@@ -839,6 +839,7 @@ static int RunPatchSettingsRefresh(string[] args)
         var beginInvokeRef = module.ImportReference(beginInvokeDef);
         var actionCtor = module.ImportReference(typeof(Action).GetConstructor(new[] { typeof(object), typeof(IntPtr) })!);
         var appendAllText = module.ImportReference(typeof(File).GetMethod("AppendAllText", new[] { typeof(string), typeof(string) })!);
+        var stringConcat2 = module.ImportReference(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) })!);
 
         var il = method.Body.Instructions;
 
@@ -932,78 +933,91 @@ static int RunPatchSettingsRefresh(string[] args)
         // still render because they populate themselves independently of formSettings_Load;
         // dataGridCategory is the one thing that ONLY formSettings_Load ever configures).
         //
-        // Fix: call formSettings_Load(this, EventArgs.Empty) directly from the private
-        // parameterless constructor -- which always runs regardless of how the form is shown --
-        // right at the end, in the fall-through position of the existing
-        // `if (!UIUtils.DesignMode) { ... }` block, immediately before the constructor's own
-        // `ResumeLayout();`. This reuses 100% of the existing Load logic (column setup, category
-        // reload, focus/selection, the BeginInvoke(Refresh) just added above) rather than
-        // duplicating it, and confirmed by reading the IL: the two DesignMode-skip branches
-        // (`brtrue IL_0e32-equivalent`) target the ResumeLayout instruction by object identity,
-        // not position, so inserting new code immediately before that instruction naturally
-        // lands in the designmode-skips-it / normal-code-runs-it position with no branch
-        // retargeting needed -- design-time still skips it, exactly like the rest of that block.
-        var ctorMethod = type.Methods.FirstOrDefault(m => m.IsConstructor && !m.IsStatic && m.Parameters.Count == 0);
-        if (ctorMethod is null) { Console.Error.WriteLine($"FAIL: couldn't find {targetType}'s parameterless constructor"); return 1; }
+        // First attempt called formSettings_Load(this, EventArgs.Empty) from the PRIVATE
+        // parameterless constructor. --patch-diag confirmed loadCategories() then ran
+        // successfully end-to-end (SetDataSource fired for dataGridCategory with real,
+        // non-null data) -- genuine progress -- but the app then crashed with an unhandled
+        // .NET exception before the Settings window ever opened. Root cause: the private
+        // ctor runs BEFORE the public formSettings(string tabName) ctor's
+        // `SwitchToTabPanel(...)` call, so controlPanelSwitcher.CurrentPanel is still unset at
+        // that point; formSettings_Load's tail end does
+        // `dataGridCategory.SelectedRows.Add(dataGridCategory.FocusedRow)`, and FocusedRow is
+        // presumably -1 with no panel selected yet, likely throwing there.
+        //
+        // Fix: move the call to the END of the PUBLIC `formSettings(string tabName)`
+        // constructor, right after its own `SwitchToTabPanel(...)` call -- so CurrentPanel is
+        // already set, matching what the natural Load-event order would have produced. Also
+        // wrapped in a try/catch that logs Exception.ToString() (type, message, and stack
+        // trace) to the diag log on failure, so if this guess is also wrong, the next round
+        // gets the real answer directly instead of another blind trace.
+        var ctorMethod = type.Methods.FirstOrDefault(m => m.IsConstructor && !m.IsStatic && m.Parameters.Count == 1 &&
+            m.Parameters[0].ParameterType.FullName == "System.String");
+        if (ctorMethod is null) { Console.Error.WriteLine($"FAIL: couldn't find {targetType}'s formSettings(string) constructor"); return 1; }
         var loadHandler = type.Methods.FirstOrDefault(m => m.Name == targetMethod && m.HasBody);
         if (loadHandler is null) { Console.Error.WriteLine($"FAIL: couldn't re-find {targetType}::{targetMethod} for the constructor call"); return 1; }
         var loadHandlerRef = module.ImportReference(loadHandler);
         var eventArgsEmpty = module.ImportReference(typeof(EventArgs).GetField("Empty")!);
+        var exceptionToString = module.ImportReference(typeof(Exception).GetMethod("ToString", Type.EmptyTypes)!);
+        var exceptionTypeRef = module.ImportReference(typeof(Exception));
 
         var ctorBody = ctorMethod.Body;
         var ctorIl = ctorBody.Instructions;
-        Instruction? ctorResumeLayoutCall = null;
+        Instruction? switchToTabPanelCall = null;
         for (int k = 0; k < ctorIl.Count; k++)
         {
             if ((ctorIl[k].OpCode == OpCodes.Callvirt || ctorIl[k].OpCode == OpCodes.Call) &&
-                ctorIl[k].Operand is MethodReference mr3 && mr3.Name == "ResumeLayout" && mr3.Parameters.Count == 0)
+                ctorIl[k].Operand is MethodReference mr3 && mr3.Name == "SwitchToTabPanel" &&
+                mr3.Parameters.Count == 1 && mr3.Parameters[0].ParameterType.FullName == "System.String")
             {
-                ctorResumeLayoutCall = ctorIl[k];
-                // don't break -- take the LAST match, in case ResumeLayout is referenced more
-                // than once anywhere earlier for an unrelated reason; the constructor's own
-                // closing ResumeLayout() is the final one in its body.
+                switchToTabPanelCall = ctorIl[k];
+                break;
             }
         }
-        if (ctorResumeLayoutCall is null)
+        if (switchToTabPanelCall is null)
         {
-            Console.Error.WriteLine($"FAIL: couldn't find `ResumeLayout()` call in {targetType}'s constructor -- refusing to patch");
+            Console.Error.WriteLine($"FAIL: couldn't find `SwitchToTabPanel(string)` call in {targetType}'s formSettings(string) constructor -- refusing to patch");
             return 1;
         }
+        // insert right after the call; the ctor is just `ldarg.0; call .ctor(); ...; ldarg.0;
+        // ldstr "tab"; ldarg.1; call Concat; call SwitchToTabPanel(string); ret` -- nothing
+        // branches into the space between this call and the final ret, so no retargeting needed.
         var ctorProc = ctorBody.GetILProcessor();
-        // ResumeLayout() is preceded by its own ldarg.0 (the receiver) -- insert before THAT,
-        // not before the call instruction itself, so we don't end up between a ldarg.0 and its
-        // matching call.
-        var ctorInsertAnchor = ctorResumeLayoutCall.Previous!.OpCode == OpCodes.Ldarg_0 ? ctorResumeLayoutCall.Previous! : ctorResumeLayoutCall;
-        var newFirst = Instruction.Create(OpCodes.Ldarg_0);
-        ctorProc.InsertBefore(ctorInsertAnchor, newFirst);
-        ctorProc.InsertBefore(ctorInsertAnchor, Instruction.Create(OpCodes.Ldarg_0));
-        ctorProc.InsertBefore(ctorInsertAnchor, Instruction.Create(OpCodes.Ldsfld, eventArgsEmpty));
-        ctorProc.InsertBefore(ctorInsertAnchor, Instruction.Create(OpCodes.Call, loadHandlerRef));
-        // ctorInsertAnchor is a branch target (at minimum the `if (!wizardExport.XmlExportAvailable)`
-        // check's brtrue.s skips straight to it when the feature IS available -- the common case --
-        // which would otherwise skip my new code entirely, exactly like the earlier
-        // handleVisibleItemsChange EXIT-marker bug). Retarget every branch/exception-handler
-        // reference to it so nothing can land past my inserted call.
-        foreach (var instr in ctorIl)
-        {
-            if (instr.Operand == ctorInsertAnchor) instr.Operand = newFirst;
-            else if (instr.Operand is Instruction[] targets)
-            {
-                for (int t = 0; t < targets.Length; t++)
-                {
-                    if (targets[t] == ctorInsertAnchor) targets[t] = newFirst;
-                }
-            }
-        }
-        foreach (var handler in ctorBody.ExceptionHandlers)
-        {
-            if (handler.TryStart == ctorInsertAnchor) handler.TryStart = newFirst;
-            if (handler.TryEnd == ctorInsertAnchor) handler.TryEnd = newFirst;
-            if (handler.HandlerStart == ctorInsertAnchor) handler.HandlerStart = newFirst;
-            if (handler.HandlerEnd == ctorInsertAnchor) handler.HandlerEnd = newFirst;
-        }
+        var afterCall = switchToTabPanelCall.Next!; // the original `ret`
+        var excLocal = new VariableDefinition(exceptionTypeRef);
+        ctorBody.Variables.Add(excLocal);
 
-        Console.WriteLine($"OK   {fileName}: {targetType}'s constructor -- inserted formSettings_Load(this, EventArgs.Empty) right before the final ResumeLayout(), retargeting branches that landed on it");
+        var tryFirst = Instruction.Create(OpCodes.Ldarg_0);
+        var tryLast = Instruction.Create(OpCodes.Call, loadHandlerRef);
+        var leaveTry = Instruction.Create(OpCodes.Leave, afterCall);
+        var catchFirst = Instruction.Create(OpCodes.Stloc, excLocal);
+        var leaveCatch = Instruction.Create(OpCodes.Leave, afterCall);
+
+        ctorProc.InsertBefore(afterCall, tryFirst);                                    // try: ldarg.0 (receiver for formSettings_Load call)
+        ctorProc.InsertBefore(afterCall, Instruction.Create(OpCodes.Ldarg_0));          //      ldarg.0 (sender)
+        ctorProc.InsertBefore(afterCall, Instruction.Create(OpCodes.Ldsfld, eventArgsEmpty));
+        ctorProc.InsertBefore(afterCall, tryLast);                                      //      call formSettings_Load(object, EventArgs)
+        ctorProc.InsertBefore(afterCall, leaveTry);                                     //      leave.s afterCall
+        ctorProc.InsertBefore(afterCall, catchFirst);                                   // catch: stloc excLocal
+        ctorProc.InsertBefore(afterCall, Instruction.Create(OpCodes.Ldstr, logPath));
+        ctorProc.InsertBefore(afterCall, Instruction.Create(OpCodes.Ldstr, "formSettings ctor: EXCEPTION calling formSettings_Load: "));
+        ctorProc.InsertBefore(afterCall, Instruction.Create(OpCodes.Ldloc, excLocal));
+        ctorProc.InsertBefore(afterCall, Instruction.Create(OpCodes.Callvirt, exceptionToString));
+        ctorProc.InsertBefore(afterCall, Instruction.Create(OpCodes.Call, stringConcat2));
+        ctorProc.InsertBefore(afterCall, Instruction.Create(OpCodes.Ldstr, "\n"));
+        ctorProc.InsertBefore(afterCall, Instruction.Create(OpCodes.Call, stringConcat2));
+        ctorProc.InsertBefore(afterCall, Instruction.Create(OpCodes.Call, appendAllText));
+        ctorProc.InsertBefore(afterCall, leaveCatch);                                   //      leave.s afterCall
+
+        ctorBody.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+        {
+            TryStart = tryFirst,
+            TryEnd = catchFirst,
+            HandlerStart = catchFirst,
+            HandlerEnd = afterCall,
+            CatchType = exceptionTypeRef
+        });
+
+        Console.WriteLine($"OK   {fileName}: {targetType}(string)'s constructor -- inserted try {{ formSettings_Load(this, EventArgs.Empty) }} catch (Exception) {{ log }} right after SwitchToTabPanel(...)");
         patched = true;
 
         module.Write(destPath);
