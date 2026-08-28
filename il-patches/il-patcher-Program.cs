@@ -720,9 +720,13 @@ static int RunPatchDiag(string[] args)
 // never superseded by a correct one.
 //
 // Fix: MailClient.dll, UI.Forms.formSettings::formSettings_Load -- insert
-// `dataGridCategory.Refresh();` immediately after the existing `dataGridCategory.EndUpdate();`
-// call, forcing one more, now-fully-populated repaint unconditionally at the point everything
-// is guaranteed to be set up correctly.
+// `this.BeginInvoke(new Action(dataGridCategory.Refresh));` immediately after the existing
+// `dataGridCategory.EndUpdate();` call. A direct synchronous `dataGridCategory.Refresh();` at
+// this spot was tried first and made no observable difference (confirmed via --patch-diag: still
+// exactly one paint, still columns.Count==0) -- Refresh()/Update() during the Load event, before
+// the form is actually shown, is a known-unreliable pattern in WinForms since the paint
+// infrastructure isn't necessarily ready. BeginInvoke(Action) defers the repaint to after the
+// current message finishes processing, which is the standard fix for that class of bug.
 static int RunPatchSettingsRefresh(string[] args)
 {
     if (args.Length < 3)
@@ -770,8 +774,9 @@ static int RunPatchSettingsRefresh(string[] args)
         if (dataGridCategoryField is null) { Console.Error.WriteLine("FAIL: couldn't find dataGridCategory field"); return 1; }
 
         var gridType = dataGridCategoryField.FieldType.Resolve();
-        // Resolve Control::Refresh() by walking ControlDataGrid's own base-type chain, same
-        // approach as --patch-diag (this project doesn't reference System.Windows.Forms directly).
+        // Resolve Control::Refresh()/BeginInvoke(Action) by walking ControlDataGrid's own
+        // base-type chain, same approach as --patch-diag (this project doesn't reference
+        // System.Windows.Forms directly).
         TypeDefinition? controlType = gridType;
         while (controlType is not null && controlType.FullName != "System.Windows.Forms.Control")
         {
@@ -781,6 +786,11 @@ static int RunPatchSettingsRefresh(string[] args)
         var refreshDef = controlType.Methods.FirstOrDefault(m => m.Name == "Refresh" && m.Parameters.Count == 0);
         if (refreshDef is null) { Console.Error.WriteLine("FAIL: Control has no parameterless Refresh()"); return 1; }
         var refreshRef = module.ImportReference(refreshDef);
+        var beginInvokeDef = controlType.Methods.FirstOrDefault(m => m.Name == "BeginInvoke" &&
+            m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "Action");
+        if (beginInvokeDef is null) { Console.Error.WriteLine("FAIL: Control has no BeginInvoke(Action)"); return 1; }
+        var beginInvokeRef = module.ImportReference(beginInvokeDef);
+        var actionCtor = module.ImportReference(typeof(Action).GetConstructor(new[] { typeof(object), typeof(IntPtr) })!);
 
         var il = method.Body.Instructions;
         Instruction? endUpdateCall = null;
@@ -802,15 +812,25 @@ static int RunPatchSettingsRefresh(string[] args)
 
         var proc = method.Body.GetILProcessor();
         var insertPoint = endUpdateCall.Next; // right after the EndUpdate() call
-        var ldarg0 = Instruction.Create(OpCodes.Ldarg_0);
-        proc.InsertBefore(insertPoint, ldarg0);
+        // this.BeginInvoke(new Action(dataGridCategory.Refresh)); -- deferred via the message
+        // loop rather than called synchronously inline. A direct dataGridCategory.Refresh() call
+        // right here was tried first and made no difference (still one paint, still
+        // columns.Count==0) -- plausible explanation: Refresh()/Update() during the Load event,
+        // before the form is actually shown, is a known-unreliable WinForms pattern since the
+        // paint infrastructure isn't necessarily ready yet. BeginInvoke defers to after the
+        // current message is done processing, which is the standard fix for that class of bug.
+        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Ldarg_0));
+        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Ldarg_0));
         proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Ldfld, dataGridCategoryField));
-        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Callvirt, refreshRef));
+        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Ldftn, refreshRef));
+        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Newobj, actionCtor));
+        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Callvirt, beginInvokeRef));
+        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Pop));
         // retarget anything branching to the old insertPoint isn't needed here: insertPoint is
         // the CultureChanger.get_Instance() call, not a branch target in this method (verified
         // by reading the IL directly -- no branches land past EndUpdate() in formSettings_Load).
 
-        Console.WriteLine($"OK   {fileName}: {targetType}::{targetMethod} -- inserted dataGridCategory.Refresh() right after dataGridCategory.EndUpdate()");
+        Console.WriteLine($"OK   {fileName}: {targetType}::{targetMethod} -- inserted this.BeginInvoke(new Action(dataGridCategory.Refresh)) right after dataGridCategory.EndUpdate()");
         patched = true;
 
         module.Write(destPath);
