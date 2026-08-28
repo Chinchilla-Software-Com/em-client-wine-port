@@ -788,6 +788,7 @@ static int RunPatchSettingsRefresh(string[] args)
     const string targetAssembly = "MailClient.dll";
     const string targetType = "MailClient.UI.Forms.formSettings";
     const string targetMethod = "formSettings_Load";
+    const string logPath = @"Z:\tmp\claude-diag.log";
 
     var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
     bool patched = false;
@@ -837,8 +838,38 @@ static int RunPatchSettingsRefresh(string[] args)
         if (beginInvokeDef is null) { Console.Error.WriteLine("FAIL: Control has no BeginInvoke(Action)"); return 1; }
         var beginInvokeRef = module.ImportReference(beginInvokeDef);
         var actionCtor = module.ImportReference(typeof(Action).GetConstructor(new[] { typeof(object), typeof(IntPtr) })!);
+        var appendAllText = module.ImportReference(typeof(File).GetMethod("AppendAllText", new[] { typeof(string), typeof(string) })!);
 
         var il = method.Body.Instructions;
+
+        // Checkpoint markers bracketing the loadCategories() call: SetDataSource is never called
+        // for dataGridCategory (confirmed via --patch-diag), which only makes sense if
+        // loadCategories() itself never runs to completion. If BEFORE logs but AFTER doesn't,
+        // that's proof something in loadCategories() throws.
+        var loadCategoriesMethod = type.Methods.FirstOrDefault(m => m.Name == "loadCategories" && m.HasBody);
+        if (loadCategoriesMethod is null) { Console.Error.WriteLine("FAIL: couldn't find loadCategories()"); return 1; }
+        Instruction? loadCategoriesCall = null;
+        for (int k = 0; k < il.Count; k++)
+        {
+            if ((il[k].OpCode == OpCodes.Call || il[k].OpCode == OpCodes.Callvirt) &&
+                il[k].Operand is MethodReference mr2 && mr2.Name == "loadCategories")
+            {
+                loadCategoriesCall = il[k];
+                break;
+            }
+        }
+        if (loadCategoriesCall is null) { Console.Error.WriteLine($"FAIL: couldn't find loadCategories() call in {targetType}::{targetMethod}"); return 1; }
+        var checkpointProc = method.Body.GetILProcessor();
+        // AFTER marker first (so retargeting, if ever needed, only has to consider one anchor at a time)
+        var afterTarget = loadCategoriesCall.Next;
+        checkpointProc.InsertBefore(afterTarget, Instruction.Create(OpCodes.Ldstr, logPath));
+        checkpointProc.InsertBefore(afterTarget, Instruction.Create(OpCodes.Ldstr, "formSettings_Load:AFTER loadCategories()\n"));
+        checkpointProc.InsertBefore(afterTarget, Instruction.Create(OpCodes.Call, appendAllText));
+        // BEFORE marker: loadCategoriesCall itself is not a branch target in this straight-line
+        // method (verified by reading the IL directly), so a plain InsertBefore is safe here.
+        checkpointProc.InsertBefore(loadCategoriesCall, Instruction.Create(OpCodes.Ldstr, logPath));
+        checkpointProc.InsertBefore(loadCategoriesCall, Instruction.Create(OpCodes.Ldstr, "formSettings_Load:BEFORE loadCategories()\n"));
+        checkpointProc.InsertBefore(loadCategoriesCall, Instruction.Create(OpCodes.Call, appendAllText));
         Instruction? endUpdateCall = null;
         for (int k = 0; k < il.Count; k++)
         {
