@@ -206,6 +206,62 @@ BOTTLE_APP_DIR="$(dirname "$SELECTED_DLL")"
 log "target bottle: $BOTTLE_NAME ($BOTTLE_APP_DIR)"
 
 # ---------------------------------------------------------------------------
+# Refuse to patch into a bottle whose MailClient.exe is still running: files
+# could be locked mid-write, and a running instance would keep the old code
+# in memory regardless of what lands on disk until it's restarted anyway.
+# Matched by bottle name appearing anywhere in the process's environment
+# (CrossOver's wine wrapper sets some bottle-identifying env var per launch
+# -- WINEPREFIX or its own CX_BOTTLE, depending on how it was started; a
+# loose substring match across the whole environment is more robust than
+# guessing the exact variable name) rather than a system-wide "any
+# MailClient.exe" check, so an instance running in a DIFFERENT bottle
+# doesn't block this one.
+# ---------------------------------------------------------------------------
+
+find_running_pids_for_bottle() {
+    local name="$1"
+    local pid cmdline
+    for p in /proc/[0-9]*; do
+        pid="${p#/proc/}"
+        [[ -r "$p/cmdline" ]] || continue
+        cmdline="$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)"
+        [[ "$cmdline" == *"MailClient.exe"* ]] || continue
+        if [[ -r "$p/environ" ]] && tr '\0' '\n' < "$p/environ" 2>/dev/null | grep -q "$name"; then
+            echo "$pid"
+        fi
+    done
+}
+
+RUNNING_PIDS=()
+while IFS= read -r pid; do
+    [[ -n "$pid" ]] && RUNNING_PIDS+=("$pid")
+done < <(find_running_pids_for_bottle "$BOTTLE_NAME")
+
+if [[ ${#RUNNING_PIDS[@]} -gt 0 ]]; then
+    warn "eM Client appears to be running in bottle '$BOTTLE_NAME' (PID(s): ${RUNNING_PIDS[*]})."
+    warn "It needs to be closed before patching."
+    read -r -p "Close it now and continue? [Y/n] " reply
+    if [[ -z "$reply" || "$reply" =~ ^[Yy]$ ]]; then
+        for pid in "${RUNNING_PIDS[@]}"; do
+            log "closing PID $pid..."
+            kill "$pid" 2>/dev/null || true
+        done
+        for _ in $(seq 1 10); do
+            sleep 1
+            RUNNING_PIDS=()
+            while IFS= read -r pid; do
+                [[ -n "$pid" ]] && RUNNING_PIDS+=("$pid")
+            done < <(find_running_pids_for_bottle "$BOTTLE_NAME")
+            [[ ${#RUNNING_PIDS[@]} -eq 0 ]] && break
+        done
+        [[ ${#RUNNING_PIDS[@]} -eq 0 ]] || die "eM Client did not exit within 10s (still running: ${RUNNING_PIDS[*]}) -- close it manually and re-run."
+        log "eM Client closed."
+    else
+        die "aborted -- close eM Client in this bottle and re-run."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Version gate
 # ---------------------------------------------------------------------------
 
