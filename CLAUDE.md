@@ -44,6 +44,11 @@
 Bottle name: emClient_win_7_x64. Exe: MailClient.exe. Bottle path:
 `~/.cxoffice/emClient_win_7_x64/`; `Z:\` inside the bottle maps to `/` on the Linux side, which
 is how diagnostic instrumentation (see below) writes logs readable directly from outside Wine.
+A secondary bottle, `emClient_win_7_x64_2` (same layout, same drive_c path shape), exists for
+testing changes that would disturb the main bottle's state — e.g. the License Activation fix was
+tested there once the main bottle had already been activated, to keep a never-activated instance
+available for any future licensing-related testing without needing yet another fresh bottle.
+Deploy commands need the `$BOTTLE` path swapped accordingly when testing there instead of main.
 
 git is available in this environment (it wasn't in earlier sessions — if CLAUDE.md you're
 reading elsewhere says otherwise, this note supersedes it). Local commit identity for this repo
@@ -94,14 +99,22 @@ $ILP --patch-default-client-notimpl il-patches/output-stage3-final/ il-patches/o
 # new BouncyCastle-backed helper assembly instead of Wine's broken native RSA.Decrypt path).
 # Touches MailClient.dll only, and adds a new sibling assembly. Build the helper first:
 (cd ~/tools/MailClient.Licensing.BouncyCastlePatch && dotnet build -c Release)
-mkdir -p il-patches/output-final
+mkdir -p il-patches/output-stage5
 $ILP2 il-patches/output-stage4/MailClient.dll \
   ~/tools/MailClient.Licensing.BouncyCastlePatch/bin/Release/net8.0/MailClient.Licensing.BouncyCastlePatch.dll \
-  il-patches/output-final/MailClient.dll
-# output-final/ needs the rest of the stage-4 tree too (everything Stage 5 doesn't touch) plus
+  il-patches/output-stage5/MailClient.dll
+# output-stage5/ needs the rest of the stage-4 tree too (everything Stage 5 doesn't touch) plus
 # the new helper assembly, to be a complete deployable directory:
-rsync -a --ignore-existing il-patches/output-stage4/ il-patches/output-final/
-cp ~/tools/MailClient.Licensing.BouncyCastlePatch/bin/Release/net8.0/MailClient.Licensing.BouncyCastlePatch.dll il-patches/output-final/
+rsync -a --ignore-existing il-patches/output-stage4/ il-patches/output-stage5/
+cp ~/tools/MailClient.Licensing.BouncyCastlePatch/bin/Release/net8.0/MailClient.Licensing.BouncyCastlePatch.dll il-patches/output-stage5/
+
+# Stage 6: License dialog "Get a license" button icon fix. NOT a Wine gap -- the button's own
+# Text resource has two literal U+0083 control characters baked into MailClient.dll's embedded
+# resource data (see reports/license-icon-findings.md for how this was confirmed isolated, not
+# a font-substitution issue). Touches MailClient.dll only, a raw byte-level resource edit (no
+# IL, no exception handlers) -- verify by confirming output size is byte-identical to the input
+# (see "Verify" below), which proves the resource container's offset table wasn't disturbed.
+$ILP --patch-license-icon il-patches/output-stage5/ il-patches/output-final/
 
 # Deploy: swap all three touched/added files into the live bottle (back up the bottle's current
 # copies first if you haven't already — see "Rollback" below), then patch deps.json so the new
@@ -130,6 +143,11 @@ ilspycmd -t "MailClient.Licensing.DecryptAndVerify" il-patches/output-final/Mail
 # Any patch touching exception handlers (Stage 4 and beyond) additionally needs the handler
 # table itself checked — decompiling clean is not sufficient (see "IL-patching lessons"):
 $ILP --dump-handlers il-patches/output-final/MailClient.dll MailClient.Utils.Integration IsDefaultClientVista
+
+# Stage 6 is a raw resource byte edit, not IL -- verify with a size check (must match exactly,
+# proving the .resources offset table wasn't disturbed) plus a content check:
+stat -c%s il-patches/output-stage5/MailClient.dll il-patches/output-final/MailClient.dll   # must be equal
+ilspycmd --resource "MailClient.UI.Forms.formLicense.resources/buttonGetLicense.Text" -o /tmp il-patches/output-final/MailClient.dll && xxd /tmp/buttonGetLicense.Text | tail -2   # should end c2 a0 c2 a0, not c2 83 c2 83
 ```
 
 **Rollback:** back up the bottle's current DLLs before the first-ever deploy in a fresh bottle
@@ -177,6 +195,19 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   across 4 key sizes × 4 plaintext shapes, byte-identical to native .NET RSA-OAEP decrypt). User
   confirmed: Activation completed successfully. Full history, including the standalone
   verification harness and the trace evidence: `reports/license-activation-oaep-findings.md`.
+- **License dialog "Get a license" button showing two tofu boxes.** Root cause: **not a Wine
+  bug** — the button's own `Text` resource (`MailClient.UI.Forms.formLicense.resources`'s
+  `buttonGetLicense.Text`, embedded in `MailClient.dll` itself) contains two literal Unicode C1
+  control characters (U+0083) baked into the app's own resource data, confirmed isolated (occurs
+  exactly once in the whole assembly) and confirmed not font-substitution-related (the button's
+  paint code does plain `TextRenderer.DrawText`, no icon-glyph logic anywhere). Almost certainly
+  an upstream eM Client resource-authoring/encoding bug that would show the same way on real
+  Windows. Fixed anyway — cheap and safe regardless of platform — via a raw byte-level resource
+  edit (`--patch-license-icon`, `~/tools/il-patcher`): U+0083 U+0083 → U+00A0 U+00A0
+  (non-breaking space), chosen to keep the resource's byte length exactly unchanged so the
+  `.resources` container's offset table needs no adjustment. User confirmed: "That's fixed the
+  icon issue on button... There's no icons visible... just text... but that's nice and clean."
+  Full history: `reports/license-icon-findings.md`.
 
 **Confirmed as a real, separate Wine bug, but not the cause of anything fixed above — patched
 anyway since it's a real bug and the fix is cheap:**
@@ -202,18 +233,11 @@ anyway since it's a real bug and the fix is cheap:**
   the same disassembly (High aliases to HighQualityBicubic internally). Promote to a stage if
   pursued — don't leave as "Hold, no evidence", that reasoning is now stale.
 
-**Newly found, not yet investigated:**
-- License dialog: the "Get a license" button shows two tofu boxes (`□□`) instead of an icon —
-  `supporting/register-icons-broken.png`. Not yet investigated; likely a missing-glyph/font-
-  fallback gap (an icon-font character Wine's font substitution doesn't resolve), in the same
-  general family as the font-substitution fixmes noted elsewhere in this investigation
-  (`fixme:font:find_matching_face Untranslated charset 255`, Arabic font fallback) but not
-  confirmed to be the same mechanism.
-
 The two bugs originally reported (blank Settings panel, and the category-click crash found once
-the panel worked), plus the License Activation failure found during that testing, are all fixed
-and confirmed. Stage 2/3/Hold interpolation items above remain scanned-but-not-pursued if a
-future session wants to extend that work.
+the panel worked), plus the License Activation failure and the "Get a license" icon bug both
+found during that testing, are all fixed and confirmed — no open bugs remain as of this writing.
+Stage 2/3/Hold interpolation items above remain scanned-but-not-pursued if a future session wants
+to extend that work.
 
 ## Investigation method (what actually worked this round)
 
@@ -264,8 +288,11 @@ poll for the process to exit or the log file to gain content before reading resu
 `ldc.i4` constant, verified by pattern-matching the few instructions around it — low risk). It
 grew instruction-*insertion* modes (`--patch-allpaintinginwmpaint`, `--patch-settings-refresh`,
 `--patch-default-client-notimpl`, and the temporary `--patch-diag`) for fixes that need new code,
-not just a changed constant. Several real bugs were introduced and caught during this session,
-all worth guarding against explicitly next time:
+not just a changed constant, plus one raw-resource-data mode (`--patch-license-icon`, which
+touches an embedded `.resources` blob's bytes directly rather than IL — see its own doc comment
+in the source for why a length-preserving byte replacement was used instead of the more obvious
+"just delete the bad characters"). Several real bugs were introduced and caught during this
+session, all worth guarding against explicitly next time:
 
 1. **Reusing a re-read anchor reverses insertion order.** `InsertBefore(anchor, x)` called three
    times with `anchor` re-read as `il[0]`/similar each time (instead of captured once into a

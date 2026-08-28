@@ -32,6 +32,11 @@ if (args.Length > 0 && args[0] == "--dump-handlers")
     return RunDumpHandlers(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-license-icon")
+{
+    return RunPatchLicenseIcon(args);
+}
+
 return RunScan(args);
 
 // --dump-handlers <dll> <type> <method>
@@ -1133,6 +1138,122 @@ static int RunPatchDefaultClientNotImpl(string[] args)
     }
 
     return 0;
+}
+
+// --patch-license-icon <input-dir> <output-dir>
+//
+// The License dialog's "Get a license" button (formLicense.buttonGetLicense) shows two tofu
+// boxes after the label text. Root cause: the button's Text resource
+// (MailClient.UI.Forms.formLicense.resources/buttonGetLicense.Text) contains two literal
+// Unicode C1 control characters (U+0083) baked directly into the app's own embedded resource
+// data -- confirmed NOT a Wine font-substitution gap: the exact byte pattern (UTF-8 C2 83 C2
+// 83) occurs exactly once in the whole assembly (no other button reuses it as a convention),
+// there's no "en" satellite resource to compare against (English is the neutral culture baked
+// into MailClient.dll itself), and ControlButton's paint code does a plain
+// TextRendererEx.DrawText with no icon-glyph special-casing anywhere in its class hierarchy.
+// See reports/license-icon-findings.md.
+//
+// Fix: byte-level replace within the embedded resource blob, C2 83 C2 83 -> C2 A0 C2 A0 (two
+// U+0083 -> two U+00A0 non-breaking spaces). Chosen specifically to keep the raw byte length
+// identical (2 UTF-8 bytes -> 2 UTF-8 bytes per character) so the .resources container's
+// data-section offset table -- which stores absolute byte offsets for every OTHER resource in
+// the same container -- needs no adjustment. A length-changing edit (e.g. deleting the two
+// characters outright) would require correctly rewriting that offset table for every
+// subsequent resource entry, which needs full binary-format parsing this patch deliberately
+// avoids by never changing any entry's length.
+static int RunPatchLicenseIcon(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-license-icon <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string resourceName = "MailClient.UI.Forms.formLicense.resources";
+    byte[] oldBytes = { 0xC2, 0x83, 0xC2, 0x83 };
+    byte[] newBytes = { 0xC2, 0xA0, 0xC2, 0xA0 };
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var resource = module.Resources.OfType<EmbeddedResource>().FirstOrDefault(r => r.Name == resourceName);
+        if (resource is null)
+        {
+            Console.Error.WriteLine($"FAIL: embedded resource not found: {resourceName}");
+            return 1;
+        }
+
+        byte[] data = resource.GetResourceData();
+        int idx = IndexOfBytes(data, oldBytes, 0);
+        if (idx < 0)
+        {
+            Console.Error.WriteLine($"FAIL: expected byte pattern C2 83 C2 83 not found in {resourceName} -- refusing to patch");
+            return 1;
+        }
+        int idx2 = IndexOfBytes(data, oldBytes, idx + 1);
+        if (idx2 >= 0)
+        {
+            Console.Error.WriteLine($"FAIL: byte pattern found more than once in {resourceName} -- ambiguous, refusing to patch");
+            return 1;
+        }
+
+        byte[] newData = (byte[])data.Clone();
+        Array.Copy(newBytes, 0, newData, idx, newBytes.Length);
+
+        int resIndex = module.Resources.IndexOf(resource);
+        module.Resources[resIndex] = new EmbeddedResource(resource.Name, resource.Attributes, newData);
+
+        Console.WriteLine($"OK   {fileName}: {resourceName} -- replaced buttonGetLicense.Text's trailing U+0083 U+0083 with U+00A0 U+00A0 (non-breaking space) at byte offset 0x{idx:X}");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+static int IndexOfBytes(byte[] haystack, byte[] needle, int start)
+{
+    for (int i = start; i <= haystack.Length - needle.Length; i++)
+    {
+        bool match = true;
+        for (int j = 0; j < needle.Length; j++)
+        {
+            if (haystack[i + j] != needle[j]) { match = false; break; }
+        }
+        if (match) return i;
+    }
+    return -1;
 }
 
 static OpCode ShortFormOpCode(int value) => value switch
