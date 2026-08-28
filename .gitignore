@@ -12,3 +12,7 @@ decompiled/
 # CX_DEBUGMSG trace captures - large, ephemeral, regenerable by rerunning under trace
 reports/cxlog*.txt
 reports/cxlog*.txt.bak
+
+# releases/<version>/deploy.sh's own backups of live bottle files before patching - contain a
+# copy of whatever eM Client build the user has installed, not something to commit
+releases/*/backups/

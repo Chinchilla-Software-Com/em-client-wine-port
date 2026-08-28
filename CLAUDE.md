@@ -40,6 +40,24 @@
   re-explored next time. Read these before starting new investigation.
 - supporting/** — reference screenshots (both "broken" and "known-good/working" states) used to
   confirm fixes visually. Tracked in git; add new ones here when reporting or confirming a bug.
+- releases/<version>/deploy.sh — the actual, practical way to deploy: a single self-contained
+  script that finds installed eM Client bottles, reads and reports each one's version, warns (and
+  asks) before proceeding against a version other than the one this release was built and tested
+  against, backs up the live files, regenerates every patch stage fresh from whatever assemblies
+  it actually found (never copies pre-built DLLs out of this repo — an update-prone app makes a
+  stale pre-built copy actively dangerous, not just inconvenient), runs every "Verify before
+  deploying" check from the "Patch pipeline" section below automatically, and only then deploys —
+  rolling back (renaming whatever it wrote to `.new`, restoring the backup) if any step from that
+  point on fails. `./deploy.sh --list` reports found bottles + versions without patching anything;
+  `./deploy.sh --bottle NAME` skips interactive bottle selection; `-y`/`--yes` skips the
+  version-mismatch confirmation prompt. Needs dotnet SDK (prints per-distro install instructions
+  and exits if missing) and python3; fetches ilspycmd itself into a temp dir if not already
+  installed. **When eM Client updates:** don't edit an existing `releases/<version>/deploy.sh` in
+  place — copy the whole `releases/<version>/` folder to a new `releases/<new-version>/`, retest
+  by hand against the new build (same process as "Investigation method" below — diff what
+  actually changed rather than assuming), and adjust whatever patch logic broke in the new
+  folder's copy. Each version's script stays a frozen, working reference for that version.
+  `releases/*/backups/` (gitignored) is where each deploy run's pre-patch backup lands.
 
 Bottle name: emClient_win_7_x64. Exe: MailClient.exe. Bottle path:
 `~/.cxoffice/emClient_win_7_x64/`; `Z:\` inside the bottle maps to `/` on the Linux side, which

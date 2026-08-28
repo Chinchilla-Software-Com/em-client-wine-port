@@ -37,6 +37,11 @@ if (args.Length > 0 && args[0] == "--patch-license-icon")
     return RunPatchLicenseIcon(args);
 }
 
+if (args.Length > 0 && args[0] == "--version")
+{
+    return RunVersion(args);
+}
+
 return RunScan(args);
 
 // --dump-handlers <dll> <type> <method>
@@ -1254,6 +1259,39 @@ static int IndexOfBytes(byte[] haystack, byte[] needle, int start)
         if (match) return i;
     }
     return -1;
+}
+
+// --version <dll> [<dll> ...]
+//
+// Prints each assembly's AssemblyFileVersion (the precise "10.4.5674.0" style version used to
+// gate the release scripts under releases/<version>/ -- see that folder's deploy.sh) and, where
+// present, its AssemblyInformationalVersion (includes eM Client's own build commit hash, e.g.
+// "10.4.5674+fcbf2a4bb4" -- a stronger identity check than the version number alone, useful if
+// two builds ever ship the same version number with different code). Read-only, no patching.
+static int RunVersion(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("usage: il-patcher --version <dll> [<dll> ...]");
+        return 2;
+    }
+
+    foreach (var dllPath in args.Skip(1))
+    {
+        using var module = ModuleDefinition.ReadModule(dllPath);
+        var asmName = module.Assembly.Name;
+        string? fileVersion = null;
+        string? infoVersion = null;
+        foreach (var ca in module.Assembly.CustomAttributes)
+        {
+            if (ca.AttributeType.Name == "AssemblyFileVersionAttribute" && ca.ConstructorArguments.Count > 0)
+                fileVersion = ca.ConstructorArguments[0].Value as string;
+            if (ca.AttributeType.Name == "AssemblyInformationalVersionAttribute" && ca.ConstructorArguments.Count > 0)
+                infoVersion = ca.ConstructorArguments[0].Value as string;
+        }
+        Console.WriteLine($"{Path.GetFileName(dllPath)}\tAssemblyVersion={asmName.Version}\tFileVersion={fileVersion ?? "(none)"}\tInformationalVersion={infoVersion ?? "(none)"}");
+    }
+    return 0;
 }
 
 static OpCode ShortFormOpCode(int value) => value switch
