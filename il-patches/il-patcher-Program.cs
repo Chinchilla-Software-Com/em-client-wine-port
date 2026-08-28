@@ -692,9 +692,55 @@ static int RunPatchDiag(string[] args)
             Instruction.Create(OpCodes.Call, appendAllText)
         );
 
+        // Fourth instrumentation point: SetDataSource<TItem>(source, filterName). All four
+        // doPaint samples for dataGridCategory showed columns.Count==0 -- not just the first,
+        // "premature" one -- which no longer fits "one early paint before Load finishes". This
+        // logs Name + whether the source argument is null every time SetDataSource runs, to
+        // check whether ReloadCategories() (called from loadCategories(), called from
+        // formSettings_Load) is even reaching dataGridCategory at all.
+        var setDataSourceMethod = type.Methods.FirstOrDefault(m => m.Name == "SetDataSource" && m.HasBody && m.Parameters.Count == 2);
+        if (setDataSourceMethod is null) { Console.Error.WriteLine("FAIL: couldn't find SetDataSource<TItem>(source, filterName)"); return 1; }
+        var sdsBody = setDataSourceMethod.Body;
+        sdsBody.InitLocals = true;
+        var sdsTmpBool = new VariableDefinition(module.TypeSystem.Boolean);
+        var sdsTmpMsg = new VariableDefinition(module.TypeSystem.String);
+        sdsBody.Variables.Add(sdsTmpBool);
+        sdsBody.Variables.Add(sdsTmpMsg);
+        var sdsIl = sdsBody.GetILProcessor();
+        var sdsFirst = sdsBody.Instructions[0];
+        void EmitSds(params Instruction[] instrs) { foreach (var i in instrs) sdsIl.InsertBefore(sdsFirst, i); }
+        // Name=<name>
+        EmitSds(
+            Instruction.Create(OpCodes.Ldstr, logPath),
+            Instruction.Create(OpCodes.Ldstr, "SetDataSource:Name="),
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Callvirt, controlGetName),
+            Instruction.Create(OpCodes.Ldstr, "\n"),
+            Instruction.Create(OpCodes.Call, module.ImportReference(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string), typeof(string) })!)),
+            Instruction.Create(OpCodes.Call, appendAllText)
+        );
+        // sourceIsNull=True/False
+        EmitSds(
+            Instruction.Create(OpCodes.Ldarg_1),
+            Instruction.Create(OpCodes.Ldnull),
+            Instruction.Create(OpCodes.Ceq),
+            Instruction.Create(OpCodes.Stloc, sdsTmpBool),
+            Instruction.Create(OpCodes.Ldstr, "SetDataSource:sourceIsNull="),
+            Instruction.Create(OpCodes.Ldloca, sdsTmpBool),
+            Instruction.Create(OpCodes.Call, boolToString),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldstr, "\n---\n"),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Stloc, sdsTmpMsg),
+            Instruction.Create(OpCodes.Ldstr, logPath),
+            Instruction.Create(OpCodes.Ldloc, sdsTmpMsg),
+            Instruction.Create(OpCodes.Call, appendAllText)
+        );
+
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::{targetMethod} -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted ENTER/EXIT markers around {targetType}::handleVisibleItemsChange -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::doPaint -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::SetDataSource -> {logPath}");
         patched = true;
 
         module.Write(destPath);
