@@ -106,17 +106,51 @@ changes what Wine's window manager does with clip regions during paint dispatch.
 checked for an existing eM Client entry that might already work around this — there isn't
 one.
 
-## Possible paths forward (not attempted — needs a decision)
+## Update: the clip-region bug is real but was a red herring for this symptom
 
-1. **Accept as a known Wine/CrossOver limitation** and stop here. Given the complexity of
-   the mechanism (a genuine window-manager region bug, not something under our control),
-   this may simply not be fixable from the app side.
-2. **Experimental app-side workaround:** add `SetStyle(ControlStyles.AllPaintingInWmPaint, true)`
-   to `ControlDataGrid`'s constructor. This is a real hypothesis (the missing style is a
-   genuine difference from the WinForms-recommended pattern for owner-drawn double-buffered
-   controls, and it changes which OS-level paint messages get sent), but it is **unproven**
-   — it would require extending the Cecil patcher beyond single-operand rewrites to insert
-   a new method call into a constructor, which is a materially bigger and riskier patch
-   than anything done so far, and there's no guarantee it avoids the buggy Wine code path.
-3. Check whether a newer CrossOver/Wine build fixes this upstream (out of scope for this
-   sandbox, needs the user to check separately), or file it as a CrossOver support case.
+`ControlDataGrid.initialize()` was patched to add `SetStyle(ControlStyles.AllPaintingInWmPaint, true)`
+(inserted via a new `--patch-allpaintinginwmpaint` mode in `~/tools/il-patcher`, real IL
+instruction insertion rather than an operand rewrite — see `il-patches/il-patcher-Program.cs`).
+A re-trace with the same channels confirmed this **did** fix the clip-region bug: both
+`WM_PAINT` events for `dataGridCategory` now show the correct non-empty client clip
+(`(0,0)-(230,568)`, previously `(0,0)-(0,0)`) and a real `StretchBlt` of the fully-rendered
+buffer to the screen. The mechanism worked exactly as hypothesized.
+
+**The panel was still blank anyway.** That ruled out the clip-region bug as *the* cause of
+this particular symptom — it's a real, separately-triggerable Wine bug, but not the reason
+Settings never shows content. Something else was still wrong.
+
+## The actual cause: a stale paint, never superseded
+
+Rather than keep guessing from GDI trace noise, the app was instrumented directly: a new
+`--patch-diag` mode in `~/tools/il-patcher` inserts logging into `ControlDataGrid.doPaint()`,
+`drawCellsWithGrouping()`, and `handleVisibleItemsChange()` that writes plain text to
+`Z:\tmp\claude-diag.log` (== `/tmp/claude-diag.log` on the Linux side — readable directly, no
+`CX_DEBUGMSG` trace needed).
+
+This showed, unambiguously: **`dataGridCategory` (identified by `Control.Name`) paints exactly
+once during a whole Settings session, and at that one paint `columns.Count == 0`.**
+`ControlDataGrid.doPaint()` has an early-exit branch:
+
+```csharp
+else if (columns.Count == 0 && !ownerDraw) { g.FillRectangle(brushBackColor, ...); }
+```
+
+which fires — filling the background and returning, never calling `drawCells()` — because this
+paint happens *before* `formSettings.loadCategories()` has added its three columns
+(`dataGridCategory.Columns.Add(...)` ×3). No further paint ever arrives afterward to redraw it
+correctly once the columns (and the ~40 category rows, grouped) actually exist. This is neither
+the interpolation bug nor the clip-region bug — it's a single stale paint slipping through
+during setup that nothing ever supersedes. (`refreshingCachedItemList`, the flag guarding
+`drawCells()`'s other branch, was also checked and ruled out: ENTER/EXIT logging around
+`handleVisibleItemsChange()` showed it always correctly resets, 54/54 across a session — no
+exception is leaking there.)
+
+## Fix
+
+`MailClient.dll`, `UI.Forms.formSettings::formSettings_Load` — insert
+`dataGridCategory.Refresh();` immediately after the existing `dataGridCategory.EndUpdate();`
+call, via a new `--patch-settings-refresh` mode in `~/tools/il-patcher`. This forces one more,
+unconditional repaint at the exact point where `loadCategories()` has already finished and the
+grid is guaranteed fully populated — superseding whatever premature paint happened earlier,
+regardless of why it happened. Not yet visually confirmed working.

@@ -12,6 +12,16 @@ if (args.Length > 0 && args[0] == "--patch-allpaintinginwmpaint")
     return RunPatchAllPaintingInWmPaint(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-diag")
+{
+    return RunPatchDiag(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-settings-refresh")
+{
+    return RunPatchSettingsRefresh(args);
+}
+
 return RunScan(args);
 
 static int RunScan(string[] args)
@@ -333,6 +343,474 @@ static int RunPatchAllPaintingInWmPaint(string[] args)
         ilProcessor.InsertAfter(newTrue, newCall);
 
         Console.WriteLine($"OK   {fileName}: {targetType}::{targetMethod} -- inserted SetStyle(AllPaintingInWmPaint, true) after the existing 4-call preamble");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-diag <input-dir> <output-dir>
+//
+// Temporary instrumentation patch (not meant to ship): inserts logging at the top of
+// MailClient.Common.UI.dll's Controls.ControlDataGrid.ControlDataGrid::drawCellsWithGrouping
+// that appends the live values of groups.Count, itemsCount, UseGroupsInCurrentView, and
+// whether cachedTopItemGroup is null to Z:\tmp\claude-diag.log (== /tmp/claude-diag.log on
+// the Linux side, readable directly with no CX_DEBUGMSG trace needed) every time the method
+// runs. Exists to answer one question directly instead of inferring it from GDI trace noise:
+// is dataGridCategory's data genuinely empty at paint time in this environment, or is
+// something else suppressing the draw despite real data being present.
+static int RunPatchDiag(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-diag <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.Common.UI.dll";
+    const string targetType = "MailClient.Common.UI.Controls.ControlDataGrid.ControlDataGrid";
+    const string targetMethod = "drawCellsWithGrouping";
+    const string logPath = @"Z:\tmp\claude-diag.log";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var method = type.Methods.FirstOrDefault(m => m.Name == targetMethod && m.HasBody);
+        if (method is null) { Console.Error.WriteLine($"FAIL: method not found: {targetType}::{targetMethod}"); return 1; }
+
+        var groupsField = type.Fields.FirstOrDefault(f => f.Name == "groups");
+        var itemsCountField = type.Fields.FirstOrDefault(f => f.Name == "itemsCount");
+        var cachedTopItemGroupField = type.Fields.FirstOrDefault(f => f.Name == "cachedTopItemGroup");
+        var useGroupsProp = type.Methods.FirstOrDefault(m => m.Name == "get_UseGroupsInCurrentView");
+        if (groupsField is null || itemsCountField is null || cachedTopItemGroupField is null || useGroupsProp is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't find one of groups/itemsCount/cachedTopItemGroup fields or get_UseGroupsInCurrentView");
+            return 1;
+        }
+        var groupsCountGetter = groupsField.FieldType.Resolve().Methods.FirstOrDefault(m => m.Name == "get_Count");
+        if (groupsCountGetter is null) { Console.Error.WriteLine("FAIL: DataGridGroupCollection has no get_Count"); return 1; }
+
+        MethodReference Import(System.Reflection.MethodBase mb) => module.ImportReference(mb);
+        var int32ToString = Import(typeof(int).GetMethod("ToString", Type.EmptyTypes)!);
+        var boolToString = Import(typeof(bool).GetMethod("ToString", Type.EmptyTypes)!);
+        var stringConcat2 = Import(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) })!);
+        var appendAllText = Import(typeof(File).GetMethod("AppendAllText", new[] { typeof(string), typeof(string) })!);
+        var groupsCountGetterRef = module.ImportReference(groupsCountGetter);
+        var useGroupsPropRef = module.ImportReference(useGroupsProp);
+
+        var body = method.Body;
+        body.InitLocals = true;
+        var tmpInt = new VariableDefinition(module.TypeSystem.Int32);
+        var tmpBool = new VariableDefinition(module.TypeSystem.Boolean);
+        var tmpMsg = new VariableDefinition(module.TypeSystem.String);
+        body.Variables.Add(tmpInt);
+        body.Variables.Add(tmpBool);
+        body.Variables.Add(tmpMsg);
+
+        var il = body.GetILProcessor();
+        var first = body.Instructions[0];
+
+        void Emit(params Instruction[] instrs)
+        {
+            foreach (var i in instrs) il.InsertBefore(first, i);
+        }
+
+        // groups.Count=N
+        Emit(
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldfld, groupsField),
+            Instruction.Create(OpCodes.Callvirt, groupsCountGetterRef),
+            Instruction.Create(OpCodes.Stloc, tmpInt),
+            Instruction.Create(OpCodes.Ldstr, "groups.Count="),
+            Instruction.Create(OpCodes.Ldloca, tmpInt),
+            Instruction.Create(OpCodes.Call, int32ToString),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldstr, "\n"),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Stloc, tmpMsg),
+            Instruction.Create(OpCodes.Ldstr, logPath),
+            Instruction.Create(OpCodes.Ldloc, tmpMsg),
+            Instruction.Create(OpCodes.Call, appendAllText)
+        );
+
+        // itemsCount=N
+        Emit(
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldfld, itemsCountField),
+            Instruction.Create(OpCodes.Stloc, tmpInt),
+            Instruction.Create(OpCodes.Ldstr, "itemsCount="),
+            Instruction.Create(OpCodes.Ldloca, tmpInt),
+            Instruction.Create(OpCodes.Call, int32ToString),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldstr, "\n"),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Stloc, tmpMsg),
+            Instruction.Create(OpCodes.Ldstr, logPath),
+            Instruction.Create(OpCodes.Ldloc, tmpMsg),
+            Instruction.Create(OpCodes.Call, appendAllText)
+        );
+
+        // UseGroupsInCurrentView=True/False
+        Emit(
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Callvirt, useGroupsPropRef),
+            Instruction.Create(OpCodes.Stloc, tmpBool),
+            Instruction.Create(OpCodes.Ldstr, "UseGroupsInCurrentView="),
+            Instruction.Create(OpCodes.Ldloca, tmpBool),
+            Instruction.Create(OpCodes.Call, boolToString),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldstr, "\n"),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Stloc, tmpMsg),
+            Instruction.Create(OpCodes.Ldstr, logPath),
+            Instruction.Create(OpCodes.Ldloc, tmpMsg),
+            Instruction.Create(OpCodes.Call, appendAllText)
+        );
+
+        // cachedTopItemGroupIsNull=True/False
+        Emit(
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldfld, cachedTopItemGroupField),
+            Instruction.Create(OpCodes.Ldnull),
+            Instruction.Create(OpCodes.Ceq),
+            Instruction.Create(OpCodes.Stloc, tmpBool),
+            Instruction.Create(OpCodes.Ldstr, "cachedTopItemGroupIsNull="),
+            Instruction.Create(OpCodes.Ldloca, tmpBool),
+            Instruction.Create(OpCodes.Call, boolToString),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldstr, "\n---\n"),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Stloc, tmpMsg),
+            Instruction.Create(OpCodes.Ldstr, logPath),
+            Instruction.Create(OpCodes.Ldloc, tmpMsg),
+            Instruction.Create(OpCodes.Call, appendAllText)
+        );
+
+        // Second instrumentation point: bracket handleVisibleItemsChange with plain ENTER/EXIT
+        // markers (no field reads needed) to test whether an exception thrown between setting
+        // refreshingCachedItemList=true and resetting it to false (there's no try/finally) is
+        // what's leaving drawCells()'s "if (!refreshingCachedItemList)" guard permanently
+        // blocking both the grouped and non-grouped draw paths. If ENTER logs but EXIT never
+        // does, that's the proof.
+        var hvicMethod = type.Methods.FirstOrDefault(m => m.Name == "handleVisibleItemsChange" && m.HasBody);
+        var refreshingField = type.Fields.FirstOrDefault(f => f.Name == "refreshingCachedItemList");
+        if (hvicMethod is null || refreshingField is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't find handleVisibleItemsChange or refreshingCachedItemList field");
+            return 1;
+        }
+        var hvicBody = hvicMethod.Body;
+        var hvicIl = hvicBody.GetILProcessor();
+        var hvicInstrs = hvicBody.Instructions;
+
+        void EmitPlainLog(ILProcessor proc, Instruction before, string message)
+        {
+            proc.InsertBefore(before, Instruction.Create(OpCodes.Ldstr, logPath));
+            proc.InsertBefore(before, Instruction.Create(OpCodes.Ldstr, message));
+            proc.InsertBefore(before, Instruction.Create(OpCodes.Call, appendAllText));
+        }
+
+        // EXIT marker: find `ldarg.0; ldc.i4.0; stfld refreshingCachedItemList; ret` and log
+        // immediately before that ldarg.0 -- i.e. only reached if nothing above threw.
+        Instruction? exitTarget = null;
+        for (int k = 0; k + 3 < hvicInstrs.Count; k++)
+        {
+            if (hvicInstrs[k].OpCode == OpCodes.Ldarg_0 &&
+                hvicInstrs[k + 1].OpCode == OpCodes.Ldc_I4_0 &&
+                hvicInstrs[k + 2].OpCode == OpCodes.Stfld &&
+                hvicInstrs[k + 2].Operand is FieldReference fr && fr.Name == "refreshingCachedItemList" &&
+                hvicInstrs[k + 3].OpCode == OpCodes.Ret)
+            {
+                exitTarget = hvicInstrs[k];
+                break;
+            }
+        }
+        if (exitTarget is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't find the refreshingCachedItemList=false; ret pattern in handleVisibleItemsChange");
+            return 1;
+        }
+        // exitTarget may itself be a branch target (e.g. the brfalse.s skipping refreshCachedItemsList()
+        // jumps straight to it) -- InsertBefore doesn't retarget existing branches, so without fixing
+        // this up, any branch landing on exitTarget would skip over the newly-inserted log entirely,
+        // making the EXIT marker fire on only one of the two paths instead of unconditionally.
+        var exitLogFirst = Instruction.Create(OpCodes.Ldstr, logPath);
+        hvicIl.InsertBefore(exitTarget, exitLogFirst);
+        hvicIl.InsertBefore(exitTarget, Instruction.Create(OpCodes.Ldstr, "handleVisibleItemsChange:EXIT (reached false-reset)\n"));
+        hvicIl.InsertBefore(exitTarget, Instruction.Create(OpCodes.Call, appendAllText));
+        foreach (var instr in hvicInstrs)
+        {
+            if (instr.Operand == exitTarget) instr.Operand = exitLogFirst;
+        }
+        foreach (var handler in hvicBody.ExceptionHandlers)
+        {
+            if (handler.TryStart == exitTarget) handler.TryStart = exitLogFirst;
+            if (handler.TryEnd == exitTarget) handler.TryEnd = exitLogFirst;
+            if (handler.HandlerStart == exitTarget) handler.HandlerStart = exitLogFirst;
+            if (handler.HandlerEnd == exitTarget) handler.HandlerEnd = exitLogFirst;
+        }
+        // ENTER marker: insert before the method's very first instruction.
+        EmitPlainLog(hvicIl, hvicInstrs[0], "handleVisibleItemsChange:ENTER\n");
+
+        // Third instrumentation point: doPaint()'s very first instruction. doPaint has two
+        // early-exit branches above the drawCells() call (scrollbar-only repaint; columns.Count==0
+        // && !ownerDraw) that would explain zero content draws without groups/itemsCount/
+        // refreshingCachedItemList being at fault. Logs Name so log entries can finally be
+        // attributed to a specific ControlDataGrid instance (dataGridCategory specifically),
+        // since drawCellsWithGrouping's own diagnostic has only ever shown some other 3-item grid.
+        var doPaintMethod = type.Methods.FirstOrDefault(m => m.Name == "doPaint" && m.HasBody);
+        var columnsField = type.Fields.FirstOrDefault(f => f.Name == "columns");
+        var ownerDrawField = type.Fields.FirstOrDefault(f => f.Name == "ownerDraw");
+        var vScrollBarField = type.Fields.FirstOrDefault(f => f.Name == "vScrollBar");
+        if (doPaintMethod is null || columnsField is null || ownerDrawField is null || vScrollBarField is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't find doPaint or columns/ownerDraw/vScrollBar fields");
+            return 1;
+        }
+        var columnsCountGetter = columnsField.FieldType.Resolve().Methods.FirstOrDefault(m => m.Name == "get_Count");
+        if (columnsCountGetter is null) { Console.Error.WriteLine("FAIL: DataGridColumnCollection has no get_Count"); return 1; }
+        var columnsCountGetterRef = module.ImportReference(columnsCountGetter);
+
+        // il-patcher itself doesn't reference System.Windows.Forms, so resolve Control (and its
+        // Name/Visible getters) by walking up ControlDataGrid's own base-type chain via Cecil
+        // instead of via System.Reflection typeof().
+        TypeDefinition? controlType = type.Resolve();
+        while (controlType is not null && controlType.FullName != "System.Windows.Forms.Control")
+        {
+            controlType = controlType.BaseType?.Resolve();
+        }
+        if (controlType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control in base-type chain"); return 1; }
+        var nameGetterDef = controlType.Methods.FirstOrDefault(m => m.Name == "get_Name");
+        var visibleGetterDef = controlType.Methods.FirstOrDefault(m => m.Name == "get_Visible");
+        if (nameGetterDef is null || visibleGetterDef is null) { Console.Error.WriteLine("FAIL: Control missing get_Name/get_Visible"); return 1; }
+        var controlGetName = module.ImportReference(nameGetterDef);
+        var controlGetVisible = module.ImportReference(visibleGetterDef);
+
+        var doPaintBody = doPaintMethod.Body;
+        doPaintBody.InitLocals = true;
+        var dpTmpInt = new VariableDefinition(module.TypeSystem.Int32);
+        var dpTmpBool = new VariableDefinition(module.TypeSystem.Boolean);
+        var dpTmpMsg = new VariableDefinition(module.TypeSystem.String);
+        doPaintBody.Variables.Add(dpTmpInt);
+        doPaintBody.Variables.Add(dpTmpBool);
+        doPaintBody.Variables.Add(dpTmpMsg);
+        var dpIl = doPaintBody.GetILProcessor();
+        var dpFirst = doPaintBody.Instructions[0];
+        void EmitDp(params Instruction[] instrs) { foreach (var i in instrs) dpIl.InsertBefore(dpFirst, i); }
+
+        // Name=<name>
+        EmitDp(
+            Instruction.Create(OpCodes.Ldstr, logPath),
+            Instruction.Create(OpCodes.Ldstr, "doPaint:Name="),
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Callvirt, controlGetName),
+            Instruction.Create(OpCodes.Ldstr, "\n"),
+            Instruction.Create(OpCodes.Call, module.ImportReference(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string), typeof(string) })!)),
+            Instruction.Create(OpCodes.Call, appendAllText)
+        );
+        // columns.Count=N
+        EmitDp(
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldfld, columnsField),
+            Instruction.Create(OpCodes.Callvirt, columnsCountGetterRef),
+            Instruction.Create(OpCodes.Stloc, dpTmpInt),
+            Instruction.Create(OpCodes.Ldstr, "doPaint:columns.Count="),
+            Instruction.Create(OpCodes.Ldloca, dpTmpInt),
+            Instruction.Create(OpCodes.Call, int32ToString),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldstr, "\n"),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Stloc, dpTmpMsg),
+            Instruction.Create(OpCodes.Ldstr, logPath),
+            Instruction.Create(OpCodes.Ldloc, dpTmpMsg),
+            Instruction.Create(OpCodes.Call, appendAllText)
+        );
+        // ownerDraw=True/False
+        EmitDp(
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldfld, ownerDrawField),
+            Instruction.Create(OpCodes.Stloc, dpTmpBool),
+            Instruction.Create(OpCodes.Ldstr, "doPaint:ownerDraw="),
+            Instruction.Create(OpCodes.Ldloca, dpTmpBool),
+            Instruction.Create(OpCodes.Call, boolToString),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldstr, "\n"),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Stloc, dpTmpMsg),
+            Instruction.Create(OpCodes.Ldstr, logPath),
+            Instruction.Create(OpCodes.Ldloc, dpTmpMsg),
+            Instruction.Create(OpCodes.Call, appendAllText)
+        );
+        // vScrollBar.Visible=True/False
+        EmitDp(
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldfld, vScrollBarField),
+            Instruction.Create(OpCodes.Callvirt, controlGetVisible),
+            Instruction.Create(OpCodes.Stloc, dpTmpBool),
+            Instruction.Create(OpCodes.Ldstr, "doPaint:vScrollBar.Visible="),
+            Instruction.Create(OpCodes.Ldloca, dpTmpBool),
+            Instruction.Create(OpCodes.Call, boolToString),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldstr, "\n---\n"),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Stloc, dpTmpMsg),
+            Instruction.Create(OpCodes.Ldstr, logPath),
+            Instruction.Create(OpCodes.Ldloc, dpTmpMsg),
+            Instruction.Create(OpCodes.Call, appendAllText)
+        );
+
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::{targetMethod} -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted ENTER/EXIT markers around {targetType}::handleVisibleItemsChange -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::doPaint -> {logPath}");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-settings-refresh <input-dir> <output-dir>
+//
+// The real fix, found via --patch-diag: dataGridCategory paints exactly once during the whole
+// Settings session, and at that one paint columns.Count==0 -- it fires before
+// formSettings.loadCategories() has added its three columns, so ControlDataGrid.doPaint()'s
+// `columns.Count == 0 && !ownerDraw` branch fires (background fill only, drawCells() never
+// called), and nothing ever invalidates/repaints the control again afterward. This is not the
+// interpolation bug and not (only) the clip-region bug -- it's a stale premature paint that's
+// never superseded by a correct one.
+//
+// Fix: MailClient.dll, UI.Forms.formSettings::formSettings_Load -- insert
+// `dataGridCategory.Refresh();` immediately after the existing `dataGridCategory.EndUpdate();`
+// call, forcing one more, now-fully-populated repaint unconditionally at the point everything
+// is guaranteed to be set up correctly.
+static int RunPatchSettingsRefresh(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-settings-refresh <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.formSettings";
+    const string targetMethod = "formSettings_Load";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var method = type.Methods.FirstOrDefault(m => m.Name == targetMethod && m.HasBody);
+        if (method is null) { Console.Error.WriteLine($"FAIL: method not found: {targetType}::{targetMethod}"); return 1; }
+
+        var dataGridCategoryField = type.Fields.FirstOrDefault(f => f.Name == "dataGridCategory");
+        if (dataGridCategoryField is null) { Console.Error.WriteLine("FAIL: couldn't find dataGridCategory field"); return 1; }
+
+        var gridType = dataGridCategoryField.FieldType.Resolve();
+        // Resolve Control::Refresh() by walking ControlDataGrid's own base-type chain, same
+        // approach as --patch-diag (this project doesn't reference System.Windows.Forms directly).
+        TypeDefinition? controlType = gridType;
+        while (controlType is not null && controlType.FullName != "System.Windows.Forms.Control")
+        {
+            controlType = controlType.BaseType?.Resolve();
+        }
+        if (controlType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control in base-type chain"); return 1; }
+        var refreshDef = controlType.Methods.FirstOrDefault(m => m.Name == "Refresh" && m.Parameters.Count == 0);
+        if (refreshDef is null) { Console.Error.WriteLine("FAIL: Control has no parameterless Refresh()"); return 1; }
+        var refreshRef = module.ImportReference(refreshDef);
+
+        var il = method.Body.Instructions;
+        Instruction? endUpdateCall = null;
+        for (int k = 0; k < il.Count; k++)
+        {
+            if ((il[k].OpCode == OpCodes.Callvirt || il[k].OpCode == OpCodes.Call) &&
+                il[k].Operand is MethodReference mr && mr.Name == "EndUpdate" &&
+                il[k - 1].OpCode == OpCodes.Ldfld && il[k - 1].Operand is FieldReference fr && fr.Name == "dataGridCategory")
+            {
+                endUpdateCall = il[k];
+                break;
+            }
+        }
+        if (endUpdateCall is null)
+        {
+            Console.Error.WriteLine($"FAIL: couldn't find `dataGridCategory.EndUpdate()` call in {targetType}::{targetMethod} -- refusing to patch");
+            return 1;
+        }
+
+        var proc = method.Body.GetILProcessor();
+        var insertPoint = endUpdateCall.Next; // right after the EndUpdate() call
+        var ldarg0 = Instruction.Create(OpCodes.Ldarg_0);
+        proc.InsertBefore(insertPoint, ldarg0);
+        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Ldfld, dataGridCategoryField));
+        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Callvirt, refreshRef));
+        // retarget anything branching to the old insertPoint isn't needed here: insertPoint is
+        // the CultureChanger.get_Instance() call, not a branch target in this method (verified
+        // by reading the IL directly -- no branches land past EndUpdate() in formSettings_Load).
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::{targetMethod} -- inserted dataGridCategory.Refresh() right after dataGridCategory.EndUpdate()");
         patched = true;
 
         module.Write(destPath);
