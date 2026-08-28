@@ -27,7 +27,77 @@ if (args.Length > 0 && args[0] == "--patch-default-client-notimpl")
     return RunPatchDefaultClientNotImpl(args);
 }
 
+if (args.Length > 0 && args[0] == "--dump-handlers")
+{
+    return RunDumpHandlers(args);
+}
+
 return RunScan(args);
+
+// --dump-handlers <dll> <type> <method>
+//
+// Verification tool, not a patch: dumps a method's exception-handler table in on-disk table
+// order with each entry's (TryStart, TryEnd) and (HandlerStart, HandlerEnd) as instruction
+// offsets, and flags any pair where one handler's range is nested inside another's but the
+// nested one appears AFTER the enclosing one -- the CLR requires most-nested-first order for
+// overlapping protected regions, and violating it produces a runtime InvalidProgramException
+// that neither Cecil's writer nor ilspycmd's decompiler flags at patch time (hit this for real:
+// --patch-default-client-notimpl's first version appended a new inner catch handler to the end
+// of the handler list, landing it after the method's outer finally handler -- decompiled clean,
+// crashed at runtime). Run this after any patch that adds or moves exception-handler regions.
+static int RunDumpHandlers(string[] args)
+{
+    if (args.Length < 4)
+    {
+        Console.Error.WriteLine("usage: il-patcher --dump-handlers <dll> <type> <method>");
+        return 2;
+    }
+    string dllPath = args[1], typeName = args[2], methodName = args[3];
+    var resolver = new DefaultAssemblyResolver();
+    resolver.AddSearchDirectory(Path.GetDirectoryName(Path.GetFullPath(dllPath))!);
+    using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters { AssemblyResolver = resolver });
+    var type = module.GetType(typeName);
+    if (type is null) { Console.Error.WriteLine($"type not found: {typeName}"); return 1; }
+    var method = type.Methods.FirstOrDefault(m => m.Name == methodName && m.HasBody);
+    if (method is null) { Console.Error.WriteLine($"method not found: {typeName}::{methodName}"); return 1; }
+
+    var handlers = method.Body.ExceptionHandlers;
+    string Off(Instruction? i) => i is null ? "END" : $"0x{i.Offset:x4}";
+    for (int i = 0; i < handlers.Count; i++)
+    {
+        var h = handlers[i];
+        Console.WriteLine($"[{i}] {h.HandlerType,-8} try=({Off(h.TryStart)}-{Off(h.TryEnd)}) handler=({Off(h.HandlerStart)}-{Off(h.HandlerEnd)}) catchType={h.CatchType?.FullName}");
+    }
+
+    bool ok = true;
+    for (int i = 0; i < handlers.Count; i++)
+    {
+        for (int j = i + 1; j < handlers.Count; j++)
+        {
+            var a = handlers[i];
+            var b = handlers[j];
+            bool aInsideB = a.TryStart!.Offset >= b.TryStart!.Offset &&
+                (b.TryEnd is null || (a.TryEnd is not null && a.TryEnd.Offset <= b.TryEnd.Offset)) &&
+                !(a.TryStart.Offset == b.TryStart.Offset && a.TryEnd == b.TryEnd); // not siblings on the same try
+            if (aInsideB)
+            {
+                // a is more nested than b, so a must come first (i < j) -- it does, since i<j here.
+                continue;
+            }
+            bool bInsideA = b.TryStart!.Offset >= a.TryStart!.Offset &&
+                (a.TryEnd is null || (b.TryEnd is not null && b.TryEnd.Offset <= a.TryEnd.Offset)) &&
+                !(a.TryStart.Offset == b.TryStart.Offset && a.TryEnd == b.TryEnd);
+            if (bInsideA)
+            {
+                // b is more nested than a but appears AFTER a (j > i) -- WRONG order.
+                Console.Error.WriteLine($"ORDER VIOLATION: handler [{j}] ({b.HandlerType}, try {Off(b.TryStart)}-{Off(b.TryEnd)}) is more nested than [{i}] ({a.HandlerType}, try {Off(a.TryStart)}-{Off(a.TryEnd)}) but appears after it -- must be reordered before it.");
+                ok = false;
+            }
+        }
+    }
+    Console.WriteLine(ok ? "OK: nesting order looks correct." : "FAIL: nesting order violation(s) found above.");
+    return ok ? 0 : 1;
+}
 
 static int RunScan(string[] args)
 {
@@ -1018,8 +1088,30 @@ static int RunPatchDefaultClientNotImpl(string[] args)
         proc.InsertBefore(afterComHandler, Instruction.Create(OpCodes.Ldc_I4_0));
         proc.InsertBefore(afterComHandler, Instruction.Create(OpCodes.Stloc, stlocVar!));
         proc.InsertBefore(afterComHandler, newHandlerLast);
+        // comHandler.HandlerEnd is still the SAME instruction object (afterComHandler) -- an
+        // exclusive boundary marker, not a fixed offset. Since 4 new instructions were just
+        // inserted immediately before it, its effective (serialized) offset moved later,
+        // silently growing the ORIGINAL COMException handler's own range to swallow the new
+        // code too (confirmed via --dump-handlers: without this line, COMException's handler
+        // range overlapped the new NotImplementedException handler's range entirely -- this,
+        // not just handler-table order, is what actually produced the InvalidProgramException).
+        // Retarget it to end exactly where the new handler begins.
+        comHandler.HandlerEnd = newHandlerFirst;
 
-        body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+        // Must be inserted at comHandler's position among its siblings, NOT appended to the end
+        // of body.ExceptionHandlers -- the outer try/finally (a wider, less-nested protected
+        // region) is already in that list, positioned after all four inner catches, and the CLR
+        // exception-handler table requires entries ordered from most-nested to least-nested.
+        // Appending unconditionally put this new (more-nested, matches the inner try) handler
+        // after the outer finally (less-nested) -- invalid ordering. The CLR verifier catches
+        // this at JIT time even though ilspycmd's decompiler didn't complain about it
+        // (confirmed: deployed and crashed with `InvalidProgramException: Common Language
+        // Runtime detected an invalid program` from this exact method -- decompiling clean is
+        // necessary but not sufficient for insertion patches that touch exception regions;
+        // getting handler table ORDER right matters even when the instruction stream itself is
+        // fine).
+        int comHandlerIndex = body.ExceptionHandlers.IndexOf(comHandler);
+        body.ExceptionHandlers.Insert(comHandlerIndex + 1, new ExceptionHandler(ExceptionHandlerType.Catch)
         {
             TryStart = comHandler.TryStart,
             TryEnd = comHandler.TryEnd,
