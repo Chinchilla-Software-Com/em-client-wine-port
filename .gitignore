@@ -1,0 +1,13 @@
+# Vendor/reference binaries - untouched, reproducible from the eM Client installer
+original/
+
+# Build artifacts from the Cecil patcher - regenerable from original/ + il-patches/*.json
+il-patches/output/
+il-patches/backup/
+
+# ilspycmd decompile output - regenerable from original/ or il-patches/output/
+decompiled/
+
+# CX_DEBUGMSG trace captures - large, ephemeral, regenerable by rerunning under trace
+reports/cxlog*.txt
+reports/cxlog*.txt.bak

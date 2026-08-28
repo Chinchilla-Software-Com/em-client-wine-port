@@ -1,0 +1,21 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "filesystem": { "allowWrite": ["./decompiled/**", "./il-patches/**", "./reports/**"] }
+  },
+  "permissions": {
+    "deny": ["Bash(sudo *)", "Bash(rm -rf /*)", "Bash(rm -rf ~*)", "Bash(mkfs*)", "Bash(dd if=*)",
+              "Bash(shutdown*)", "Bash(reboot*)", "Bash(curl * | sh*)", "Bash(wget * | sh*)"],
+"allow": [
+  "Bash(dotnet *)", "Bash(ilspycmd *)", "Bash(git *)",
+  "Bash(strings *)", "Bash(grep *)", "Bash(find *)",
+  "Bash(/opt/cxoffice/bin/wine *)", "Bash(winedbg *)",
+  "Bash(CX_LOG=* CX_DEBUGMSG=* *)",
+  "Bash(wine reg *)", "Bash(*/wineserver -k)",
+  "Read", "Edit"
+]
+
+  },
+  "disableBypassPermissionsMode": "disable"
+}

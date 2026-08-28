@@ -1,0 +1,18 @@
+[
+  {
+    "Assembly": "MailClient.Common.UI.dll",
+    "Type": "MailClient.Common.UI.CommonPaintUtils/<>c__DisplayClass25_0",
+    "Method": "<ResizeImage>b__0",
+    "IlOffset": "0x0067",
+    "OldValue": 7,
+    "NewValue": 3
+  },
+  {
+    "Assembly": "MailClient.dll",
+    "Type": "MailClient.UI.Forms.FormSplashScreen",
+    "Method": "OnPaintBackground",
+    "IlOffset": "0x001c",
+    "OldValue": 7,
+    "NewValue": 3
+  }
+]
