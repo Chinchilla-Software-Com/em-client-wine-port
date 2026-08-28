@@ -146,11 +146,90 @@ during setup that nothing ever supersedes. (`refreshingCachedItemList`, the flag
 `handleVisibleItemsChange()` showed it always correctly resets, 54/54 across a session — no
 exception is leaking there.)
 
-## Fix
+## First fix attempt (superseded) and what it actually revealed
 
-`MailClient.dll`, `UI.Forms.formSettings::formSettings_Load` — insert
-`dataGridCategory.Refresh();` immediately after the existing `dataGridCategory.EndUpdate();`
-call, via a new `--patch-settings-refresh` mode in `~/tools/il-patcher`. This forces one more,
-unconditional repaint at the exact point where `loadCategories()` has already finished and the
-grid is guaranteed fully populated — superseding whatever premature paint happened earlier,
-regardless of why it happened. Not yet visually confirmed working.
+The initial fix tried was `dataGridCategory.Refresh();` immediately after
+`dataGridCategory.EndUpdate();` inside `formSettings_Load`, on the theory that one stale
+premature paint (before `loadCategories()` populated the columns) was never being superseded.
+Re-instrumented with `--patch-diag` and retested: **every** `doPaint` sample for
+`dataGridCategory` still showed `columns.Count==0`, not just the first — ruling that theory out.
+Deeper instrumentation (logging every `SetDataSource` call by control `Name`) showed
+`SetDataSource` was **never called for `dataGridCategory` at all**, meaning `loadCategories()`
+(which calls it via `ReloadCategories()`) never ran to completion.
+
+Bracketing `formSettings_Load` itself with ENTER/BEFORE-loadCategories/AFTER-loadCategories log
+markers settled it: **`formSettings_Load`'s very first instruction never executes.** Not "throws
+partway through" — never entered, full stop. Yet `base.Load += new
+EventHandler(formSettings_Load);` is correctly wired near the end of a clean
+`InitializeComponent()` (verified by reading the IL directly) — this isn't an event-wiring bug.
+The conclusion: **the `Load` event itself is never raised for this form under Wine**, most likely
+because eM Client shows the Settings dialog through a path that doesn't trigger WinForms' normal
+`Show()`/`OnLoad()` sequence. Every other settings page renders fine because it populates itself
+independently (constructor/`OnLoad` override on the page control itself); `dataGridCategory` is
+the one thing only `formSettings_Load` ever configures.
+
+## The actual fix
+
+`MailClient.dll`, `UI.Forms.formSettings(string tabName)`'s **public constructor** — insert
+
+```csharp
+try { formSettings_Load(this, EventArgs.Empty); }
+catch (Exception ex) { /* log to Z:\tmp\claude-diag.log */ }
+```
+
+immediately after the constructor's own `SwitchToTabPanel(...)` call, via
+`--patch-settings-refresh` in `~/tools/il-patcher`. Two things about placement mattered:
+
+- **Which constructor.** A first attempt put this call in the *private* parameterless
+  constructor (which runs first, via `: this()`). `--patch-diag` showed real progress —
+  `loadCategories()` ran end-to-end, `SetDataSource` fired for `dataGridCategory` with genuine
+  data — but the app then crashed with an unhandled `System.InvalidOperationException: Invoke or
+  BeginInvoke cannot be called on a control until the window handle has been created.` (full
+  stack trace captured via the bug-report file the app itself generated,
+  `bug.20260828183820.txt`: `Control.BeginInvoke` → `formSettings_Load` → `formSettings..ctor`).
+  `formSettings_Load`'s tail end reads `controlPanelSwitcher.CurrentPanel`, which is only set by
+  `SwitchToTabPanel(...)` — called by the *public* constructor, which hasn't run yet when the
+  private constructor's body is still executing. Moving the call to after the public
+  constructor's own `SwitchToTabPanel(...)` call fixed this: `CurrentPanel` is already set,
+  matching the order the natural `Load` event path would have produced.
+- **The try/catch is a permanent safety net, not just a diagnostic.** `formSettings_Load` also
+  briefly included a `this.BeginInvoke(new Action(dataGridCategory.Refresh))` call from an even
+  earlier fix attempt (since removed — proven unnecessary once real data flows through the
+  natural paint cycle) that reliably threw `InvalidOperationException` for the same
+  window-handle-not-created-yet reason. The try/catch caught it safely every time; the exception
+  just added log/telemetry noise. Confirmed via `--patch-diag` that IL-insertion mistakes are a
+  real risk worth guarding against here too — two separate bugs were caught this way and fixed
+  before deploying: (1) inserting three log instructions by repeatedly re-reading `il[0]` as the
+  anchor instead of capturing it once reversed their order into invalid IL (caught by
+  re-decompiling before deploy — ilspycmd reported a stack underflow); (2) inserting new code
+  immediately before a branch target without retargeting the branches that pointed at it caused
+  the new code to be silently skipped whenever that branch was taken (hit twice: once in an
+  earlier `handleVisibleItemsChange` EXIT marker, once in this constructor fix, where
+  `if (!wizardExport.XmlExportAvailable)`'s branch — true in the common case — jumped straight
+  past the new call). Both are now standing lessons for any future IL-insertion patch in this
+  project: always re-decompile and read the result before deploying.
+
+**Confirmed working, visually, by the user:** categories now load in the Settings left panel (12
+groups, 47 items) and are clickable.
+
+## Unrelated bug surfaced once the panel actually worked
+
+Clicking into a category (the default/first one, "General") crashes the app. Full stack trace
+captured from the bug-report file the app generated, `bug.20260828184622.txt`:
+
+```
+System.NotImplementedException: The method or operation is not implemented.
+  at MailClient.Utils.IApplicationAssociationRegistration.QueryAppIsDefaultAll(...)
+  at MailClient.Utils.Integration.IsDefaultClientVista()
+  at MailClient.Utils.Integration.IsDefaultClient()
+  at MailClient.UI.Controls.SettingsControls.ControlSettingsGeneral.checkDefaultClient()
+  at MailClient.UI.Controls.SettingsControls.ControlSettingsGeneral.LoadSettings()
+  at MailClient.UI.Controls.SettingsControls.ControlSettingsBase.OnLoad(EventArgs)
+```
+
+This is a completely different class of bug from everything above — a Windows Shell COM API
+(`IApplicationAssociationRegistration`, used to check "is this the default mail client") that
+Wine doesn't implement, thrown unhandled rather than failing gracefully, from the General
+settings page's "Default Email Application" section (visible, unpopulated, in
+`supporting/settings-broken.png` from the very start of this investigation). Not yet
+investigated — worth its own report if pursued.
