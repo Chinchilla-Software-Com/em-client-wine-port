@@ -118,6 +118,15 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   intermediate fixes and why they failed (a Wine clip-region bug that was real but not the
   cause; calling the same fix from the wrong constructor, which crashed on unset
   `CurrentPanel`) are documented so they aren't re-tried: `reports/settings-panel-clip-region-findings.md`.
+- **Settings category click crash.** `NotImplementedException` from
+  `IApplicationAssociationRegistration.QueryAppIsDefaultAll` — a Windows Shell "is this the
+  default mail client" COM API Wine doesn't implement, thrown unhandled instead of failing
+  gracefully. Fixed by adding a sibling `catch (NotImplementedException) { return false; }`
+  handler next to `Integration.IsDefaultClientVista`'s existing `catch (COMException) { return
+  false; }` — the app already anticipated this class of COM failure, Wine just throws a
+  differently-typed exception for it. User confirmed: moved between all categories, changed and
+  saved settings, no further crash. Full history (including two exception-handler IL-correctness
+  bugs hit and fixed along the way): `reports/default-mail-client-notimplemented-findings.md`.
 
 **Confirmed as a real, separate Wine bug, but not the cause of anything fixed above — patched
 anyway since it's a real bug and the fix is cheap:**
@@ -143,18 +152,10 @@ anyway since it's a real bug and the fix is cheap:**
   the same disassembly (High aliases to HighQualityBicubic internally). Promote to a stage if
   pursued — don't leave as "Hold, no evidence", that reasoning is now stale.
 
-**Patched, not yet visually confirmed by the user:**
-- Clicking into a Settings category (e.g. General, the default) crashed the app:
-  `NotImplementedException` from `IApplicationAssociationRegistration.QueryAppIsDefaultAll`
-  (`MailClient.Utils.Integration.IsDefaultClientVista` → `checkDefaultClient` →
-  `ControlSettingsGeneral.LoadSettings`) — a Windows Shell "is this the default mail client" COM
-  API Wine doesn't implement, thrown unhandled instead of failing gracefully. Fixed by adding a
-  sibling `catch (NotImplementedException) { return false; }` handler next to the method's
-  existing `catch (COMException) { return false; }` — the app already anticipated this class of
-  COM failure, Wine just throws a differently-typed exception for it. See "IL-patching lessons"
-  for two real bugs (handler-table order, and an overlapping-range bug from not retargeting
-  `HandlerEnd`) hit and fixed while building this patch — both produced a runtime
-  `InvalidProgramException` despite decompiling clean, which is why `--dump-handlers` exists.
+No open items as of this update — the two bugs originally reported (blank Settings panel, and
+the category-click crash found once the panel worked) are both fixed and confirmed. Stage 2/3/
+Hold interpolation items above remain scanned-but-not-pursued if a future session wants to
+extend that work.
 
 ## Investigation method (what actually worked this round)
 
