@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>MailClient.Licensing.BouncyCastlePatch</RootNamespace>
+    <AssemblyName>MailClient.Licensing.BouncyCastlePatch</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Reference the exact vendored BouncyCastle build already shipped with eM Client, not a
+         NuGet-fetched copy, to guarantee identical behavior and avoid any network dependency. -->
+    <Reference Include="BouncyCastle.Cryptography">
+      <HintPath>/home/portagent/project/original/BouncyCastle.Cryptography.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

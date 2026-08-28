@@ -12,6 +12,21 @@
                       (il-patches/il-patcher-Program.cs — copy back to
                       ~/tools/il-patcher/Program.cs and `dotnet build -c Release` before use;
                       the ~/tools/ copy is gitignored, this copy is the tracked source of truth).
+                      A second, smaller Cecil tool lives alongside it for the license-activation
+                      fix (Stage 5 below): il-patches/license-oaep-patcher-Program.cs (copy to
+                      ~/tools/license-oaep-patcher/Program.cs; console app, net10.0, references
+                      Mono.Cecil 0.11.6 — same shape as il-patcher's own untracked .csproj) and
+                      il-patches/license-oaep-patcher-patch-deps-json.py (copy anywhere, it just
+                      needs a path argument). It's a separate tool rather than a new il-patcher
+                      mode because this fix's shape — redirecting a call to a newly-added sibling
+                      assembly — doesn't fit the existing tool's per-fix flag pattern as cleanly.
+                      il-patches/MailClient.Licensing.BouncyCastlePatch/ is the full tracked
+                      source (OaepPatch.cs + its .csproj) of the new helper assembly Stage 5
+                      builds and deploys — this one *is* shipped into the bottle, unlike the
+                      patcher tools, so it's tracked in full rather than as a "copy back" source
+                      file. Its .csproj HintPaths BouncyCastle.Cryptography.dll from
+                      `original/` by absolute path — adjust if building from a different checkout
+                      location.
                       il-patches/output*/ and il-patches/backup/ are gitignored build output —
                       regenerate via the pipeline below, don't hand-edit or commit them.
 - reports/crossover-backlog.json — one entry per CONFIRMED freeze point
@@ -48,10 +63,14 @@ Run in order; each stage's output directory is the next stage's input. All comma
 `~/tools/il-patcher` is built (`cd ~/tools/il-patcher && dotnet build -c Release`) from
 `il-patches/il-patcher-Program.cs` (copy it to `~/tools/il-patcher/Program.cs` first if rebuilding
 from a clean checkout — the tool itself isn't tracked in this repo's git history under its own
-path).
+path), and `~/tools/license-oaep-patcher` + `~/tools/MailClient.Licensing.BouncyCastlePatch` are
+built the same way from their `il-patches/` tracked sources (Stage 5 below needs both).
 
 ```bash
-ILP="dotnet ~/tools/il-patcher/bin/Release/net10.0/il-patcher.dll"
+# Note: use $HOME, not ~, inside these quoted assignments -- ~ does not expand inside double
+# quotes in bash, so ILP="dotnet ~/tools/..." silently fails to resolve when $ILP is invoked.
+ILP="dotnet $HOME/tools/il-patcher/bin/Release/net10.0/il-patcher.dll"
+ILP2="dotnet $HOME/tools/license-oaep-patcher/bin/Release/net10.0/license-oaep-patcher.dll"
 
 # Stage 1: InterpolationMode.Bilinear fix (splash screen banner + Settings icon resize).
 # Touches MailClient.dll (FormSplashScreen.OnPaintBackground) and
@@ -69,13 +88,30 @@ $ILP --patch-settings-refresh il-patches/output-stage2/ il-patches/output-stage3
 # Stage 4: category-click crash fix (Integration.IsDefaultClientVista).
 # Touches MailClient.dll only. If you add any further exception-handler patch after this
 # one, verify with --dump-handlers before deploying -- see "IL-patching lessons".
-$ILP --patch-default-client-notimpl il-patches/output-stage3-final/ il-patches/output-final/
+$ILP --patch-default-client-notimpl il-patches/output-stage3-final/ il-patches/output-stage4/
 
-# Deploy: swap both touched DLLs into the live bottle (back up the bottle's current
-# copies first if you haven't already — see "Rollback" below).
+# Stage 5: License Activate RSA-OAEP decrypt fix (redirects DecryptAndVerify's OAEP calls to a
+# new BouncyCastle-backed helper assembly instead of Wine's broken native RSA.Decrypt path).
+# Touches MailClient.dll only, and adds a new sibling assembly. Build the helper first:
+(cd ~/tools/MailClient.Licensing.BouncyCastlePatch && dotnet build -c Release)
+mkdir -p il-patches/output-final
+$ILP2 il-patches/output-stage4/MailClient.dll \
+  ~/tools/MailClient.Licensing.BouncyCastlePatch/bin/Release/net8.0/MailClient.Licensing.BouncyCastlePatch.dll \
+  il-patches/output-final/MailClient.dll
+# output-final/ needs the rest of the stage-4 tree too (everything Stage 5 doesn't touch) plus
+# the new helper assembly, to be a complete deployable directory:
+rsync -a --ignore-existing il-patches/output-stage4/ il-patches/output-final/
+cp ~/tools/MailClient.Licensing.BouncyCastlePatch/bin/Release/net8.0/MailClient.Licensing.BouncyCastlePatch.dll il-patches/output-final/
+
+# Deploy: swap all three touched/added files into the live bottle (back up the bottle's current
+# copies first if you haven't already — see "Rollback" below), then patch deps.json so the new
+# assembly resolves at runtime (this is a real deps.json-managed deployment, 247+ libraries
+# listed — a dropped-in DLL isn't found without an explicit entry; the script is idempotent).
 BOTTLE="/home/$USER/.cxoffice/emClient_win_7_x64/drive_c/Program Files (x86)/eM Client"
 cp il-patches/output-final/MailClient.dll "$BOTTLE/MailClient.dll"
 cp il-patches/output-final/MailClient.Common.UI.dll "$BOTTLE/MailClient.Common.UI.dll"
+cp il-patches/output-final/MailClient.Licensing.BouncyCastlePatch.dll "$BOTTLE/"
+python3 il-patches/license-oaep-patcher-patch-deps-json.py "$BOTTLE/MailClient.deps.json"
 ```
 
 Verify before deploying, every time — this has caught real bugs (see "IL-patching lessons"
@@ -89,6 +125,7 @@ $ILP il-patches/output-final/    # (no --patch flag = scan mode)
 export DOTNET_ROOT=~/.dotnet   # ilspycmd needs this set in this environment
 ilspycmd -m "M:MailClient.UI.Forms.formSettings.formSettings_Load(System.Object,System.EventArgs)" il-patches/output-final/MailClient.dll
 ilspycmd -t "MailClient.Common.UI.Controls.ControlDataGrid.ControlDataGrid" il-patches/output-final/MailClient.Common.UI.dll | grep AllPaintingInWmPaint
+ilspycmd -t "MailClient.Licensing.DecryptAndVerify" il-patches/output-final/MailClient.dll | grep OaepPatch
 
 # Any patch touching exception handlers (Stage 4 and beyond) additionally needs the handler
 # table itself checked — decompiling clean is not sufficient (see "IL-patching lessons"):
@@ -127,6 +164,19 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   differently-typed exception for it. User confirmed: moved between all categories, changed and
   saved settings, no further crash. Full history (including two exception-handler IL-correctness
   bugs hit and fixed along the way): `reports/default-mail-client-notimplemented-findings.md`.
+- **License Activation failure** (spinner, then silent revert, no visible error). Root cause: an
+  RSA-OAEP private-key decrypt (`DecryptAndVerify.DecryptAndVerifyString`/`...StringV1` in
+  `MailClient.dll`, behind the License dialog's Activate button) fails inside Wine's `bcrypt.dll`
+  — `gnutls_x509_privkey_set_spki` hits an internal GnuTLS assertion specific to OAEP's parameter
+  encoding, throws, and is caught by the app's own blanket handler in `ReporterMode.Silent` (why
+  nothing visible happens). Fixed by redirecting both call sites to a new pure-managed
+  BouncyCastle-backed RSA-OAEP implementation (`MailClient.Licensing.BouncyCastlePatch.dll`,
+  built against the app's already-vendored `BouncyCastle.Cryptography.dll`) instead of the native
+  CNG-backed `RSA.Decrypt` — BouncyCastle has no P/Invoke, so it never touches the broken Wine
+  code path. Cryptographic correctness verified independently before deploying (32/32 checks
+  across 4 key sizes × 4 plaintext shapes, byte-identical to native .NET RSA-OAEP decrypt). User
+  confirmed: Activation completed successfully. Full history, including the standalone
+  verification harness and the trace evidence: `reports/license-activation-oaep-findings.md`.
 
 **Confirmed as a real, separate Wine bug, but not the cause of anything fixed above — patched
 anyway since it's a real bug and the fix is cheap:**
@@ -161,8 +211,9 @@ anyway since it's a real bug and the fix is cheap:**
   confirmed to be the same mechanism.
 
 The two bugs originally reported (blank Settings panel, and the category-click crash found once
-the panel worked) are both fixed and confirmed. Stage 2/3/Hold interpolation items above remain
-scanned-but-not-pursued if a future session wants to extend that work.
+the panel worked), plus the License Activation failure found during that testing, are all fixed
+and confirmed. Stage 2/3/Hold interpolation items above remain scanned-but-not-pursued if a
+future session wants to extend that work.
 
 ## Investigation method (what actually worked this round)
 
