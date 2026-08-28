@@ -22,6 +22,11 @@ if (args.Length > 0 && args[0] == "--patch-settings-refresh")
     return RunPatchSettingsRefresh(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-default-client-notimpl")
+{
+    return RunPatchDefaultClientNotImpl(args);
+}
+
 return RunScan(args);
 
 static int RunScan(string[] args)
@@ -906,6 +911,138 @@ static int RunPatchSettingsRefresh(string[] args)
     return 0;
 }
 
+// --patch-default-client-notimpl <input-dir> <output-dir>
+//
+// New bug, surfaced once the Settings panel itself started working: clicking into a category
+// (e.g. General, the default) crashes the app. Full stack trace captured from the app's own
+// generated bug-report file (C:\users\crossover\AppData\Local\Temp\bug.*.txt):
+//   System.NotImplementedException: The method or operation is not implemented.
+//     at MailClient.Utils.IApplicationAssociationRegistration.QueryAppIsDefaultAll(...)
+//     at MailClient.Utils.Integration.IsDefaultClientVista()
+//     at MailClient.Utils.Integration.IsDefaultClient()
+//     at ControlSettingsGeneral.checkDefaultClient() / LoadSettings() / ControlSettingsBase.OnLoad()
+//
+// IApplicationAssociationRegistration is a Windows Shell COM interface ("is this app the default
+// mail client") that Wine's shell32 doesn't implement -- confirmed by matching CX_DEBUGMSG fixmes
+// seen earlier in this investigation: `fixme:shell:ApplicationAssociationRegistration_QueryInterface
+// ... interface not supported` / `fixme:shell:ApplicationAssociationRegistration_QueryAppIsDefaultAll`.
+// Rather than a real COM failure (which would normally surface as a COMException), Wine's stub
+// apparently throws a raw CLR NotImplementedException through the interop layer.
+//
+// The good news: IsDefaultClientVista() already has a `catch (COMException) { return false; }`
+// handler -- the app's own authors already anticipated "this COM call can fail, and if it does,
+// just report not-default" as a safe, defensively-correct fallback. Wine just throws a
+// differently-typed exception than expected for that exact scenario. Fix: add a sibling
+// `catch (NotImplementedException) { return false; }` handler, structurally identical to (and
+// copied from) the existing COMException one -- same protected try region, same handler body,
+// just a different CatchType. Not a workaround or a guess about behavior; it's completing the
+// error handling the app already has for this exact "the OS integration call isn't available"
+// case.
+static int RunPatchDefaultClientNotImpl(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-default-client-notimpl <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.Utils.Integration";
+    const string targetMethod = "IsDefaultClientVista";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var method = type.Methods.FirstOrDefault(m => m.Name == targetMethod && m.HasBody);
+        if (method is null) { Console.Error.WriteLine($"FAIL: method not found: {targetType}::{targetMethod}"); return 1; }
+
+        var body = method.Body;
+        var comHandler = body.ExceptionHandlers.FirstOrDefault(h =>
+            h.HandlerType == ExceptionHandlerType.Catch &&
+            h.CatchType?.FullName == "System.Runtime.InteropServices.COMException");
+        if (comHandler is null)
+        {
+            Console.Error.WriteLine($"FAIL: couldn't find `catch (COMException)` handler in {targetType}::{targetMethod} -- refusing to patch");
+            return 1;
+        }
+        // Paranoid shape check: the handler body must be exactly `pop; ldc.i4.0; stloc.X; leave*`
+        // (the pattern for `catch (COMException) { return false; }` compiled with a shared exit
+        // point) -- if the compiled shape ever changes, refuse rather than guess.
+        var il = body.Instructions;
+        int hIdx = il.IndexOf(comHandler.HandlerStart);
+        VariableDefinition? stlocVar = null;
+        bool shapeOk = hIdx >= 0 && hIdx + 3 < il.Count &&
+            il[hIdx].OpCode == OpCodes.Pop &&
+            IsLdcI4(il[hIdx + 1], out int zeroCheck) && zeroCheck == 0 &&
+            IsStloc(il[hIdx + 2], body, out stlocVar) && stlocVar is not null &&
+            (il[hIdx + 3].OpCode == OpCodes.Leave || il[hIdx + 3].OpCode == OpCodes.Leave_S);
+        if (!shapeOk)
+        {
+            Console.Error.WriteLine($"FAIL: {targetType}::{targetMethod}'s catch(COMException) handler body doesn't match the expected `pop; ldc.i4.0; stloc; leave` shape -- refusing to patch");
+            return 1;
+        }
+
+        var notImplTypeRef = module.ImportReference(typeof(NotImplementedException));
+        var proc = body.GetILProcessor();
+        var newHandlerFirst = Instruction.Create(OpCodes.Pop);
+        var newHandlerLast = Instruction.Create(il[hIdx + 3].OpCode, (Instruction)il[hIdx + 3].Operand!);
+        // insert the new handler body right after the existing COMException handler's body, so
+        // it isn't itself mistaken for lying inside any other handler's range.
+        var afterComHandler = comHandler.HandlerEnd;
+        proc.InsertBefore(afterComHandler, newHandlerFirst);
+        proc.InsertBefore(afterComHandler, Instruction.Create(OpCodes.Ldc_I4_0));
+        proc.InsertBefore(afterComHandler, Instruction.Create(OpCodes.Stloc, stlocVar!));
+        proc.InsertBefore(afterComHandler, newHandlerLast);
+
+        body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+        {
+            TryStart = comHandler.TryStart,
+            TryEnd = comHandler.TryEnd,
+            HandlerStart = newHandlerFirst,
+            HandlerEnd = afterComHandler,
+            CatchType = notImplTypeRef
+        });
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::{targetMethod} -- added `catch (NotImplementedException) {{ return false; }}` alongside the existing catch (COMException)");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
 static OpCode ShortFormOpCode(int value) => value switch
 {
     -1 => OpCodes.Ldc_I4_M1,
@@ -960,6 +1097,21 @@ static bool IsLdcI4(Instruction insn, out int value)
     if (insn.OpCode == OpCodes.Ldc_I4_6) { value = 6; return true; }
     if (insn.OpCode == OpCodes.Ldc_I4_7) { value = 7; return true; }
     if (insn.OpCode == OpCodes.Ldc_I4_8) { value = 8; return true; }
+    return false;
+}
+
+static bool IsStloc(Instruction insn, MethodBody body, out VariableDefinition? variable)
+{
+    variable = null;
+    if (insn.OpCode == OpCodes.Stloc || insn.OpCode == OpCodes.Stloc_S)
+    {
+        variable = (VariableDefinition)insn.Operand;
+        return true;
+    }
+    if (insn.OpCode == OpCodes.Stloc_0) { variable = body.Variables[0]; return true; }
+    if (insn.OpCode == OpCodes.Stloc_1) { variable = body.Variables[1]; return true; }
+    if (insn.OpCode == OpCodes.Stloc_2) { variable = body.Variables[2]; return true; }
+    if (insn.OpCode == OpCodes.Stloc_3) { variable = body.Variables[3]; return true; }
     return false;
 }
 
