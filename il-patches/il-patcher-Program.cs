@@ -870,6 +870,19 @@ static int RunPatchSettingsRefresh(string[] args)
         checkpointProc.InsertBefore(loadCategoriesCall, Instruction.Create(OpCodes.Ldstr, logPath));
         checkpointProc.InsertBefore(loadCategoriesCall, Instruction.Create(OpCodes.Ldstr, "formSettings_Load:BEFORE loadCategories()\n"));
         checkpointProc.InsertBefore(loadCategoriesCall, Instruction.Create(OpCodes.Call, appendAllText));
+        // ENTER marker: the log file didn't even get created in the previous round (neither
+        // BEFORE nor AFTER fired), so check whether formSettings_Load is entered at all, or
+        // whether something in setFont()/dataGridCategory.BeginUpdate() -- both of which run
+        // before the BEFORE marker -- throws first.
+        // NB: must capture the anchor ONCE and reuse it for all three inserts (not re-read
+        // il[0] each call) -- InsertBefore(fixedAnchor, x) three times in order naturally
+        // stacks x1,x2,x3 correctly right before the anchor; re-reading il[0] each time picks
+        // up the previous insert as the new "first" and reverses the order, corrupting the
+        // stack (this bit the first version of this exact block).
+        var methodFirst = il[0];
+        checkpointProc.InsertBefore(methodFirst, Instruction.Create(OpCodes.Ldstr, logPath));
+        checkpointProc.InsertBefore(methodFirst, Instruction.Create(OpCodes.Ldstr, "formSettings_Load:ENTER\n"));
+        checkpointProc.InsertBefore(methodFirst, Instruction.Create(OpCodes.Call, appendAllText));
         Instruction? endUpdateCall = null;
         for (int k = 0; k < il.Count; k++)
         {
