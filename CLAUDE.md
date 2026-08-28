@@ -64,7 +64,12 @@ $ILP --patch-allpaintinginwmpaint il-patches/output/ il-patches/output-stage2/
 
 # Stage 3: Settings panel Load-event fix.
 # Touches MailClient.dll only (formSettings's public constructor).
-$ILP --patch-settings-refresh il-patches/output-stage2/ il-patches/output-final/
+$ILP --patch-settings-refresh il-patches/output-stage2/ il-patches/output-stage3-final/
+
+# Stage 4: category-click crash fix (Integration.IsDefaultClientVista).
+# Touches MailClient.dll only. If you add any further exception-handler patch after this
+# one, verify with --dump-handlers before deploying -- see "IL-patching lessons".
+$ILP --patch-default-client-notimpl il-patches/output-stage3-final/ il-patches/output-final/
 
 # Deploy: swap both touched DLLs into the live bottle (back up the bottle's current
 # copies first if you haven't already — see "Rollback" below).
@@ -84,6 +89,10 @@ $ILP il-patches/output-final/    # (no --patch flag = scan mode)
 export DOTNET_ROOT=~/.dotnet   # ilspycmd needs this set in this environment
 ilspycmd -m "M:MailClient.UI.Forms.formSettings.formSettings_Load(System.Object,System.EventArgs)" il-patches/output-final/MailClient.dll
 ilspycmd -t "MailClient.Common.UI.Controls.ControlDataGrid.ControlDataGrid" il-patches/output-final/MailClient.Common.UI.dll | grep AllPaintingInWmPaint
+
+# Any patch touching exception handlers (Stage 4 and beyond) additionally needs the handler
+# table itself checked — decompiling clean is not sufficient (see "IL-patching lessons"):
+$ILP --dump-handlers il-patches/output-final/MailClient.dll MailClient.Utils.Integration IsDefaultClientVista
 ```
 
 **Rollback:** back up the bottle's current DLLs before the first-ever deploy in a fresh bottle
@@ -134,14 +143,18 @@ anyway since it's a real bug and the fix is cheap:**
   the same disassembly (High aliases to HighQualityBicubic internally). Promote to a stage if
   pursued — don't leave as "Hold, no evidence", that reasoning is now stale.
 
-**Newly found, not yet fixed:**
-- Clicking into a Settings category (e.g. General, the default) crashes the app:
+**Patched, not yet visually confirmed by the user:**
+- Clicking into a Settings category (e.g. General, the default) crashed the app:
   `NotImplementedException` from `IApplicationAssociationRegistration.QueryAppIsDefaultAll`
   (`MailClient.Utils.Integration.IsDefaultClientVista` → `checkDefaultClient` →
-  `ControlSettingsGeneral.LoadSettings`). A Windows Shell "is this the default mail client" COM
-  API that Wine doesn't implement, thrown unhandled instead of failing gracefully. Full stack
-  trace was captured from the app's own generated bug-report file (see "Investigation method").
-  Not yet investigated further.
+  `ControlSettingsGeneral.LoadSettings`) — a Windows Shell "is this the default mail client" COM
+  API Wine doesn't implement, thrown unhandled instead of failing gracefully. Fixed by adding a
+  sibling `catch (NotImplementedException) { return false; }` handler next to the method's
+  existing `catch (COMException) { return false; }` — the app already anticipated this class of
+  COM failure, Wine just throws a differently-typed exception for it. See "IL-patching lessons"
+  for two real bugs (handler-table order, and an overlapping-range bug from not retargeting
+  `HandlerEnd`) hit and fixed while building this patch — both produced a runtime
+  `InvalidProgramException` despite decompiling clean, which is why `--dump-handlers` exists.
 
 ## Investigation method (what actually worked this round)
 
@@ -191,9 +204,9 @@ poll for the process to exit or the log file to gain content before reading resu
 `~/tools/il-patcher` started as a read-only scanner (`--patch`, simple operand rewrite: flips an
 `ldc.i4` constant, verified by pattern-matching the few instructions around it — low risk). It
 grew instruction-*insertion* modes (`--patch-allpaintinginwmpaint`, `--patch-settings-refresh`,
-and the temporary `--patch-diag`) for fixes that need new code, not just a changed constant. Two
-real bugs were introduced and caught during this session, both worth guarding against explicitly
-next time:
+`--patch-default-client-notimpl`, and the temporary `--patch-diag`) for fixes that need new code,
+not just a changed constant. Several real bugs were introduced and caught during this session,
+all worth guarding against explicitly next time:
 
 1. **Reusing a re-read anchor reverses insertion order.** `InsertBefore(anchor, x)` called three
    times with `anchor` re-read as `il[0]`/similar each time (instead of captured once into a
@@ -212,10 +225,31 @@ next time:
    instruction/handler-region boundary whose `Operand`/`TryStart`/`TryEnd`/`HandlerStart`/
    `HandlerEnd` equals the original anchor, and retarget them to the new first inserted
    instruction.
+3. **Inserting new code before an existing exception handler's own `HandlerEnd` silently grows
+   that handler's range to swallow the new code.** `HandlerEnd` (also `TryEnd`) is an *exclusive
+   boundary marker* — a reference to the instruction right after the region, not a fixed offset.
+   Adding a sibling `catch` clause by inserting its body immediately before an existing handler's
+   `HandlerEnd` extends that *existing* handler's own range to include the new code too, unless
+   `HandlerEnd` is explicitly reassigned to the new code's first instruction. The result:
+   two handlers with overlapping byte ranges — invalid IL that neither Cecil's writer nor
+   ilspycmd's decompiler flags, but the CLR verifier does, as `InvalidProgramException` at JIT
+   time (hit for real, deployed, crashed — see `--patch-default-client-notimpl`'s history).
+   Separately, when a `try` has multiple sibling `catch` clauses, a *new* one must be inserted at
+   that position in `body.ExceptionHandlers` (e.g. right after the existing handler it's modeled
+   on) — appending to the end of the list can land it after an enclosing method's outer
+   `finally`, violating the CLR's required most-nested-first handler ordering. Use
+   `--dump-handlers <dll> <type> <method>` (prints the handler table with resolved offsets and
+   flags nesting-order violations) to verify both **before** deploying, any time a patch adds,
+   moves, or extends an exception-handler region — this class of bug doesn't show up in a
+   decompile.
 
 **Always re-decompile and read the result before deploying** anything beyond a simple operand
 rewrite — `ilspycmd -m "<doc-id>" <dll>` or `ilspycmd -t "<type>" <dll>` on the patched output.
-This caught both bugs above before they ever reached the bottle: bug 1 as an explicit decompiler
-error ("Stack underflow"), bug 2 as the new code visibly appearing inside the wrong `if` block in
-the decompiled C#. A clean scan-mode pass (`$ILP <dir>`, no flags) confirms operand-rewrite
-patches but does *not* catch either of these — it doesn't attempt to decompile control flow.
+This caught bugs 1 and 2 above before they ever reached the bottle: bug 1 as an explicit
+decompiler error ("Stack underflow"), bug 2 as the new code visibly appearing inside the wrong
+`if` block in the decompiled C#. A clean scan-mode pass (`$ILP <dir>`, no flags) confirms
+operand-rewrite patches but does *not* catch any of these three — it doesn't attempt to
+decompile control flow or validate exception regions. Bug 3 is the sharpest lesson here: it
+decompiled perfectly cleanly (ilspycmd doesn't validate handler-region bounds) and only surfaced
+as a real crash after deploying — `--dump-handlers` exists specifically because decompiling
+clean is not sufficient proof for any patch touching exception regions.
