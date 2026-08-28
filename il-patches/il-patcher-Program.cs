@@ -921,6 +921,89 @@ static int RunPatchSettingsRefresh(string[] args)
         // by reading the IL directly -- no branches land past EndUpdate() in formSettings_Load).
 
         Console.WriteLine($"OK   {fileName}: {targetType}::{targetMethod} -- inserted this.BeginInvoke(new Action(dataGridCategory.Refresh)) right after dataGridCategory.EndUpdate()");
+
+        // THE ACTUAL FIX. Confirmed via --patch-settings-refresh's own ENTER/BEFORE/AFTER
+        // markers: formSettings_Load's first instruction never runs at all -- not "throws
+        // partway", never entered, full stop -- even though `base.Load += new
+        // EventHandler(formSettings_Load);` is correctly wired near the end of a clean
+        // InitializeComponent(). The Load event itself is simply never raised for this form in
+        // this environment (plausibly because eM Client shows Settings through a path that
+        // doesn't trigger WinForms' normal Show()/OnLoad() sequence -- other settings pages
+        // still render because they populate themselves independently of formSettings_Load;
+        // dataGridCategory is the one thing that ONLY formSettings_Load ever configures).
+        //
+        // Fix: call formSettings_Load(this, EventArgs.Empty) directly from the private
+        // parameterless constructor -- which always runs regardless of how the form is shown --
+        // right at the end, in the fall-through position of the existing
+        // `if (!UIUtils.DesignMode) { ... }` block, immediately before the constructor's own
+        // `ResumeLayout();`. This reuses 100% of the existing Load logic (column setup, category
+        // reload, focus/selection, the BeginInvoke(Refresh) just added above) rather than
+        // duplicating it, and confirmed by reading the IL: the two DesignMode-skip branches
+        // (`brtrue IL_0e32-equivalent`) target the ResumeLayout instruction by object identity,
+        // not position, so inserting new code immediately before that instruction naturally
+        // lands in the designmode-skips-it / normal-code-runs-it position with no branch
+        // retargeting needed -- design-time still skips it, exactly like the rest of that block.
+        var ctorMethod = type.Methods.FirstOrDefault(m => m.IsConstructor && !m.IsStatic && m.Parameters.Count == 0);
+        if (ctorMethod is null) { Console.Error.WriteLine($"FAIL: couldn't find {targetType}'s parameterless constructor"); return 1; }
+        var loadHandler = type.Methods.FirstOrDefault(m => m.Name == targetMethod && m.HasBody);
+        if (loadHandler is null) { Console.Error.WriteLine($"FAIL: couldn't re-find {targetType}::{targetMethod} for the constructor call"); return 1; }
+        var loadHandlerRef = module.ImportReference(loadHandler);
+        var eventArgsEmpty = module.ImportReference(typeof(EventArgs).GetField("Empty")!);
+
+        var ctorBody = ctorMethod.Body;
+        var ctorIl = ctorBody.Instructions;
+        Instruction? ctorResumeLayoutCall = null;
+        for (int k = 0; k < ctorIl.Count; k++)
+        {
+            if ((ctorIl[k].OpCode == OpCodes.Callvirt || ctorIl[k].OpCode == OpCodes.Call) &&
+                ctorIl[k].Operand is MethodReference mr3 && mr3.Name == "ResumeLayout" && mr3.Parameters.Count == 0)
+            {
+                ctorResumeLayoutCall = ctorIl[k];
+                // don't break -- take the LAST match, in case ResumeLayout is referenced more
+                // than once anywhere earlier for an unrelated reason; the constructor's own
+                // closing ResumeLayout() is the final one in its body.
+            }
+        }
+        if (ctorResumeLayoutCall is null)
+        {
+            Console.Error.WriteLine($"FAIL: couldn't find `ResumeLayout()` call in {targetType}'s constructor -- refusing to patch");
+            return 1;
+        }
+        var ctorProc = ctorBody.GetILProcessor();
+        // ResumeLayout() is preceded by its own ldarg.0 (the receiver) -- insert before THAT,
+        // not before the call instruction itself, so we don't end up between a ldarg.0 and its
+        // matching call.
+        var ctorInsertAnchor = ctorResumeLayoutCall.Previous!.OpCode == OpCodes.Ldarg_0 ? ctorResumeLayoutCall.Previous! : ctorResumeLayoutCall;
+        var newFirst = Instruction.Create(OpCodes.Ldarg_0);
+        ctorProc.InsertBefore(ctorInsertAnchor, newFirst);
+        ctorProc.InsertBefore(ctorInsertAnchor, Instruction.Create(OpCodes.Ldarg_0));
+        ctorProc.InsertBefore(ctorInsertAnchor, Instruction.Create(OpCodes.Ldsfld, eventArgsEmpty));
+        ctorProc.InsertBefore(ctorInsertAnchor, Instruction.Create(OpCodes.Call, loadHandlerRef));
+        // ctorInsertAnchor is a branch target (at minimum the `if (!wizardExport.XmlExportAvailable)`
+        // check's brtrue.s skips straight to it when the feature IS available -- the common case --
+        // which would otherwise skip my new code entirely, exactly like the earlier
+        // handleVisibleItemsChange EXIT-marker bug). Retarget every branch/exception-handler
+        // reference to it so nothing can land past my inserted call.
+        foreach (var instr in ctorIl)
+        {
+            if (instr.Operand == ctorInsertAnchor) instr.Operand = newFirst;
+            else if (instr.Operand is Instruction[] targets)
+            {
+                for (int t = 0; t < targets.Length; t++)
+                {
+                    if (targets[t] == ctorInsertAnchor) targets[t] = newFirst;
+                }
+            }
+        }
+        foreach (var handler in ctorBody.ExceptionHandlers)
+        {
+            if (handler.TryStart == ctorInsertAnchor) handler.TryStart = newFirst;
+            if (handler.TryEnd == ctorInsertAnchor) handler.TryEnd = newFirst;
+            if (handler.HandlerStart == ctorInsertAnchor) handler.HandlerStart = newFirst;
+            if (handler.HandlerEnd == ctorInsertAnchor) handler.HandlerEnd = newFirst;
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}'s constructor -- inserted formSettings_Load(this, EventArgs.Empty) right before the final ResumeLayout(), retargeting branches that landed on it");
         patched = true;
 
         module.Write(destPath);
