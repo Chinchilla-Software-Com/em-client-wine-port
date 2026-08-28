@@ -152,10 +152,17 @@ anyway since it's a real bug and the fix is cheap:**
   the same disassembly (High aliases to HighQualityBicubic internally). Promote to a stage if
   pursued — don't leave as "Hold, no evidence", that reasoning is now stale.
 
-No open items as of this update — the two bugs originally reported (blank Settings panel, and
-the category-click crash found once the panel worked) are both fixed and confirmed. Stage 2/3/
-Hold interpolation items above remain scanned-but-not-pursued if a future session wants to
-extend that work.
+**Newly found, not yet investigated:**
+- License dialog: the "Get a license" button shows two tofu boxes (`□□`) instead of an icon —
+  `supporting/register-icons-broken.png`. Not yet investigated; likely a missing-glyph/font-
+  fallback gap (an icon-font character Wine's font substitution doesn't resolve), in the same
+  general family as the font-substitution fixmes noted elsewhere in this investigation
+  (`fixme:font:find_matching_face Untranslated charset 255`, Arabic font fallback) but not
+  confirmed to be the same mechanism.
+
+The two bugs originally reported (blank Settings panel, and the category-click crash found once
+the panel worked) are both fixed and confirmed. Stage 2/3/Hold interpolation items above remain
+scanned-but-not-pursued if a future session wants to extend that work.
 
 ## Investigation method (what actually worked this round)
 
