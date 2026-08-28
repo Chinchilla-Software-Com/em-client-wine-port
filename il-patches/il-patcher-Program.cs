@@ -7,6 +7,11 @@ if (args.Length > 0 && args[0] == "--patch")
     return RunPatch(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-allpaintinginwmpaint")
+{
+    return RunPatchAllPaintingInWmPaint(args);
+}
+
 return RunScan(args);
 
 static int RunScan(string[] args)
@@ -212,6 +217,134 @@ static int RunPatch(string[] args)
     Console.WriteLine();
     Console.WriteLine($"Patched {patchedTotal} site(s), {failedTotal} failure(s).");
     return failedTotal > 0 ? 1 : 0;
+}
+
+// --patch-allpaintinginwmpaint <input-dir> <output-dir>
+//
+// One-off, hardcoded experimental patch: MailClient.Common.UI.dll,
+// Controls.ControlDataGrid.ControlDataGrid::initialize() sets four ControlStyles flags
+// (UserPaint=2, ResizeRedraw=0x10, Selectable=0x200, StandardClick|StandardDoubleClick=0x1100)
+// via four back-to-back `ldarg.0; ldc.i4 X; ldc.i4.1; call SetStyle` sequences at the very top
+// of the method, but never sets AllPaintingInWmPaint (0x2000) -- the flag WinForms recommends
+// for owner-drawn double-buffered controls, whose absence may be why this control's WM_PAINT
+// hits a Wine BeginPaint/WM_NCPAINT region-reuse bug that collapses its client clip to empty
+// (see reports/settings-panel-clip-region-findings.md). This inserts a fifth
+// `ldarg.0; ldc.i4 8192; ldc.i4.1; call SetStyle` sequence immediately after the fourth one,
+// reusing the exact same SetStyle MethodReference already in the method -- verifying the exact
+// four-call preamble (values 2, 16, 512, 4352 in that order) before touching anything, since
+// this is real instruction insertion, not just an operand rewrite, and there's no automatic
+// "does this even make sense" check the way the interpolation-mode patcher has.
+static int RunPatchAllPaintingInWmPaint(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-allpaintinginwmpaint <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.Common.UI.dll";
+    const string targetType = "MailClient.Common.UI.Controls.ControlDataGrid.ControlDataGrid";
+    const string targetMethod = "initialize";
+    const int allPaintingInWmPaint = 0x2000;
+    int[] expectedPreamble = { 2, 16, 512, 4352 };
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null)
+        {
+            Console.Error.WriteLine($"FAIL: type not found: {targetType}");
+            return 1;
+        }
+        var method = type.Methods.FirstOrDefault(m => m.Name == targetMethod && m.HasBody);
+        if (method is null)
+        {
+            Console.Error.WriteLine($"FAIL: method not found: {targetType}::{targetMethod}");
+            return 1;
+        }
+
+        var il = method.Body.Instructions;
+        MethodReference? setStyleRef = null;
+        Instruction? insertAfter = null;
+        int matched = 0;
+        int i = 0;
+        while (i + 3 < il.Count && matched < expectedPreamble.Length)
+        {
+            if (il[i].OpCode == OpCodes.Ldarg_0 &&
+                IsLdcI4(il[i + 1], out int value) &&
+                value == expectedPreamble[matched] &&
+                IsLdcI4(il[i + 2], out int one) && one == 1 &&
+                (il[i + 3].OpCode == OpCodes.Call || il[i + 3].OpCode == OpCodes.Callvirt) &&
+                il[i + 3].Operand is MethodReference mr &&
+                mr.Name == "SetStyle" &&
+                mr.DeclaringType.FullName == "System.Windows.Forms.Control")
+            {
+                setStyleRef = mr;
+                insertAfter = il[i + 3];
+                matched++;
+                i += 4;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (matched != expectedPreamble.Length || setStyleRef is null || insertAfter is null)
+        {
+            Console.Error.WriteLine($"FAIL: {targetType}::{targetMethod} preamble didn't match expected four SetStyle calls " +
+                $"(matched {matched}/{expectedPreamble.Length}) -- refusing to patch, method body may have changed");
+            return 1;
+        }
+
+        var ilProcessor = method.Body.GetILProcessor();
+        // insert in reverse so each InsertAfter(insertAfter, ...) lands right after the call, in order
+        var newCall = Instruction.Create(OpCodes.Call, setStyleRef);
+        var newTrue = Instruction.Create(OpCodes.Ldc_I4_1);
+        var newFlag = Instruction.Create(OpCodes.Ldc_I4, allPaintingInWmPaint);
+        var newLdarg = Instruction.Create(OpCodes.Ldarg_0);
+        ilProcessor.InsertAfter(insertAfter, newLdarg);
+        ilProcessor.InsertAfter(newLdarg, newFlag);
+        ilProcessor.InsertAfter(newFlag, newTrue);
+        ilProcessor.InsertAfter(newTrue, newCall);
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::{targetMethod} -- inserted SetStyle(AllPaintingInWmPaint, true) after the existing 4-call preamble");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
 }
 
 static OpCode ShortFormOpCode(int value) => value switch

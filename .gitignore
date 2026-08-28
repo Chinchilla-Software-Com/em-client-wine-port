@@ -3,6 +3,7 @@ original/
 
 # Build artifacts from the Cecil patcher - regenerable from original/ + il-patches/*.json
 il-patches/output/
+il-patches/output-stage2/
 il-patches/backup/
 
 # ilspycmd decompile output - regenerable from original/ or il-patches/output/
