@@ -757,22 +757,28 @@ static int RunPatchDiag(string[] args)
 
 // --patch-settings-refresh <input-dir> <output-dir>
 //
-// The real fix, found via --patch-diag: dataGridCategory paints exactly once during the whole
-// Settings session, and at that one paint columns.Count==0 -- it fires before
-// formSettings.loadCategories() has added its three columns, so ControlDataGrid.doPaint()'s
-// `columns.Count == 0 && !ownerDraw` branch fires (background fill only, drawCells() never
-// called), and nothing ever invalidates/repaints the control again afterward. This is not the
-// interpolation bug and not (only) the clip-region bug -- it's a stale premature paint that's
-// never superseded by a correct one.
+// Root cause (found through several rounds of --patch-diag instrumentation, all superseded by
+// this point): the Load event is simply never raised for formSettings under Wine (`base.Load +=
+// new EventHandler(formSettings_Load);` is correctly wired near the end of a clean
+// InitializeComponent(), but the handler's first instruction never runs) -- eM Client evidently
+// shows Settings through a path that doesn't trigger WinForms' normal Show()/OnLoad() sequence.
+// dataGridCategory is the one thing formSettings_Load exclusively configures (columns, category
+// data, focus/selection), so without it the grid stays permanently empty; other settings pages
+// render fine because they populate independently.
 //
-// Fix: MailClient.dll, UI.Forms.formSettings::formSettings_Load -- insert
-// `this.BeginInvoke(new Action(dataGridCategory.Refresh));` immediately after the existing
-// `dataGridCategory.EndUpdate();` call. A direct synchronous `dataGridCategory.Refresh();` at
-// this spot was tried first and made no observable difference (confirmed via --patch-diag: still
-// exactly one paint, still columns.Count==0) -- Refresh()/Update() during the Load event, before
-// the form is actually shown, is a known-unreliable pattern in WinForms since the paint
-// infrastructure isn't necessarily ready. BeginInvoke(Action) defers the repaint to after the
-// current message finishes processing, which is the standard fix for that class of bug.
+// Fix: MailClient.dll, UI.Forms.formSettings(string tabName)'s public constructor -- insert
+// `try { formSettings_Load(this, EventArgs.Empty); } catch (Exception ex) { log }` right after
+// the constructor's own `SwitchToTabPanel(...)` call. Must be there and not in the private
+// parameterless constructor (tried first): formSettings_Load's tail end does
+// `dataGridCategory.SelectedRows.Add(dataGridCategory.FocusedRow)`, which needs
+// controlPanelSwitcher.CurrentPanel to already be set -- true only after SwitchToTabPanel has
+// run, which is the public constructor's job, called after the private one via `: this()`.
+// Confirmed working via --patch-diag: loadCategories() now runs end-to-end, SetDataSource fires
+// for dataGridCategory with real data (12 groups, 47 items), and it now paints with real content
+// instead of columns.Count==0. The try/catch is a permanent safety net, not just a diagnostic:
+// formSettings_Load also calls `this.BeginInvoke(...)` in some builds of this codebase, which
+// throws InvalidOperationException this early (window handle doesn't exist yet during
+// construction) -- caught and logged rather than crashing the app.
 static int RunPatchSettingsRefresh(string[] args)
 {
     if (args.Length < 3)
@@ -814,142 +820,10 @@ static int RunPatchSettingsRefresh(string[] args)
 
         var type = module.GetType(targetType);
         if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
-        var method = type.Methods.FirstOrDefault(m => m.Name == targetMethod && m.HasBody);
-        if (method is null) { Console.Error.WriteLine($"FAIL: method not found: {targetType}::{targetMethod}"); return 1; }
 
-        var dataGridCategoryField = type.Fields.FirstOrDefault(f => f.Name == "dataGridCategory");
-        if (dataGridCategoryField is null) { Console.Error.WriteLine("FAIL: couldn't find dataGridCategory field"); return 1; }
-
-        var gridType = dataGridCategoryField.FieldType.Resolve();
-        // Resolve Control::Refresh()/BeginInvoke(Action) by walking ControlDataGrid's own
-        // base-type chain, same approach as --patch-diag (this project doesn't reference
-        // System.Windows.Forms directly).
-        TypeDefinition? controlType = gridType;
-        while (controlType is not null && controlType.FullName != "System.Windows.Forms.Control")
-        {
-            controlType = controlType.BaseType?.Resolve();
-        }
-        if (controlType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control in base-type chain"); return 1; }
-        var refreshDef = controlType.Methods.FirstOrDefault(m => m.Name == "Refresh" && m.Parameters.Count == 0);
-        if (refreshDef is null) { Console.Error.WriteLine("FAIL: Control has no parameterless Refresh()"); return 1; }
-        var refreshRef = module.ImportReference(refreshDef);
-        var beginInvokeDef = controlType.Methods.FirstOrDefault(m => m.Name == "BeginInvoke" &&
-            m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "Action");
-        if (beginInvokeDef is null) { Console.Error.WriteLine("FAIL: Control has no BeginInvoke(Action)"); return 1; }
-        var beginInvokeRef = module.ImportReference(beginInvokeDef);
-        var actionCtor = module.ImportReference(typeof(Action).GetConstructor(new[] { typeof(object), typeof(IntPtr) })!);
         var appendAllText = module.ImportReference(typeof(File).GetMethod("AppendAllText", new[] { typeof(string), typeof(string) })!);
         var stringConcat2 = module.ImportReference(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) })!);
 
-        var il = method.Body.Instructions;
-
-        // Checkpoint markers bracketing the loadCategories() call: SetDataSource is never called
-        // for dataGridCategory (confirmed via --patch-diag), which only makes sense if
-        // loadCategories() itself never runs to completion. If BEFORE logs but AFTER doesn't,
-        // that's proof something in loadCategories() throws.
-        var loadCategoriesMethod = type.Methods.FirstOrDefault(m => m.Name == "loadCategories" && m.HasBody);
-        if (loadCategoriesMethod is null) { Console.Error.WriteLine("FAIL: couldn't find loadCategories()"); return 1; }
-        Instruction? loadCategoriesCall = null;
-        for (int k = 0; k < il.Count; k++)
-        {
-            if ((il[k].OpCode == OpCodes.Call || il[k].OpCode == OpCodes.Callvirt) &&
-                il[k].Operand is MethodReference mr2 && mr2.Name == "loadCategories")
-            {
-                loadCategoriesCall = il[k];
-                break;
-            }
-        }
-        if (loadCategoriesCall is null) { Console.Error.WriteLine($"FAIL: couldn't find loadCategories() call in {targetType}::{targetMethod}"); return 1; }
-        var checkpointProc = method.Body.GetILProcessor();
-        // AFTER marker first (so retargeting, if ever needed, only has to consider one anchor at a time)
-        var afterTarget = loadCategoriesCall.Next;
-        checkpointProc.InsertBefore(afterTarget, Instruction.Create(OpCodes.Ldstr, logPath));
-        checkpointProc.InsertBefore(afterTarget, Instruction.Create(OpCodes.Ldstr, "formSettings_Load:AFTER loadCategories()\n"));
-        checkpointProc.InsertBefore(afterTarget, Instruction.Create(OpCodes.Call, appendAllText));
-        // BEFORE marker: loadCategoriesCall itself is not a branch target in this straight-line
-        // method (verified by reading the IL directly), so a plain InsertBefore is safe here.
-        checkpointProc.InsertBefore(loadCategoriesCall, Instruction.Create(OpCodes.Ldstr, logPath));
-        checkpointProc.InsertBefore(loadCategoriesCall, Instruction.Create(OpCodes.Ldstr, "formSettings_Load:BEFORE loadCategories()\n"));
-        checkpointProc.InsertBefore(loadCategoriesCall, Instruction.Create(OpCodes.Call, appendAllText));
-        // ENTER marker: the log file didn't even get created in the previous round (neither
-        // BEFORE nor AFTER fired), so check whether formSettings_Load is entered at all, or
-        // whether something in setFont()/dataGridCategory.BeginUpdate() -- both of which run
-        // before the BEFORE marker -- throws first.
-        // NB: must capture the anchor ONCE and reuse it for all three inserts (not re-read
-        // il[0] each call) -- InsertBefore(fixedAnchor, x) three times in order naturally
-        // stacks x1,x2,x3 correctly right before the anchor; re-reading il[0] each time picks
-        // up the previous insert as the new "first" and reverses the order, corrupting the
-        // stack (this bit the first version of this exact block).
-        var methodFirst = il[0];
-        checkpointProc.InsertBefore(methodFirst, Instruction.Create(OpCodes.Ldstr, logPath));
-        checkpointProc.InsertBefore(methodFirst, Instruction.Create(OpCodes.Ldstr, "formSettings_Load:ENTER\n"));
-        checkpointProc.InsertBefore(methodFirst, Instruction.Create(OpCodes.Call, appendAllText));
-        Instruction? endUpdateCall = null;
-        for (int k = 0; k < il.Count; k++)
-        {
-            if ((il[k].OpCode == OpCodes.Callvirt || il[k].OpCode == OpCodes.Call) &&
-                il[k].Operand is MethodReference mr && mr.Name == "EndUpdate" &&
-                il[k - 1].OpCode == OpCodes.Ldfld && il[k - 1].Operand is FieldReference fr && fr.Name == "dataGridCategory")
-            {
-                endUpdateCall = il[k];
-                break;
-            }
-        }
-        if (endUpdateCall is null)
-        {
-            Console.Error.WriteLine($"FAIL: couldn't find `dataGridCategory.EndUpdate()` call in {targetType}::{targetMethod} -- refusing to patch");
-            return 1;
-        }
-
-        var proc = method.Body.GetILProcessor();
-        var insertPoint = endUpdateCall.Next; // right after the EndUpdate() call
-        // this.BeginInvoke(new Action(dataGridCategory.Refresh)); -- deferred via the message
-        // loop rather than called synchronously inline. A direct dataGridCategory.Refresh() call
-        // right here was tried first and made no difference (still one paint, still
-        // columns.Count==0) -- plausible explanation: Refresh()/Update() during the Load event,
-        // before the form is actually shown, is a known-unreliable WinForms pattern since the
-        // paint infrastructure isn't necessarily ready yet. BeginInvoke defers to after the
-        // current message is done processing, which is the standard fix for that class of bug.
-        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Ldarg_0));
-        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Ldarg_0));
-        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Ldfld, dataGridCategoryField));
-        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Ldftn, refreshRef));
-        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Newobj, actionCtor));
-        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Callvirt, beginInvokeRef));
-        proc.InsertBefore(insertPoint, Instruction.Create(OpCodes.Pop));
-        // retarget anything branching to the old insertPoint isn't needed here: insertPoint is
-        // the CultureChanger.get_Instance() call, not a branch target in this method (verified
-        // by reading the IL directly -- no branches land past EndUpdate() in formSettings_Load).
-
-        Console.WriteLine($"OK   {fileName}: {targetType}::{targetMethod} -- inserted this.BeginInvoke(new Action(dataGridCategory.Refresh)) right after dataGridCategory.EndUpdate()");
-
-        // THE ACTUAL FIX. Confirmed via --patch-settings-refresh's own ENTER/BEFORE/AFTER
-        // markers: formSettings_Load's first instruction never runs at all -- not "throws
-        // partway", never entered, full stop -- even though `base.Load += new
-        // EventHandler(formSettings_Load);` is correctly wired near the end of a clean
-        // InitializeComponent(). The Load event itself is simply never raised for this form in
-        // this environment (plausibly because eM Client shows Settings through a path that
-        // doesn't trigger WinForms' normal Show()/OnLoad() sequence -- other settings pages
-        // still render because they populate themselves independently of formSettings_Load;
-        // dataGridCategory is the one thing that ONLY formSettings_Load ever configures).
-        //
-        // First attempt called formSettings_Load(this, EventArgs.Empty) from the PRIVATE
-        // parameterless constructor. --patch-diag confirmed loadCategories() then ran
-        // successfully end-to-end (SetDataSource fired for dataGridCategory with real,
-        // non-null data) -- genuine progress -- but the app then crashed with an unhandled
-        // .NET exception before the Settings window ever opened. Root cause: the private
-        // ctor runs BEFORE the public formSettings(string tabName) ctor's
-        // `SwitchToTabPanel(...)` call, so controlPanelSwitcher.CurrentPanel is still unset at
-        // that point; formSettings_Load's tail end does
-        // `dataGridCategory.SelectedRows.Add(dataGridCategory.FocusedRow)`, and FocusedRow is
-        // presumably -1 with no panel selected yet, likely throwing there.
-        //
-        // Fix: move the call to the END of the PUBLIC `formSettings(string tabName)`
-        // constructor, right after its own `SwitchToTabPanel(...)` call -- so CurrentPanel is
-        // already set, matching what the natural Load-event order would have produced. Also
-        // wrapped in a try/catch that logs Exception.ToString() (type, message, and stack
-        // trace) to the diag log on failure, so if this guess is also wrong, the next round
-        // gets the real answer directly instead of another blind trace.
         var ctorMethod = type.Methods.FirstOrDefault(m => m.IsConstructor && !m.IsStatic && m.Parameters.Count == 1 &&
             m.Parameters[0].ParameterType.FullName == "System.String");
         if (ctorMethod is null) { Console.Error.WriteLine($"FAIL: couldn't find {targetType}'s formSettings(string) constructor"); return 1; }
