@@ -16,3 +16,9 @@ reports/cxlog*.txt.bak
 # releases/<version>/deploy.sh's own backups of live bottle files before patching - contain a
 # copy of whatever eM Client build the user has installed, not something to commit
 releases/*/backups/
+
+# dotnet build output for the tracked-in-full tool sources under il-patches/ (e.g.
+# MailClient.Licensing.BouncyCastlePatch/, font-systemlink-writer/) - regenerable via
+# `dotnet build`/`dotnet publish`, not something to commit
+il-patches/*/bin/
+il-patches/*/obj/

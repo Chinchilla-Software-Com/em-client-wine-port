@@ -20,11 +20,19 @@
 #   ./deploy.sh --list           list found bottles and their installed versions, then exit
 #   ./deploy.sh -y|--yes         don't prompt on a version mismatch, continue automatically
 #   ./deploy.sh --force          skip the "already patched, nothing to do" short-circuit
+#   ./deploy.sh --install-fonts  install the vendored fonts/ without the license-consent prompt
+#   ./deploy.sh --no-fonts       skip font installation without the license-consent prompt
 #
 # Safe to re-run: if the target's MailClient.dll already references the
 # MailClient.Licensing.BouncyCastlePatch assembly (a marker only this pipeline could have
 # created, so this holds regardless of eM Client version or file size), the script reports that
 # and exits cleanly without touching anything.
+#
+# Fonts: if fonts/*.ttf exist in this repo (genuine Microsoft fonts -- Segoe UI, Tahoma, Calibri
+# -- vendored by whoever holds a valid license to use them; see reports/splash-tip-icon-findings.md),
+# the script asks whether you hold a license and want them installed into the target bottle
+# before deploying. --install-fonts / --no-fonts answer that non-interactively -- for scripted or
+# repeated runs (e.g. a periodic check) where a prompt can't be answered by a human.
 #
 # Requires: dotnet SDK (checked below, prints install instructions if missing), python3 (for the
 # deps.json patch step), network access (NuGet restore for Mono.Cecil, and ilspycmd if not
@@ -54,9 +62,11 @@ BOTTLE_OVERRIDE=""
 ASSUME_YES=0
 LIST_ONLY=0
 FORCE=0
+INSTALL_FONTS=0
+NO_FONTS=0
 
 print_help() {
-    sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -65,6 +75,8 @@ while [[ $# -gt 0 ]]; do
         -y|--yes) ASSUME_YES=1; shift ;;
         --list) LIST_ONLY=1; shift ;;
         --force) FORCE=1; shift ;;
+        --install-fonts) INSTALL_FONTS=1; shift ;;
+        --no-fonts) NO_FONTS=1; shift ;;
         -h|--help) print_help; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -273,10 +285,31 @@ if [[ ${#RUNNING_PIDS[@]} -gt 0 ]]; then
     warn "It needs to be closed before patching."
     read -r -p "Close it now and continue? [Y/n] " reply
     if [[ -z "$reply" || "$reply" =~ ^[Yy]$ ]]; then
-        for pid in "${RUNNING_PIDS[@]}"; do
-            log "closing PID $pid..."
-            kill "$pid" 2>/dev/null || true
-        done
+        # Graceful close (wmctrl -c, a WM_DELETE_WINDOW-style request) only -- never `kill` an
+        # abruptly running instance: confirmed hands-on that an abrupt process kill leaves the
+        # app's local database in a state that triggers a "wasn't closed correctly, checking for
+        # corrupted database" recovery dialog on the next launch. Falls back to `kill` only if
+        # wmctrl isn't available or finds no matching window, with a clear warning either way.
+        graceful_closed=0
+        if command -v wmctrl >/dev/null 2>&1; then
+            while IFS= read -r wline; do
+                wid="$(awk '{print $1}' <<<"$wline")"
+                wpid="$(awk '{print $3}' <<<"$wline")"
+                for pid in "${RUNNING_PIDS[@]}"; do
+                    if [[ "$wpid" == "$pid" ]]; then
+                        log "sending graceful close (wmctrl) to window $wid (PID $pid)..."
+                        wmctrl -ic "$wid" 2>/dev/null && graceful_closed=1
+                    fi
+                done
+            done < <(wmctrl -l -p 2>/dev/null)
+        fi
+        if [[ $graceful_closed -eq 0 ]]; then
+            warn "no window found to close gracefully via wmctrl -- falling back to kill"
+            warn "(this may trigger a DB-repair check on the next launch)."
+            for pid in "${RUNNING_PIDS[@]}"; do
+                kill "$pid" 2>/dev/null || true
+            done
+        fi
         for _ in $(seq 1 10); do
             sleep 1
             RUNNING_PIDS=()
@@ -427,7 +460,11 @@ cp -an "$WORKDIR/output-stage4"/. "$WORKDIR/output-stage5/"
 cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage5/"
 
 log "Stage 6: license icon fix..."
-$ILP --patch-license-icon "$WORKDIR/output-stage5" "$WORKDIR/output-final"
+$ILP --patch-license-icon "$WORKDIR/output-stage5" "$WORKDIR/output-stage6"
+cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage6/"
+
+log "Stage 7: splash-screen tip icon fix..."
+$ILP --patch-splash-tip-icon "$WORKDIR/output-stage6" "$WORKDIR/output-final"
 cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-final/"
 
 FINAL_DIR="$WORKDIR/output-final"
@@ -458,7 +495,7 @@ $ILP --dump-handlers "$FINAL_DIR/MailClient.dll" MailClient.Utils.Integration Is
 ORIG_SIZE=$(stat -c%s "$WORKDIR/output-stage5/MailClient.dll")
 FINAL_SIZE=$(stat -c%s "$FINAL_DIR/MailClient.dll")
 [[ "$ORIG_SIZE" -eq "$FINAL_SIZE" ]] \
-    || die "verification failed: Stage 6 should not change MailClient.dll's byte size (was $ORIG_SIZE, now $FINAL_SIZE) -- .resources offset table may be corrupted"
+    || die "verification failed: Stages 6-7 should not change MailClient.dll's byte size (was $ORIG_SIZE, now $FINAL_SIZE) -- .resources offset table may be corrupted"
 
 log "all verification checks passed."
 
@@ -514,4 +551,73 @@ log "deploy complete."
 log "  bottle:  $BOTTLE_NAME"
 log "  version: $FOUND_FILE_VERSION"
 log "  backup:  $BACKUP_DIR"
+
+# ---------------------------------------------------------------------------
+# Optional: install vendored Windows fonts (Segoe UI, Tahoma, Calibri, etc.,
+# under fonts/) into the bottle for better general font fidelity under Wine.
+# Deliberately separate from the assembly patch pipeline above -- independent
+# of it, and skipped entirely if fonts/ has no .ttf files. These are genuine
+# Microsoft font files, not freely redistributable, so installing them
+# requires confirming a valid license (unless --install-fonts/--no-fonts
+# settles it non-interactively -- see header comment).
+#
+# NOTE: known to make genuine Segoe UI/Tahoma available for font resolution
+# and may improve general text rendering fidelity, but confirmed (see
+# reports/splash-tip-icon-findings.md) NOT to fix Wine's emoji-glyph
+# rendering gap by itself -- that's a deeper issue in Wine's glyph-shaping
+# code, not something registry configuration alone resolves. The splash-tip
+# fix (Stage 7 above, already applied) does not depend on this running.
+# ---------------------------------------------------------------------------
+
+FONTS_DIR="$REPO_ROOT/fonts"
+if [[ -d "$FONTS_DIR" ]] && compgen -G "$FONTS_DIR"/*.ttf >/dev/null; then
+    font_count=$(ls "$FONTS_DIR"/*.ttf | wc -l)
+    do_install_fonts=0
+    if [[ $INSTALL_FONTS -eq 1 ]]; then
+        do_install_fonts=1
+    elif [[ $NO_FONTS -eq 1 ]]; then
+        do_install_fonts=0
+    else
+        echo ""
+        echo "This repo has $font_count Windows font files vendored under fonts/ (Segoe UI,"
+        echo "Segoe UI Emoji, Tahoma, Calibri, etc.) for better font fidelity under Wine -- this"
+        echo "bottle currently has none of them installed. These are genuine Microsoft fonts, not"
+        echo "freely redistributable -- installing them requires a valid Windows font license."
+        read -r -p "Do you hold a valid license for these fonts, and want them installed into this bottle? [y/N] " freply
+        [[ "$freply" =~ ^[Yy]$ ]] && do_install_fonts=1
+    fi
+
+    if [[ $do_install_fonts -eq 1 ]]; then
+        log "installing $font_count font(s) into the bottle..."
+        BOTTLE_ROOT="$(cd "$BOTTLE_APP_DIR/../.." && pwd)"
+        BOTTLE_FONTS_DIR="$BOTTLE_ROOT/windows/Fonts"
+        cp "$FONTS_DIR"/*.ttf "$BOTTLE_FONTS_DIR/"
+
+        mkdir -p "$WORKDIR/tools/font-systemlink-writer"
+        cp "$IL_PATCHES_DIR/font-systemlink-writer/Program.cs" "$WORKDIR/tools/font-systemlink-writer/"
+        cp "$IL_PATCHES_DIR/font-systemlink-writer/font-systemlink-writer.csproj" "$WORKDIR/tools/font-systemlink-writer/"
+        if dotnet publish -c Release "$WORKDIR/tools/font-systemlink-writer" >"$WORKDIR/build-fontwriter.log" 2>&1; then
+            FONTWRITER_EXE="$WORKDIR/tools/font-systemlink-writer/bin/Release/net8.0/win-x86/publish/font-systemlink-writer.exe"
+            WIN_FONTWRITER_PATH="Z:$(echo "$FONTWRITER_EXE" | sed 's/\//\\/g')"
+            # -u DOTNET_ROOT: a host-side DOTNET_ROOT (set by other tooling, e.g. for ilspycmd)
+            # leaks through into the wine child process and gets reinterpreted via CrossOver's
+            # own Y: drive mapping, pointing the bottle's own apphost at the HOST's dotnet
+            # install instead of the bottle's -- confirmed hands-on ("hostfxr.dll could not be
+            # found in [Y:\.dotnet\...]", Y: being CrossOver's mapping for $HOME). Must be
+            # unset, not just left unexported, for hostfxr's resolution to use the bottle's own
+            # C:\Program Files\dotnet installation as intended.
+            if CX_BOTTLE="$BOTTLE_NAME" env -u DOTNET_ROOT /opt/cxoffice/bin/wine "$WIN_FONTWRITER_PATH"; then
+                log "fonts registered and SystemLink fallback entries set."
+            else
+                warn "font-systemlink-writer failed -- font files were copied but not registered in the registry."
+            fi
+        else
+            cat "$WORKDIR/build-fontwriter.log" >&2
+            warn "failed to build font-systemlink-writer -- font files were copied but not registered in the registry."
+        fi
+    else
+        log "skipping font install (no license confirmation given). Use --install-fonts to skip this prompt."
+    fi
+fi
+
 log "Restart eM Client in this bottle to pick up the change."

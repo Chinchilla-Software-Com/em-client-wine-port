@@ -37,6 +37,11 @@ if (args.Length > 0 && args[0] == "--patch-license-icon")
     return RunPatchLicenseIcon(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-splash-tip-icon")
+{
+    return RunPatchSplashTipIcon(args);
+}
+
 if (args.Length > 0 && args[0] == "--version")
 {
     return RunVersion(args);
@@ -1238,6 +1243,112 @@ static int RunPatchLicenseIcon(string[] args)
         module.Resources[resIndex] = new EmbeddedResource(resource.Name, resource.Attributes, newData);
 
         Console.WriteLine($"OK   {fileName}: {resourceName} -- replaced buttonGetLicense.Text's trailing U+0083 U+0083 with U+00A0 U+00A0 (non-breaking space) at byte offset 0x{idx:X}");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-splash-tip-icon <input-dir> <output-dir>
+//
+// The splash screen's rotating "tip" label (FormSplashScreen.labelTip) shows two tofu boxes
+// before the tip text on every launch. Root cause: labelTip's baseline Text resource
+// (MailClient.UI.Forms.FormSplashScreen.resources/labelTip.Text) is a single genuine emoji,
+// U+1F4A1 (light bulb) -- unlike the license-button bug, this is a real, correctly-encoded
+// character (not corrupted control-character bytes), so this one IS a legitimate Wine gap: no
+// emoji-capable font is available/consulted for it under Wine, so the surrogate pair renders as
+// two missing-glyph boxes. Investigated a proper fix first (vendoring real Segoe UI/Segoe UI
+// Emoji fonts + Wine FontLink\SystemLink registry entries into the target bottle -- see
+// fonts/ and reports/splash-tip-icon-findings.md for the full investigation, including a real
+// `wine regedit /S` multi-string import bug found and worked around along the way): confirmed
+// via CX_DEBUGMSG=+font trace that Wine correctly LOADS the SystemLink fallback config, but the
+// glyph still doesn't render -- the gap is deeper, in Wine's actual glyph-shaping/ExtTextOut
+// code path, not just registry configuration. Falling back to the same narrow, low-risk
+// resource-string patch used for the license icon rather than chasing that further.
+//
+// Fix: byte-level replace within the embedded resource blob, F0 9F 92 A1 (the emoji's 4-byte
+// UTF-8 encoding) -> C2 A0 C2 A0 (two U+00A0 non-breaking spaces, also 4 bytes) -- same
+// byte-length-preserving rationale as --patch-license-icon: keeps the .resources container's
+// data-section offset table untouched. NOTE: the same 4-byte emoji sequence also appears
+// elsewhere in MailClient.dll as part of MailClient.Resources.UI.Form.SplashScreenHints'
+// EmoticonLookup table (a legitimate, unrelated feature -- compose-window emoticon shortcuts
+// like "*IDEA*" -> the bulb emoji) -- irrelevant here since this patch scopes its byte search to
+// the FormSplashScreen.resources container specifically, not the whole assembly.
+static int RunPatchSplashTipIcon(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-splash-tip-icon <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string resourceName = "MailClient.UI.Forms.FormSplashScreen.resources";
+    byte[] oldBytes = { 0xF0, 0x9F, 0x92, 0xA1 };
+    byte[] newBytes = { 0xC2, 0xA0, 0xC2, 0xA0 };
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var resource = module.Resources.OfType<EmbeddedResource>().FirstOrDefault(r => r.Name == resourceName);
+        if (resource is null)
+        {
+            Console.Error.WriteLine($"FAIL: embedded resource not found: {resourceName}");
+            return 1;
+        }
+
+        byte[] data = resource.GetResourceData();
+        int idx = IndexOfBytes(data, oldBytes, 0);
+        if (idx < 0)
+        {
+            Console.Error.WriteLine($"FAIL: expected byte pattern F0 9F 92 A1 not found in {resourceName} -- refusing to patch");
+            return 1;
+        }
+        int idx2 = IndexOfBytes(data, oldBytes, idx + 1);
+        if (idx2 >= 0)
+        {
+            Console.Error.WriteLine($"FAIL: byte pattern found more than once in {resourceName} -- ambiguous, refusing to patch");
+            return 1;
+        }
+
+        byte[] newData = (byte[])data.Clone();
+        Array.Copy(newBytes, 0, newData, idx, newBytes.Length);
+
+        int resIndex = module.Resources.IndexOf(resource);
+        module.Resources[resIndex] = new EmbeddedResource(resource.Name, resource.Attributes, newData);
+
+        Console.WriteLine($"OK   {fileName}: {resourceName} -- replaced labelTip.Text's U+1F4A1 (light bulb emoji) with U+00A0 U+00A0 (non-breaking space) at byte offset 0x{idx:X}");
         patched = true;
 
         module.Write(destPath);

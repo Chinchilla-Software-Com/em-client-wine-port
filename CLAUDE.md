@@ -27,6 +27,15 @@
                       file. Its .csproj HintPaths BouncyCastle.Cryptography.dll from
                       `original/` by absolute path — adjust if building from a different checkout
                       location.
+                      il-patches/font-systemlink-writer/ (tracked in full, same reason as the
+                      BouncyCastlePatch helper — it's built and run against a live bottle, not
+                      just a dev-time tool) registers fonts/*.ttf in a target bottle's registry
+                      and adds Wine FontLink\SystemLink fallback entries, via the real Win32
+                      registry API rather than a `.reg` file import — `wine regedit /S` has a
+                      confirmed multi-string-value import bug in this Wine build (see
+                      reports/splash-tip-icon-findings.md). Optional, wired into
+                      releases/<version>/deploy.sh's `--install-fonts` step; not part of the core
+                      IL-patch pipeline and not required by any of it.
                       il-patches/output*/ and il-patches/backup/ are gitignored build output —
                       regenerate via the pipeline below, don't hand-edit or commit them.
 - reports/crossover-backlog.json — one entry per CONFIRMED freeze point
@@ -40,6 +49,14 @@
   re-explored next time. Read these before starting new investigation.
 - supporting/** — reference screenshots (both "broken" and "known-good/working" states) used to
   confirm fixes visually. Tracked in git; add new ones here when reporting or confirming a bug.
+- fonts/** — genuine Microsoft TrueType fonts (Segoe UI family, Segoe UI Emoji/Symbol, Segoe
+  MDL2 Assets/Fluent Icons, Tahoma, Calibri — 30 files) the app expects but the bottle doesn't
+  ship. Tracked in git on the basis that whoever adds files here holds a valid license to use
+  them (these are not open-licensed — don't add font files here without one). Installed into a
+  bottle only on explicit opt-in — see `releases/<version>/deploy.sh --install-fonts` and
+  `il-patches/font-systemlink-writer/` above. Known to improve general font availability/fidelity
+  but confirmed NOT sufficient by itself to fix Wine's emoji-glyph rendering gap — see
+  `reports/splash-tip-icon-findings.md`.
 - releases/<version>/deploy.sh — the actual, practical way to deploy: a single self-contained
   script that finds installed eM Client bottles, reads and reports each one's version, warns (and
   asks) before proceeding against a version other than the one this release was built and tested
@@ -50,23 +67,36 @@
   rolling back (renaming whatever it wrote to `.new`, restoring the backup) if any step from that
   point on fails. `./deploy.sh --list` reports found bottles + versions without patching anything;
   `./deploy.sh --bottle NAME` skips interactive bottle selection; `-y`/`--yes` skips the
-  version-mismatch confirmation prompt. Needs dotnet SDK (prints per-distro install instructions
-  and exits if missing) and python3; fetches ilspycmd itself into a temp dir if not already
-  installed. **When eM Client updates:** don't edit an existing `releases/<version>/deploy.sh` in
+  version-mismatch confirmation prompt; `--install-fonts`/`--no-fonts` answer the fonts/ license
+  consent prompt (see below) non-interactively, for scripted/repeated runs. Safe to re-run —
+  checks whether the target is already patched (an assembly-reference marker, not file size —
+  see `il-patcher --check-patched`'s doc comment) and exits cleanly if so; `--force` skips that.
+  Needs dotnet SDK (prints per-distro install instructions and exits if missing) and python3;
+  fetches ilspycmd itself into a temp dir if not already installed. **When eM Client updates:** don't edit an existing `releases/<version>/deploy.sh` in
   place — copy the whole `releases/<version>/` folder to a new `releases/<new-version>/`, retest
   by hand against the new build (same process as "Investigation method" below — diff what
   actually changed rather than assuming), and adjust whatever patch logic broke in the new
   folder's copy. Each version's script stays a frozen, working reference for that version.
   `releases/*/backups/` (gitignored) is where each deploy run's pre-patch backup lands.
 
-Bottle name: emClient_win_7_x64. Exe: MailClient.exe. Bottle path:
+Main bottle: emClient_win_7_x64. Exe: MailClient.exe. Bottle path:
 `~/.cxoffice/emClient_win_7_x64/`; `Z:\` inside the bottle maps to `/` on the Linux side, which
 is how diagnostic instrumentation (see below) writes logs readable directly from outside Wine.
 A secondary bottle, `emClient_win_7_x64_2` (same layout, same drive_c path shape), exists for
 testing changes that would disturb the main bottle's state — e.g. the License Activation fix was
 tested there once the main bottle had already been activated, to keep a never-activated instance
 available for any future licensing-related testing without needing yet another fresh bottle.
-Deploy commands need the `$BOTTLE` path swapped accordingly when testing there instead of main.
+Deploy commands need the `$BOTTLE` path swapped accordingly when testing there instead of main
+(or use `releases/<version>/deploy.sh --bottle NAME`, which handles this automatically).
+
+**Multi-OS testing (in progress):** additional bottles per Windows version the installer might
+target differently — `emClient_win_8_x64` (confirmed working, all 7 stages deployed and
+splash-tip-icon-confirmed there), with `emClient_win_10_x64` and `emClient_win_11_x64` being set
+up next. `original/` is now split into per-OS-version subfolders (`original/7/`, `original/8/`,
+more to come) — confirmed `original/7` and `original/8` are byte-for-byte identical (2408 files,
+zero diffs, matching hashes on every touched assembly), i.e. the eM Client installer doesn't
+differentiate its payload by target OS version, at least for these two. Worth re-confirming for
+each new OS subfolder as it's added, in case a later Windows version does differ.
 
 git is available in this environment (it wasn't in earlier sessions — if CLAUDE.md you're
 reading elsewhere says otherwise, this note supersedes it). Local commit identity for this repo
@@ -132,7 +162,13 @@ cp ~/tools/MailClient.Licensing.BouncyCastlePatch/bin/Release/net8.0/MailClient.
 # a font-substitution issue). Touches MailClient.dll only, a raw byte-level resource edit (no
 # IL, no exception handlers) -- verify by confirming output size is byte-identical to the input
 # (see "Verify" below), which proves the resource container's offset table wasn't disturbed.
-$ILP --patch-license-icon il-patches/output-stage5/ il-patches/output-final/
+$ILP --patch-license-icon il-patches/output-stage5/ il-patches/output-stage6/
+
+# Stage 7: splash-screen tip label icon fix. IS a Wine gap (unlike Stage 6) -- the label's own
+# Text resource is a genuine emoji (U+1F4A1) Wine has no glyph for; see
+# reports/splash-tip-icon-findings.md for the font-linking fix that was tried first and why it
+# didn't pan out. Same raw byte-level resource edit pattern as Stage 6.
+$ILP --patch-splash-tip-icon il-patches/output-stage6/ il-patches/output-final/
 
 # Deploy: swap all three touched/added files into the live bottle (back up the bottle's current
 # copies first if you haven't already — see "Rollback" below), then patch deps.json so the new
@@ -144,6 +180,15 @@ cp il-patches/output-final/MailClient.Common.UI.dll "$BOTTLE/MailClient.Common.U
 cp il-patches/output-final/MailClient.Licensing.BouncyCastlePatch.dll "$BOTTLE/"
 python3 il-patches/license-oaep-patcher-patch-deps-json.py "$BOTTLE/MailClient.deps.json"
 ```
+
+**In practice, use `releases/<version>/deploy.sh` instead of typing the above by hand** — it runs
+every stage above (against whatever's actually installed, not a pre-built copy), every check in
+"Verify" below, backs up, deploys, and can roll back on failure, all in one command. The manual
+commands above remain the reference for understanding/debugging what each stage actually does;
+see the release script's own header comment and `il-patches/**`'s bullet above for details on
+when/why you'd still reach for the individual `$ILP`/`$ILP2` invocations directly (mainly:
+investigating why a specific stage failed, or building a brand new stage before it's proven
+enough to fold into a release script).
 
 Verify before deploying, every time — this has caught real bugs (see "IL-patching lessons"
 below):
@@ -162,10 +207,12 @@ ilspycmd -t "MailClient.Licensing.DecryptAndVerify" il-patches/output-final/Mail
 # table itself checked — decompiling clean is not sufficient (see "IL-patching lessons"):
 $ILP --dump-handlers il-patches/output-final/MailClient.dll MailClient.Utils.Integration IsDefaultClientVista
 
-# Stage 6 is a raw resource byte edit, not IL -- verify with a size check (must match exactly,
-# proving the .resources offset table wasn't disturbed) plus a content check:
+# Stages 6-7 are raw resource byte edits, not IL -- verify with a size check (must match the
+# stage-5 output exactly, proving the .resources offset table wasn't disturbed by either) plus a
+# content check on each:
 stat -c%s il-patches/output-stage5/MailClient.dll il-patches/output-final/MailClient.dll   # must be equal
 ilspycmd --resource "MailClient.UI.Forms.formLicense.resources/buttonGetLicense.Text" -o /tmp il-patches/output-final/MailClient.dll && xxd /tmp/buttonGetLicense.Text | tail -2   # should end c2 a0 c2 a0, not c2 83 c2 83
+ilspycmd --resource "MailClient.UI.Forms.FormSplashScreen.resources/labelTip.Text" -o /tmp il-patches/output-final/MailClient.dll && xxd /tmp/labelTip.Text   # should read c2 a0 c2 a0, not f0 9f 92 a1
 ```
 
 **Rollback:** back up the bottle's current DLLs before the first-ever deploy in a fresh bottle
@@ -182,7 +229,23 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   (3) and `NearestNeighbor` (5) are implemented; everything else (0, 1, 2, 4, 6, 7) hits an
   "Unimplemented interpolation %i" stub. Two wrong guesses before landing on 3 — `HighQualityBilinear`
   (6) and `High` (2, which internally aliases to 7) are *also* unimplemented; don't reuse either
-  without new evidence. Full history: `reports/gdiplus-interpolation-findings.md`.
+  without new evidence. Full history: `reports/gdiplus-interpolation-findings.md`. **Correction:**
+  this fix was originally marked "confirmed working" on the strength of the disassembly evidence
+  alone — the banner image itself was never actually visually re-checked by the user under
+  Windows 7 at the time. It was properly visually confirmed only later, incidentally, while
+  testing the splash-tip-icon fix below (same screen, both bugs visible together in
+  `supporting/splash-broken.png` before either fix, both gone after).
+- **Splash screen tip label showing tofu boxes before the tip text.** Not a Wine font-substitution
+  gap in the way originally guessed, and not the same class of bug as the license icon below:
+  `FormSplashScreen.labelTip`'s baseline text is a genuine emoji (U+1F4A1, light bulb) that Wine
+  has no glyph for. A proper fix was attempted first — vendoring real, user-licensed Segoe UI/Segoe
+  UI Emoji fonts and configuring Wine's `FontLink\SystemLink` registry fallback (see `fonts/` and
+  the release script's `--install-fonts` step) — and a real `wine regedit` multi-string import bug
+  was found and worked around along the way, but the glyph still didn't render even with correct
+  registry configuration confirmed via trace: the gap is deeper, in Wine's glyph-shaping code
+  itself, not something registry configuration alone fixes. Fixed instead with the same narrow,
+  safe resource-string patch used for the license icon (`--patch-splash-tip-icon`, Stage 7).
+  Full history: `reports/splash-tip-icon-findings.md`.
 - **Settings dialog left category panel (was completely blank).** Root cause: `formSettings`'s
   `Load` event never fires under Wine at all (not a paint bug, not a data bug — the event
   handler's first instruction never executes). Fixed by calling
