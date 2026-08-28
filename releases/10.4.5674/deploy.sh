@@ -19,6 +19,12 @@
 #   ./deploy.sh --bottle NAME    skip bottle selection (bottle dir name under ~/.cxoffice/)
 #   ./deploy.sh --list           list found bottles and their installed versions, then exit
 #   ./deploy.sh -y|--yes         don't prompt on a version mismatch, continue automatically
+#   ./deploy.sh --force          skip the "already patched, nothing to do" short-circuit
+#
+# Safe to re-run: if the target's MailClient.dll already references the
+# MailClient.Licensing.BouncyCastlePatch assembly (a marker only this pipeline could have
+# created, so this holds regardless of eM Client version or file size), the script reports that
+# and exits cleanly without touching anything.
 #
 # Requires: dotnet SDK (checked below, prints install instructions if missing), python3 (for the
 # deps.json patch step), network access (NuGet restore for Mono.Cecil, and ilspycmd if not
@@ -47,6 +53,7 @@ die()  { err "$*"; exit 1; }
 BOTTLE_OVERRIDE=""
 ASSUME_YES=0
 LIST_ONLY=0
+FORCE=0
 
 print_help() {
     sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -57,6 +64,7 @@ while [[ $# -gt 0 ]]; do
         --bottle) BOTTLE_OVERRIDE="${2:-}"; shift 2 ;;
         -y|--yes) ASSUME_YES=1; shift ;;
         --list) LIST_ONLY=1; shift ;;
+        --force) FORCE=1; shift ;;
         -h|--help) print_help; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -204,6 +212,29 @@ fi
 BOTTLE_NAME="${BOTTLE_NAME_FOR_DLL[$SELECTED_DLL]}"
 BOTTLE_APP_DIR="$(dirname "$SELECTED_DLL")"
 log "target bottle: $BOTTLE_NAME ($BOTTLE_APP_DIR)"
+
+# ---------------------------------------------------------------------------
+# Already-patched check -- safe to re-run. Deliberately NOT a file-size or
+# byte-diff check: file size isn't a reliable "already patched" signal
+# across future eM Client releases (an unrelated app change could easily
+# land on the same size we produce, or a future version of these same
+# patches could land on a different size, independent of whether they're
+# applied). Instead checks whether MailClient.dll references the
+# MailClient.Licensing.BouncyCastlePatch assembly (il-patcher --check-patched)
+# -- an assembly reference that cannot exist unless this pipeline created
+# it, regardless of version or size. See that mode's doc comment in
+# il-patcher-Program.cs for the full reasoning, including its one known
+# limitation (doesn't independently verify every earlier stage is still
+# intact if someone hand-reverted just one of them).
+# ---------------------------------------------------------------------------
+
+if [[ $FORCE -eq 0 ]] && $ILP --check-patched "$SELECTED_DLL" >/dev/null 2>&1; then
+    log "already patched: $SELECTED_DLL references MailClient.Licensing.BouncyCastlePatch."
+    log "nothing to do. Pass --force to attempt patching anyway (will very likely fail cleanly"
+    log "at Stage 1's own shape-check, since the individual stages aren't self-reverting -- to"
+    log "genuinely re-patch, restore from a releases/*/backups/ backup first, then re-run)."
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Refuse to patch into a bottle whose MailClient.exe is still running: files

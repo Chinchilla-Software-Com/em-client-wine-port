@@ -42,6 +42,11 @@ if (args.Length > 0 && args[0] == "--version")
     return RunVersion(args);
 }
 
+if (args.Length > 0 && args[0] == "--check-patched")
+{
+    return RunCheckPatched(args);
+}
+
 return RunScan(args);
 
 // --dump-handlers <dll> <type> <method>
@@ -1292,6 +1297,37 @@ static int RunVersion(string[] args)
         Console.WriteLine($"{Path.GetFileName(dllPath)}\tAssemblyVersion={asmName.Version}\tFileVersion={fileVersion ?? "(none)"}\tInformationalVersion={infoVersion ?? "(none)"}");
     }
     return 0;
+}
+
+// --check-patched <dll>
+//
+// Reports (via exit code + a one-line message) whether this exact MailClient.dll already has
+// the Stage 5 (license-Activation OAEP) patch applied, by checking whether it references the
+// MailClient.Licensing.BouncyCastlePatch assembly -- an assembly reference that cannot exist
+// unless our pipeline created it, regardless of eM Client's version or file size. This is the
+// check releases/<version>/deploy.sh's re-run safety leans on: file size isn't a reliable
+// "already patched" signal across future eM Client releases (an unrelated app change could
+// easily land on the same size, or the same patch logic could land on a different size next
+// release, independent of whether these patches are applied) -- an assembly-reference check
+// has no such failure mode, since the referenced assembly name is unique to this project.
+// Since Stage 5 always runs after Stages 1-4 in the pipeline, its presence is treated as a
+// reliable proxy for "the whole pipeline has already been applied" -- not airtight proof every
+// individual stage is intact (someone could in principle hand-revert one earlier stage and
+// leave this one), but far more robust than relying on any single stage's own incidental
+// shape-check (which exists to protect that one stage, not to answer this question cleanly).
+// Exit 0 + "PATCHED" if the reference is present, exit 1 + "NOT PATCHED" if not.
+static int RunCheckPatched(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("usage: il-patcher --check-patched <dll>");
+        return 2;
+    }
+    string dllPath = args[1];
+    using var module = ModuleDefinition.ReadModule(dllPath);
+    bool found = module.AssemblyReferences.Any(r => r.Name == "MailClient.Licensing.BouncyCastlePatch");
+    Console.WriteLine(found ? "PATCHED" : "NOT PATCHED");
+    return found ? 0 : 1;
 }
 
 static OpCode ShortFormOpCode(int value) => value switch
