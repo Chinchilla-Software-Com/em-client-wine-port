@@ -198,7 +198,11 @@ $ILP il-patches/output-final/    # (no --patch flag = scan mode)
 
 # Decompile-and-read anything you just patched with instruction insertion (not just an
 # operand rewrite) before deploying — ilspycmd will surface invalid IL as a decompile error:
-export DOTNET_ROOT=~/.dotnet   # ilspycmd needs this set in this environment
+export DOTNET_ROOT=~/.dotnet   # ilspycmd needs this set in this environment (dotnet-install.sh
+                                # layout specifically — this dev environment's dotnet lives under
+                                # ~/.dotnet; on a global/apt/dnf install, derive DOTNET_ROOT from
+                                # `readlink -f "$(command -v dotnet)"`'s directory instead, as
+                                # deploy.sh now does, rather than hardcoding this path)
 ilspycmd -m "M:MailClient.UI.Forms.formSettings.formSettings_Load(System.Object,System.EventArgs)" il-patches/output-final/MailClient.dll
 ilspycmd -t "MailClient.Common.UI.Controls.ControlDataGrid.ControlDataGrid" il-patches/output-final/MailClient.Common.UI.dll | grep AllPaintingInWmPaint
 ilspycmd -t "MailClient.Licensing.DecryptAndVerify" il-patches/output-final/MailClient.dll | grep OaepPatch

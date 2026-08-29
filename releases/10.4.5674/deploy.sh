@@ -431,7 +431,17 @@ else
         || { cat "$WORKDIR/install-ilspy.log" >&2; die "failed to install ilspycmd (log above)"; }
     ILSPY="$WORKDIR/ilspy-tools/ilspycmd"
 fi
-export DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
+# ilspycmd runs as its own apphost binary (not `dotnet ilspycmd.dll`), so hostfxr needs
+# DOTNET_ROOT to find the shared runtime. Don't hardcode ~/.dotnet -- that's only where
+# dotnet-install.sh puts it; an apt/dnf/zypper/pacman package install lives elsewhere
+# (e.g. /usr/lib/dotnet, /usr/share/dotnet) and DOTNET_ROOT is usually unset there because
+# the `dotnet` command itself doesn't need it. Derive it from wherever `dotnet` (the one
+# check_dotnet found on PATH) actually resolves to, symlinks and all, so this works for any
+# install method. Only touch DOTNET_ROOT if the caller hasn't already set one themselves.
+if [[ -z "${DOTNET_ROOT:-}" ]]; then
+    DOTNET_BIN="$(readlink -f "$(command -v dotnet)")"
+    export DOTNET_ROOT="$(dirname "$DOTNET_BIN")"
+fi
 log "ilspycmd ready: $ILSPY"
 
 # ---------------------------------------------------------------------------
