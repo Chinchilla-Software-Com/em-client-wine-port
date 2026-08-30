@@ -362,11 +362,32 @@ anyway since it's a real bug and the fix is cheap:**
   the same disassembly (High aliases to HighQualityBicubic internally). Promote to a stage if
   pursued — don't leave as "Hold, no evidence", that reasoning is now stale.
 
+**Investigated extensively, unresolved — no fix currently applied:**
+- **New-mail notification toast shows an empty box until it starts to fade out.** The one open
+  bug as of this writing. Direct app instrumentation confirmed the data (title/content) and the
+  fade animation's state machine are both correct from the very first paint — not a timing or
+  data bug. Two hypothesis-driven fixes (an extra `Invalidate()` call; forcing a genuine
+  `SetLayeredWindowAttributes` alpha change) both made no observable difference, and were later
+  confirmed via trace to have been patching mechanisms that were never actually broken: Wine's
+  `window_surface_flush` and `SetLayeredWindowAttributes` handling both check out correct, and a
+  further trace confirmed `NtGdiExtTextOutW` and per-glyph `NtGdiGetGlyphOutline` calls fire
+  correctly — with the right content, at the right position — on the very first paint. Cinnamon's
+  window-open "Map" animation effect looked like a strong compositor-level candidate but was ruled
+  out (user tested with all Cinnamon desktop effects disabled — no change). Pixel-level analysis
+  of the existing screenshot confirmed the content is genuinely absent from what's composited to
+  screen at that moment, not a low-contrast/color issue. Every mechanism inspectable via
+  instrumentation and trace is confirmed correct, yet the pixels don't reach the screen the first
+  time — a real gap between "GDI did the work" and "the screen shows it" with no specific
+  mechanism identified. All experimental changes reverted; bottle back to its confirmed-working
+  baseline. Full history, including everything ruled out and what's not yet tried:
+  `reports/notification-empty-until-fade-findings.md`.
+
 The two bugs originally reported (blank Settings panel, and the category-click crash found once
 the panel worked), the License Activation failure and "Get a license" icon bug found during that
 testing, and the attachment file-type-association gap found during multi-OS testing, are all
-fixed and confirmed — no open bugs remain as of this writing. Stage 2/3/Hold interpolation items
-above remain scanned-but-not-pursued if a future session wants to extend that work.
+fixed and confirmed. The notification empty-box bug above remains open as of this writing. Stage
+2/3/Hold interpolation items above remain scanned-but-not-pursued if a future session wants to
+extend that work.
 
 ## Investigation method (what actually worked this round)
 
