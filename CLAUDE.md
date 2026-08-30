@@ -57,6 +57,19 @@
   `il-patches/font-systemlink-writer/` above. Known to improve general font availability/fidelity
   but confirmed NOT sufficient by itself to fix Wine's emoji-glyph rendering gap — see
   `reports/splash-tip-icon-findings.md`.
+- file-associations/** — `.reg` files fixing attachment types eM Client can't launch an external
+  viewer for because a fresh CrossOver bottle has no OS-level file association for them (not an
+  eM Client bug — its own attachment-open code faithfully mirrors Explorer's own mechanism; see
+  `reports/office-file-associations-findings.md`). `office-associations.reg` covers MS Office
+  (Word/Excel/PowerPoint/Visio/Publisher + CSV) and OpenDocument formats;
+  `common-attachments.reg` covers images/archives/audio/video plus `.json`/`.md`. Every extension
+  gets its own `EMClientWinePort.<ext>` ProgID pointed at the same `winebrowser.exe` handler
+  already proven working for `.pdf`, deliberately namespaced so these entries can never collide
+  with a real Office/LibreOffice install added to the bottle later. `parse-reg-associations.py`
+  splits each file into per-extension blocks so `releases/<version>/deploy.sh` can import only
+  the extensions actually missing an association on the target bottle (see its own bullet below)
+  — the `.reg` files are also valid to import as-is by hand
+  (`wine regedit /S file-associations/<file>.reg`) if you want every entry unconditionally.
 - releases/<version>/deploy.sh — the actual, practical way to deploy: a single self-contained
   script that finds installed eM Client bottles, reads and reports each one's version, warns (and
   asks) before proceeding against a version other than the one this release was built and tested
@@ -71,6 +84,15 @@
   consent prompt (see below) non-interactively, for scripted/repeated runs. Safe to re-run —
   checks whether the target is already patched (an assembly-reference marker, not file size —
   see `il-patcher --check-patched`'s doc comment) and exits cleanly if so; `--force` skips that.
+  Note this short-circuit only skips the DLL patch pipeline itself — fonts and file-type
+  associations (below) are independent of it and always still run, since most bottles this
+  script targets will already be patched from a previous run. `--install-associations`/
+  `--no-associations` answer the file-associations/ prompt non-interactively;
+  `--force-associations` also overwrites extensions that already have some association set (see
+  file-associations/** above and `reports/office-file-associations-findings.md`) — by default
+  only extensions with no existing association are touched, checked individually against the
+  target bottle's live registry, so a bottle with a real Office/LibreOffice install isn't
+  disturbed.
   Needs dotnet SDK (prints per-distro install instructions and exits if missing) and python3;
   fetches ilspycmd itself into a temp dir if not already installed. **When eM Client updates:** don't edit an existing `releases/<version>/deploy.sh` in
   place — copy the whole `releases/<version>/` folder to a new `releases/<new-version>/`, retest
@@ -89,14 +111,21 @@ available for any future licensing-related testing without needing yet another f
 Deploy commands need the `$BOTTLE` path swapped accordingly when testing there instead of main
 (or use `releases/<version>/deploy.sh --bottle NAME`, which handles this automatically).
 
-**Multi-OS testing (in progress):** additional bottles per Windows version the installer might
-target differently — `emClient_win_8_x64` (confirmed working, all 7 stages deployed and
-splash-tip-icon-confirmed there), with `emClient_win_10_x64` and `emClient_win_11_x64` being set
-up next. `original/` is now split into per-OS-version subfolders (`original/7/`, `original/8/`,
-more to come) — confirmed `original/7` and `original/8` are byte-for-byte identical (2408 files,
-zero diffs, matching hashes on every touched assembly), i.e. the eM Client installer doesn't
-differentiate its payload by target OS version, at least for these two. Worth re-confirming for
-each new OS subfolder as it's added, in case a later Windows version does differ.
+**Multi-OS testing:** additional bottles per Windows version the installer might target
+differently — `emClient_win_8_x64`, `emClient_win_10_x64`, and `emClient_win_11_x64`, all
+confirmed working with the full deploy.sh pipeline (Windows 10/11 run the Microsoft Store variant
+of the app, with no classic License menu entry — licensing there is presumably handled via
+`MicrosoftStoreLicenseSource` instead, not yet investigated). `original/` is split into
+per-OS-version subfolders (`original/7/`, `original/8/`, more to come) — confirmed `original/7`
+and `original/8` are byte-for-byte identical (2408 files, zero diffs, matching hashes on every
+touched assembly), i.e. the eM Client installer doesn't differentiate its payload by target OS
+version, at least for these two. Worth re-confirming for each new OS subfolder as it's added, in
+case a later Windows version does differ.
+
+**Primary testing bottle shifted permanently from `emClient_win_7_x64` to `emClient_win_8_x64`**
+(already set up with test data) — use bottle 8 for new investigation/testing going forward unless
+there's a specific reason to use another bottle (e.g. `emClient_win_7_x64_2`'s never-activated
+license state, kept available for licensing-related testing).
 
 git is available in this environment (it wasn't in earlier sessions — if CLAUDE.md you're
 reading elsewhere says otherwise, this note supersedes it). Local commit identity for this repo
@@ -293,6 +322,21 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   `.resources` container's offset table needs no adjustment. User confirmed: "That's fixed the
   icon issue on button... There's no icons visible... just text... but that's nice and clean."
   Full history: `reports/license-icon-findings.md`.
+- **Attachments (office documents, images, archives, audio/video) failing to open** with "There
+  is no Windows program configured to open this type of file." Root cause: **not an eM Client
+  bug** — its own attachment-open code (`UIUtils.OpenFileInDefaultApp` →
+  `ShellInterop.OpenItem`) faithfully mirrors the same `IContextMenu`-based mechanism Explorer
+  itself uses; a fresh CrossOver bottle just doesn't ship file-type associations for these
+  extensions (`.pdf` is associated out of the box, most others aren't). Confirmed the error text
+  itself is a Wine `shell32.dll` built-in string, not something eM Client generates. Fixed by
+  importing `.reg` files (`file-associations/**`) that associate each extension with its own
+  `EMClientWinePort.<ext>` ProgID pointed at the same `winebrowser.exe` handler `.pdf` already
+  used — `deploy.sh` imports only extensions missing an association on the target bottle, so a
+  bottle with a real Office/LibreOffice install isn't disturbed. Initially misreported as
+  PDF-specific; PDFs were already working — the real, confirmed failure was `.docx`, and a
+  systematic registry check turned up a much wider set of broken attachment types. User confirmed
+  after live-testing multiple attachment types: "It worked." Full history:
+  `reports/office-file-associations-findings.md`.
 
 **Confirmed as a real, separate Wine bug, but not the cause of anything fixed above — patched
 anyway since it's a real bug and the fix is cheap:**
@@ -319,10 +363,10 @@ anyway since it's a real bug and the fix is cheap:**
   pursued — don't leave as "Hold, no evidence", that reasoning is now stale.
 
 The two bugs originally reported (blank Settings panel, and the category-click crash found once
-the panel worked), plus the License Activation failure and the "Get a license" icon bug both
-found during that testing, are all fixed and confirmed — no open bugs remain as of this writing.
-Stage 2/3/Hold interpolation items above remain scanned-but-not-pursued if a future session wants
-to extend that work.
+the panel worked), the License Activation failure and "Get a license" icon bug found during that
+testing, and the attachment file-type-association gap found during multi-OS testing, are all
+fixed and confirmed — no open bugs remain as of this writing. Stage 2/3/Hold interpolation items
+above remain scanned-but-not-pursued if a future session wants to extend that work.
 
 ## Investigation method (what actually worked this round)
 

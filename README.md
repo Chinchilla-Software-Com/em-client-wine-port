@@ -38,8 +38,9 @@ for both and tells you how to install whichever is missing.
 | License Activation silently failed (spinner, then nothing) | RSA-OAEP decrypt fails inside Wine's `bcrypt.dll`/GnuTLS backend | [license-activation-oaep-findings.md](reports/license-activation-oaep-findings.md) |
 | License dialog's "Get a license" button showed two tofu boxes | Corrupted control characters baked into eM Client's own resource data (not a Wine bug) | [license-icon-findings.md](reports/license-icon-findings.md) |
 | Splash screen tip line showed two tofu boxes | A real emoji character Wine has no glyph for (a genuine Wine gap, investigated at length) | [splash-tip-icon-findings.md](reports/splash-tip-icon-findings.md) |
+| Attachments (office documents, images, archives, audio/video) wouldn't open — "no Windows program configured" | Fresh CrossOver bottles ship no file-type association for most attachment extensions (not an eM Client bug) | [office-file-associations-findings.md](reports/office-file-associations-findings.md) |
 
-All six confirmed fixed and working, tested across Windows 7/8/10/11 CrossOver bottles.
+All seven confirmed fixed and working, tested across Windows 7/8/10/11 CrossOver bottles.
 
 ## How it's built
 
@@ -51,6 +52,11 @@ original/<os-version>/   Untouched eM Client install output, one subfolder per W
 il-patches/               The Cecil-based patcher tools (source tracked, binaries built fresh
                            each run) plus every patch's own doc comments explaining what it does
                            and why.
+
+file-associations/        .reg files fixing attachment types (office documents, images,
+                           archives, audio/video) a fresh CrossOver bottle has no file-type
+                           association for. deploy.sh imports only the extensions actually
+                           missing one on your bottle.
 
 releases/<version>/       deploy.sh — the thing you actually run (see Quick start). Versioned so
                            a new eM Client release gets its own folder rather than editing this
