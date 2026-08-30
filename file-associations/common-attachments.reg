@@ -1,0 +1,172 @@
+Windows Registry Editor Version 5.00
+
+; Common non-office email-attachment file-type associations for the em Client
+; CrossOver/Wine bottle -- images, archives, audio, video, plus a couple of text
+; formats (.json, .md) that turned up missing too.
+;
+; Found the same way as file-associations/office-associations.reg was: em Client's
+; own file-open logic (MailClient.UI.ShellInterop.OpenItem / OpenFileInDefaultApp,
+; see reports/office-file-associations-findings.md) only has special internal
+; handling for .eml/.msg/.emlt/.oft/.vcf/.ics/.asc/.crt/.cer/.note/.pst/.emdf --
+; every other attachment type, these included, falls through to the OS file
+; association exactly like .docx did, so any extension with no working association
+; hits the same Wine shell32 "There is no Windows program configured to open this
+; type of file." message.
+;
+; Checked against a fresh emClient_win_8_x64 bottle's registry: .jpg/.jpeg, .png,
+; .gif, .txt, .htm/.html and .xml already had working associations out of the box
+; and are deliberately NOT touched here. Everything below was either missing the
+; extension key entirely, present with an empty default value (no ProgID), or --
+; .svg specifically -- pointing at a ProgID ("svgfile") that doesn't itself exist,
+; so .svg's entry below overwrites that dangling default rather than adding a new
+; one (note: this means a plain "does the extension already have a value" merge
+; check, as used by deploy.sh's selective-import logic, will treat .svg as already
+; associated and skip it -- --force-associations is needed to actually fix .svg).
+;
+; Same ProgID scheme and same winebrowser.exe handler as office-associations.reg --
+; see that file's own header comment for the reasoning (avoids colliding with any
+; real app's ProgID, delegates to the host's own xdg-open MIME resolution).
+
+; --- Images ---
+[HKEY_CLASSES_ROOT\.bmp]
+@="EMClientWinePort.bmp"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.bmp\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.tif]
+@="EMClientWinePort.tif"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.tif\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.tiff]
+@="EMClientWinePort.tiff"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.tiff\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.ico]
+@="EMClientWinePort.ico"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.ico\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.webp]
+@="EMClientWinePort.webp"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.webp\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.heic]
+@="EMClientWinePort.heic"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.heic\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.svg]
+@="EMClientWinePort.svg"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.svg\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+; --- Archives ---
+[HKEY_CLASSES_ROOT\.zip]
+@="EMClientWinePort.zip"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.zip\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.rar]
+@="EMClientWinePort.rar"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.rar\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.7z]
+@="EMClientWinePort.7z"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.7z\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.tar]
+@="EMClientWinePort.tar"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.tar\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.gz]
+@="EMClientWinePort.gz"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.gz\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+; --- Audio ---
+[HKEY_CLASSES_ROOT\.mp3]
+@="EMClientWinePort.mp3"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.mp3\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.wav]
+@="EMClientWinePort.wav"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.wav\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.m4a]
+@="EMClientWinePort.m4a"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.m4a\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.ogg]
+@="EMClientWinePort.ogg"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.ogg\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+; --- Video ---
+[HKEY_CLASSES_ROOT\.mp4]
+@="EMClientWinePort.mp4"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.mp4\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.mov]
+@="EMClientWinePort.mov"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.mov\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.avi]
+@="EMClientWinePort.avi"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.avi\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.wmv]
+@="EMClientWinePort.wmv"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.wmv\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.mkv]
+@="EMClientWinePort.mkv"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.mkv\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+; --- Text / markup ---
+[HKEY_CLASSES_ROOT\.json]
+@="EMClientWinePort.json"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.json\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.md]
+@="EMClientWinePort.md"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.md\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+

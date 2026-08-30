@@ -15,13 +15,16 @@
 # it warns and asks first.
 #
 # Usage:
-#   ./deploy.sh                  interactive: lists bottles found, prompts for choice + confirms
-#   ./deploy.sh --bottle NAME    skip bottle selection (bottle dir name under ~/.cxoffice/)
-#   ./deploy.sh --list           list found bottles and their installed versions, then exit
-#   ./deploy.sh -y|--yes         don't prompt on a version mismatch, continue automatically
-#   ./deploy.sh --force          skip the "already patched, nothing to do" short-circuit
-#   ./deploy.sh --install-fonts  install the vendored fonts/ without the license-consent prompt
-#   ./deploy.sh --no-fonts       skip font installation without the license-consent prompt
+#   ./deploy.sh                     interactive: lists bottles found, prompts for choice + confirms
+#   ./deploy.sh --bottle NAME       skip bottle selection (bottle dir name under ~/.cxoffice/)
+#   ./deploy.sh --list              list found bottles and their installed versions, then exit
+#   ./deploy.sh -y|--yes            don't prompt on a version mismatch, continue automatically
+#   ./deploy.sh --force             skip the "already patched, nothing to do" short-circuit
+#   ./deploy.sh --install-fonts     install the vendored fonts/ without the license-consent prompt
+#   ./deploy.sh --no-fonts          skip font installation without the license-consent prompt
+#   ./deploy.sh --install-associations   add file-type associations without the prompt
+#   ./deploy.sh --no-associations        skip file-type associations without the prompt
+#   ./deploy.sh --force-associations     also overwrite extensions that already have an association
 #
 # Safe to re-run: if the target's MailClient.dll already references the
 # MailClient.Licensing.BouncyCastlePatch assembly (a marker only this pipeline could have
@@ -33,6 +36,13 @@
 # the script asks whether you hold a license and want them installed into the target bottle
 # before deploying. --install-fonts / --no-fonts answer that non-interactively -- for scripted or
 # repeated runs (e.g. a periodic check) where a prompt can't be answered by a human.
+#
+# File-type associations: file-associations/*.reg fixes attachment types (office documents,
+# images, archives, audio/video) that a fresh CrossOver bottle has no working association for --
+# see reports/office-file-associations-findings.md. Only extensions with no existing association
+# are added by default (so a bottle with a real Office/LibreOffice install isn't touched);
+# --force-associations also overwrites extensions that already have something set.
+# --install-associations / --no-associations answer the prompt non-interactively.
 #
 # Requires: dotnet SDK (checked below, prints install instructions if missing), python3 (for the
 # deps.json patch step), network access (NuGet restore for Mono.Cecil, and ilspycmd if not
@@ -64,9 +74,12 @@ LIST_ONLY=0
 FORCE=0
 INSTALL_FONTS=0
 NO_FONTS=0
+INSTALL_ASSOCIATIONS=0
+NO_ASSOCIATIONS=0
+FORCE_ASSOCIATIONS=0
 
 print_help() {
-    sed -n '2,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -77,6 +90,9 @@ while [[ $# -gt 0 ]]; do
         --force) FORCE=1; shift ;;
         --install-fonts) INSTALL_FONTS=1; shift ;;
         --no-fonts) NO_FONTS=1; shift ;;
+        --install-associations) INSTALL_ASSOCIATIONS=1; shift ;;
+        --no-associations) NO_ASSOCIATIONS=1; shift ;;
+        --force-associations) FORCE_ASSOCIATIONS=1; shift ;;
         -h|--help) print_help; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -240,13 +256,18 @@ log "target bottle: $BOTTLE_NAME ($BOTTLE_APP_DIR)"
 # intact if someone hand-reverted just one of them).
 # ---------------------------------------------------------------------------
 
+DLL_ALREADY_PATCHED=0
 if [[ $FORCE -eq 0 ]] && $ILP --check-patched "$SELECTED_DLL" >/dev/null 2>&1; then
+    DLL_ALREADY_PATCHED=1
     log "already patched: $SELECTED_DLL references MailClient.Licensing.BouncyCastlePatch."
-    log "nothing to do. Pass --force to attempt patching anyway (will very likely fail cleanly"
-    log "at Stage 1's own shape-check, since the individual stages aren't self-reverting -- to"
-    log "genuinely re-patch, restore from a releases/*/backups/ backup first, then re-run)."
-    exit 0
+    log "skipping the DLL patch pipeline (pass --force to attempt patching anyway -- will very"
+    log "likely fail cleanly at Stage 1's own shape-check, since the individual stages aren't"
+    log "self-reverting -- to genuinely re-patch, restore from a releases/*/backups/ backup"
+    log "first, then re-run). Still checking fonts/file-associations below, since those are"
+    log "independent of whether the DLL patches are applied."
 fi
+
+if [[ $DLL_ALREADY_PATCHED -eq 0 ]]; then
 
 # ---------------------------------------------------------------------------
 # Refuse to patch into a bottle whose MailClient.exe is still running: files
@@ -562,6 +583,8 @@ log "  bottle:  $BOTTLE_NAME"
 log "  version: $FOUND_FILE_VERSION"
 log "  backup:  $BACKUP_DIR"
 
+fi  # DLL_ALREADY_PATCHED
+
 # ---------------------------------------------------------------------------
 # Optional: install vendored Windows fonts (Segoe UI, Tahoma, Calibri, etc.,
 # under fonts/) into the bottle for better general font fidelity under Wine.
@@ -627,6 +650,108 @@ if [[ -d "$FONTS_DIR" ]] && compgen -G "$FONTS_DIR"/*.ttf >/dev/null; then
         fi
     else
         log "skipping font install (no license confirmation given). Use --install-fonts to skip this prompt."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Optional: file-type associations (file-associations/*.reg) for attachment
+# types eM Client can't launch an external viewer for because the bottle has
+# no working association for them -- see
+# reports/office-file-associations-findings.md. Confirmed root cause: eM
+# Client's own attachment-open logic (MailClient.UI.ShellInterop.OpenItem /
+# UIUtils.OpenFileInDefaultApp) only has special internal handling for a
+# handful of its own item types (.eml/.msg/.emlt/.oft/.vcf/.ics/.asc/.crt/
+# .cer/.note/.pst/.emdf); everything else -- office documents, images,
+# archives, audio, video -- depends entirely on the bottle's own OS-level
+# file association, same as Explorer would use. A fresh CrossOver bottle
+# ships a working .pdf association out of the box but not office documents
+# (confirmed missing for .docx) or several common attachment types (images
+# like .bmp/.tif/.webp/.heic, archives, audio, video -- confirmed empty or
+# entirely absent). Each fix .reg file's own header comment has the full
+# story; this section applies whichever of file-associations/*.reg exist.
+#
+# Deliberately NOT a blind `wine regedit /S` of the whole file: that would
+# unconditionally overwrite every extension's association, including one a
+# real Office/LibreOffice install already set up correctly in this bottle.
+# Instead: parse each .reg file into its individual per-extension blocks
+# (file-associations/parse-reg-associations.py), check each extension
+# against THIS bottle's live registry via `wine reg query`, and only import
+# the blocks for extensions with no existing association (a missing key, or
+# a present key whose default value is "(value not set)" -- e.g. .svg,
+# whose ProgID pointed nowhere; see common-attachments.reg's own comment).
+# --force-associations also overwrites extensions that already have
+# something set. Per the project's own stated preference: this only checks
+# whether the extension already has *a* value, not what it actually points
+# to or whether that target is still valid -- simple and fast, at the cost
+# of not distinguishing "already correctly associated" from "associated
+# with something broken" (--force-associations is the escape hatch for the
+# latter).
+# ---------------------------------------------------------------------------
+
+ASSOC_FILES=("$REPO_ROOT/file-associations/office-associations.reg" "$REPO_ROOT/file-associations/common-attachments.reg")
+ASSOC_FILES_PRESENT=()
+for f in "${ASSOC_FILES[@]}"; do [[ -f "$f" ]] && ASSOC_FILES_PRESENT+=("$f"); done
+
+if [[ ${#ASSOC_FILES_PRESENT[@]} -gt 0 ]]; then
+    do_associations=0
+    if [[ $FORCE_ASSOCIATIONS -eq 1 || $INSTALL_ASSOCIATIONS -eq 1 ]]; then
+        do_associations=1
+    elif [[ $NO_ASSOCIATIONS -eq 1 ]]; then
+        do_associations=0
+    else
+        echo ""
+        echo "This repo has file-type association fixes under file-associations/ for"
+        echo "attachment types eM Client can't open otherwise (office documents, images,"
+        echo "archives, audio/video) -- see reports/office-file-associations-findings.md."
+        echo "Only extensions with no existing association in this bottle are touched."
+        read -r -p "Add missing file-type associations to this bottle? [Y/n] " areply
+        [[ -z "$areply" || "$areply" =~ ^[Yy]$ ]] && do_associations=1
+    fi
+
+    if [[ $do_associations -eq 1 ]]; then
+        log "checking file-type associations against $BOTTLE_NAME's registry..."
+        MERGED_REG="$WORKDIR/associations-merged.reg"
+        printf 'Windows Registry Editor Version 5.00\r\n\r\n' > "$MERGED_REG"
+
+        added=0
+        skipped=0
+        forced=0
+        while IFS=$'\t' read -r ext block_b64; do
+            # `wine reg query` exits non-zero for a genuinely-missing key -- expected, not an
+            # error, but pipefail (set above) would otherwise propagate that through this
+            # substitution and abort the whole script via set -e. || true absorbs it; $existing
+            # is correctly empty in that case either way.
+            existing=$( (CX_BOTTLE="$BOTTLE_NAME" /opt/cxoffice/bin/wine reg query "HKCR\\.$ext" /ve 2>/dev/null \
+                | sed -n 's/.*REG_SZ *//p' | tr -d '\r') || true)
+            if [[ -n "$existing" && "$existing" != "(value not set)" ]]; then
+                if [[ $FORCE_ASSOCIATIONS -eq 1 ]]; then
+                    echo "$block_b64" | base64 -d >> "$MERGED_REG"
+                    printf '\r\n' >> "$MERGED_REG"
+                    forced=$((forced + 1))
+                else
+                    skipped=$((skipped + 1))
+                fi
+            else
+                echo "$block_b64" | base64 -d >> "$MERGED_REG"
+                printf '\r\n' >> "$MERGED_REG"
+                added=$((added + 1))
+            fi
+        done < <(for f in "${ASSOC_FILES_PRESENT[@]}"; do python3 "$REPO_ROOT/file-associations/parse-reg-associations.py" "$f"; done)
+
+        log "file associations: $added new, $forced forced-overwrite, $skipped already present (unchanged)."
+
+        if [[ $((added + forced)) -gt 0 ]]; then
+            WIN_MERGED_REG="Z:$(echo "$MERGED_REG" | sed 's/\//\\/g')"
+            if CX_BOTTLE="$BOTTLE_NAME" /opt/cxoffice/bin/wine regedit /S "$WIN_MERGED_REG"; then
+                log "file-type associations imported."
+            else
+                warn "wine regedit import of file-type associations failed -- bottle's associations may be partially updated."
+            fi
+        else
+            log "no file-type association changes needed."
+        fi
+    else
+        log "skipping file-type associations. Use --install-associations to skip this prompt."
     fi
 fi
 

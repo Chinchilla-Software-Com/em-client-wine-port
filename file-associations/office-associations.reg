@@ -1,0 +1,310 @@
+Windows Registry Editor Version 5.00
+
+; Office document file-type associations for the em Client CrossOver/Wine bottle.
+;
+; Not something the eM Client installer sets up itself (unlike .pdf, which ships
+; associated with pdffile -> winebrowser.exe out of the box on a fresh CrossOver
+; bottle) -- confirmed missing for .docx specifically (see
+; reports/office-file-associations-findings.md), which is why em Client's own
+; Explorer-mirroring open logic (MailClient.UI.ShellInterop.OpenItem, with a
+; Process.Start/"openas" fallback) has nothing to resolve and Wine's shell32 shows
+; its own "There is no Windows program configured to open this type of file."
+; message box.
+;
+; Each extension gets its own ProgID under the EMClientWinePort.<ext> namespace --
+; deliberately not reusing any real Microsoft Office/LibreOffice ProgID name, so
+; these entries can never collide with (or be mistaken for) a genuine Office suite
+; installed in the same bottle later. All of them point at the same handler already
+; proven to work for .pdf: winebrowser.exe, which hands the file to the host's
+; xdg-open/MIME-configured Linux viewer.
+;
+; releases/<version>/deploy.sh imports this file selectively at deploy time (only
+; the extensions not already associated with something, unless --force-associations
+; is passed) rather than a blind `wine regedit /S` of the whole thing -- see its
+; own comments for how the selective merge works. This full file is also valid to
+; import as-is by hand (`wine regedit /S file-associations/office-associations.reg`)
+; if you want every entry unconditionally, overwriting anything already there.
+
+; --- Microsoft Word ---
+[HKEY_CLASSES_ROOT\.doc]
+@="EMClientWinePort.doc"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.doc\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.docx]
+@="EMClientWinePort.docx"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.docx\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.docm]
+@="EMClientWinePort.docm"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.docm\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.dot]
+@="EMClientWinePort.dot"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.dot\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.dotx]
+@="EMClientWinePort.dotx"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.dotx\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.dotm]
+@="EMClientWinePort.dotm"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.dotm\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.rtf]
+@="EMClientWinePort.rtf"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.rtf\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+; --- Microsoft Excel ---
+[HKEY_CLASSES_ROOT\.xls]
+@="EMClientWinePort.xls"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.xls\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.xlsx]
+@="EMClientWinePort.xlsx"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.xlsx\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.xlsm]
+@="EMClientWinePort.xlsm"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.xlsm\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.xlt]
+@="EMClientWinePort.xlt"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.xlt\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.xltx]
+@="EMClientWinePort.xltx"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.xltx\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.xltm]
+@="EMClientWinePort.xltm"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.xltm\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.xlsb]
+@="EMClientWinePort.xlsb"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.xlsb\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.csv]
+@="EMClientWinePort.csv"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.csv\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+; --- Microsoft PowerPoint ---
+[HKEY_CLASSES_ROOT\.ppt]
+@="EMClientWinePort.ppt"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.ppt\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.pptx]
+@="EMClientWinePort.pptx"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.pptx\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.pptm]
+@="EMClientWinePort.pptm"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.pptm\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.pot]
+@="EMClientWinePort.pot"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.pot\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.potx]
+@="EMClientWinePort.potx"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.potx\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.potm]
+@="EMClientWinePort.potm"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.potm\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.pps]
+@="EMClientWinePort.pps"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.pps\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.ppsx]
+@="EMClientWinePort.ppsx"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.ppsx\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.ppsm]
+@="EMClientWinePort.ppsm"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.ppsm\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+; --- Microsoft Visio ---
+[HKEY_CLASSES_ROOT\.vsd]
+@="EMClientWinePort.vsd"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.vsd\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.vsdx]
+@="EMClientWinePort.vsdx"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.vsdx\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.vsdm]
+@="EMClientWinePort.vsdm"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.vsdm\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.vss]
+@="EMClientWinePort.vss"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.vss\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.vssx]
+@="EMClientWinePort.vssx"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.vssx\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.vssm]
+@="EMClientWinePort.vssm"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.vssm\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.vst]
+@="EMClientWinePort.vst"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.vst\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.vstx]
+@="EMClientWinePort.vstx"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.vstx\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.vstm]
+@="EMClientWinePort.vstm"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.vstm\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+; --- Microsoft Publisher ---
+[HKEY_CLASSES_ROOT\.pub]
+@="EMClientWinePort.pub"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.pub\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+; --- OpenDocument (zipped) ---
+[HKEY_CLASSES_ROOT\.odt]
+@="EMClientWinePort.odt"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.odt\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.ott]
+@="EMClientWinePort.ott"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.ott\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.ods]
+@="EMClientWinePort.ods"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.ods\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.ots]
+@="EMClientWinePort.ots"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.ots\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.odp]
+@="EMClientWinePort.odp"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.odp\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.otp]
+@="EMClientWinePort.otp"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.otp\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.odg]
+@="EMClientWinePort.odg"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.odg\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.otg]
+@="EMClientWinePort.otg"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.otg\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+; --- OpenDocument (flat XML) ---
+[HKEY_CLASSES_ROOT\.fodt]
+@="EMClientWinePort.fodt"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.fodt\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.fods]
+@="EMClientWinePort.fods"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.fods\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.fodp]
+@="EMClientWinePort.fodp"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.fodp\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
+[HKEY_CLASSES_ROOT\.fodg]
+@="EMClientWinePort.fodg"
+
+[HKEY_CLASSES_ROOT\EMClientWinePort.fodg\shell\open\command]
+@="\"c:\\windows\\system32\\winebrowser.exe\" \"%1\""
+
