@@ -292,6 +292,58 @@ All three experimental builds were reverted after testing; `emClient_win_8_x64` 
 confirmed-working stage-7 baseline (verified via `md5sum` against the pre-test backup taken in
 `il-patches/backup/MailClient.dll.stage7-confirmed-working`).
 
+## Fifth round: content becomes visible when `Hide()` runs, not at a fixed wall-clock mark
+
+Two more tests, prompted directly by the user's own idea and an independent observation on a
+second machine, sharpen (and partly supersede) the fourth round's "tracks `NotificationsHideTimeout`"
+theory:
+
+1. **Disable the fade animation entirely**, via the app's own existing `LayeredBaseForm.
+   ShowWithoutFading` flag (`get; set;`, already used elsewhere for non-animated layered popups) --
+   not a new mechanism, just forcing an existing one on. New `il-patcher` mode
+   (`--patch-notification-no-fading`) sets `this.ShowWithoutFading = true;` in
+   `FormGenericNotification`'s constructor, scoped narrowly there (not on `LayeredBaseForm` itself)
+   so unrelated `LayeredBaseForm` consumers like `FormPopup` aren't affected. Result: the
+   notification window is created at the correct position/size (confirmed via `xwininfo`: 310x125,
+   `IsViewable`) but is **completely invisible for its entire lifetime** -- not even the chrome/
+   background box that every other test showed immediately. Root cause of *that*: `OnShown`'s
+   `ShowWithoutFading` branch never starts `timer` at all (only the fade-driven Appearing/
+   Disappearing branches do), so `NotificationsHideAfterTimeout`'s auto-hide never engages either --
+   the window is left permanently stuck with no scheduled future tick of any kind. Useful negative
+   result: the repeated animation ticks aren't just cosmetic opacity changes, they're also
+   apparently doing something necessary to make the layered window's content composite at all --
+   removing them doesn't sidestep the bug, it just removes the one thing that (eventually) fixes it.
+2. **The user's own test, independently, on a second machine**: with `NotificationsHideAfterTimeout`
+   turned off via Settings (autoHide=false; normal fade animation still active, no patch involved)
+   the notification displayed with no text and stayed that way *indefinitely* -- not ~6s, however
+   long they left it. **Clicking it** made the avatar and text appear immediately, then it began
+   fading out and opened the email. Reproduced on `emClient_win_8_x64` too (recorded): box blank
+   from ~t=0.5s to ~t=16.5s (matching how long the user let it sit before clicking), content
+   appearing right around the click at ~t=17s, then holding steady (the app then hung before it
+   could finish opening the email/fading out -- see below).
+
+This is materially better evidence than the fourth round's burst/silent-wait correlation: it shows
+the release point moving to match an arbitrary, user-controlled event (a click, at whatever elapsed
+time), not sitting at a fixed ~6s mark. The real trigger is calling `Hide()` (state -> Disappearing)
+-- whether invoked by the timer naturally elapsing or by a mouse click -- not elapsed wall-clock
+time as such. This reframes (without fully resolving) the fourth round's silent-wait result: that
+test's ~7.4s release, notably *earlier* than the ~12s a naive reading of the inserted
+`timer.Stop()`/`Sleep`/`Start()` sequence would predict before the next real tick could fire,
+suggests some other path into `Hide()`/a tick fires sooner than modeled -- not re-investigated this
+round, but worth reconciling if this picked up again, ideally alongside the `updateLayeredBackground`
+angle noted above.
+
+**New, separate wrinkle:** eM Client hung (stopped responding, requiring force-quit) twice in a
+row this round, both times shortly after the user clicked a no-text notification with auto-hide
+disabled. Not yet investigated as its own issue -- could be coincidental (unrelated Wine/CEF
+instability) or could be connected to this bug's mechanism; flagging here since it happened
+consistently (2/2) under this specific combination (auto-hide off + click) and hasn't been seen
+under any other test in this investigation.
+
+Both this round's builds/settings changes were reverted; `emClient_win_8_x64` is back on the
+confirmed-working stage-7 baseline (`NotificationsHideAfterTimeout` should be re-confirmed still
+enabled next session, since it was toggled off via Settings mid-investigation, not via a patch).
+
 ## Not yet tried
 
 - A live X11 pixmap dump (e.g. `xwd`/`import`) precisely synchronized with the broken window's

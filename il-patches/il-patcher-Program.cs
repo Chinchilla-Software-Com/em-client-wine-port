@@ -58,6 +58,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-silent-wait")
     return RunPatchNotificationSilentWait(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-no-fading")
+{
+    return RunPatchNotificationNoFading(args);
+}
+
 if (args.Length > 0 && args[0] == "--version")
 {
     return RunVersion(args);
@@ -1239,6 +1244,160 @@ static int RunPatchNotificationSilentWait(string[] args)
         );
 
         Console.WriteLine($"OK   {fileName}: inserted silent {waitMs}ms wait (timer stopped, zero paint activity) after state=Visible in {targetType}::{targetMethod}");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-no-fading <input-dir> <output-dir>
+//
+// Separate test from the burst/silent-wait isolation patches above -- rather than guessing at the
+// freeze's mechanism, remove the animation apparatus entirely and see whether a plain, static
+// (non-layered-opacity-animated) notification is affected at all. `LayeredBaseForm` (the shared
+// base of FormGenericNotification and unrelated things like FormPopup) already has a built-in
+// `ShowWithoutFading` property that, when true, skips the whole Appearing/Disappearing opacity
+// state machine on both the show and hide paths (see FormGenericNotification.OnShown and .Hide)
+// -- existing, already-exercised app logic, not something invented for this test. Setting it via
+// LayeredBaseForm's own getter would also affect FormPopup and other unrelated layered popups, so
+// this patch instead sets it narrowly in FormGenericNotification's own constructor (right after
+// the existing `autoHide = Program.Settings.NotificationsHideAfterTimeout;` assignment), scoping
+// the change to notification toasts only.
+//
+// Caveat worth watching for when testing this: OnShown's ShowWithoutFading branch never starts
+// `timer` at all (the fade-driven Appearing/Disappearing branches are the only place it's
+// started in that method) -- meaning it's not yet confirmed whether auto-hide-after-timeout still
+// works with fading disabled, or whether some other, not-yet-found mechanism drives it. If the
+// notification never disappears on its own during testing, that's a real (if separate) finding,
+// not a sign this patch is broken -- don't read it as "the fix worked, it just never closes."
+//
+// Touches MailClient.dll only (FormGenericNotification's instance constructor).
+static int RunPatchNotificationNoFading(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-no-fading <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var ctor = type.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0 && m.HasBody);
+        if (ctor is null) { Console.Error.WriteLine($"FAIL: parameterless .ctor not found on {targetType}"); return 1; }
+
+        var baseType = type.BaseType?.Resolve();
+        if (baseType is null || baseType.FullName != "MailClient.UI.Forms.LayeredBaseForm")
+        {
+            Console.Error.WriteLine($"FAIL: expected base type MailClient.UI.Forms.LayeredBaseForm, got {baseType?.FullName}");
+            return 1;
+        }
+        var setShowWithoutFadingDef = baseType.Methods.FirstOrDefault(m => m.Name == "set_ShowWithoutFading");
+        if (setShowWithoutFadingDef is null) { Console.Error.WriteLine("FAIL: LayeredBaseForm missing set_ShowWithoutFading"); return 1; }
+        var setShowWithoutFadingRef = module.ImportReference(setShowWithoutFadingDef);
+
+        var body = ctor.Body;
+        body.SimplifyMacros();
+        var instrs = body.Instructions;
+
+        // `autoHide` is assigned twice: a compiler-generated field initializer (`autoHide = true;`)
+        // ahead of the `base..ctor()` call, and the real one inside `if (!UIUtils.DesignMode)`
+        // (`autoHide = Program.Settings.NotificationsHideAfterTimeout;`). Only the second is a
+        // reliable insertion anchor (past DesignMode-guard, past base-ctor, method body settled)
+        // -- identify it by the preceding call to the settings getter rather than by assuming
+        // ordering, so a compiler-output shuffle doesn't silently pick the wrong one.
+        Instruction? autoHideStfld = null;
+        for (int idx = 0; idx < instrs.Count; idx++)
+        {
+            var instr = instrs[idx];
+            if (instr.OpCode == OpCodes.Stfld && instr.Operand is FieldReference fr && fr.Name == "autoHide")
+            {
+                var prev = idx > 0 ? instrs[idx - 1] : null;
+                bool isRealAssignment = prev is not null && (prev.OpCode == OpCodes.Call || prev.OpCode == OpCodes.Callvirt) &&
+                    prev.Operand is MethodReference mr && mr.Name == "get_NotificationsHideAfterTimeout";
+                if (isRealAssignment)
+                {
+                    if (autoHideStfld is not null)
+                    {
+                        Console.Error.WriteLine("FAIL: more than one qualifying `stfld autoHide` found in .ctor -- method shape changed, review needed");
+                        return 1;
+                    }
+                    autoHideStfld = instr;
+                }
+            }
+        }
+        if (autoHideStfld is null) { Console.Error.WriteLine("FAIL: couldn't find the real `stfld autoHide` (preceded by get_NotificationsHideAfterTimeout) in .ctor"); return 1; }
+
+        // Insert immediately before the `stfld` itself, not after it: the instruction after it is
+        // the if(!DesignMode)-block's own join point (the branch target the guard's initial
+        // brfalse jumps to when skipping the block) -- CLAUDE.md lesson #2 territory. Inserting
+        // before `stfld` instead is both stack-neutral (our sequence is a self-contained
+        // ldarg.0/ldc.i4.1/callvirt with net-zero stack effect, so it doesn't disturb the pending
+        // objref+value already pushed for the real stfld beneath it) and correctly stays inside
+        // the same DesignMode guard as the assignment it's anchored to, without needing to retarget
+        // anything.
+        var insertBefore = autoHideStfld;
+
+        foreach (var instr in instrs)
+        {
+            if (instr.Operand == insertBefore)
+            {
+                Console.Error.WriteLine("FAIL: insertion point is a branch target -- would need retargeting, review needed");
+                return 1;
+            }
+        }
+        foreach (var handler in body.ExceptionHandlers)
+        {
+            if (handler.TryStart == insertBefore || handler.TryEnd == insertBefore ||
+                handler.HandlerStart == insertBefore || handler.HandlerEnd == insertBefore)
+            {
+                Console.Error.WriteLine("FAIL: insertion point is an exception-handler region boundary -- review needed");
+                return 1;
+            }
+        }
+
+        var il = body.GetILProcessor();
+        il.InsertBefore(insertBefore, Instruction.Create(OpCodes.Ldarg_0));
+        il.InsertBefore(insertBefore, Instruction.Create(OpCodes.Ldc_I4_1));
+        il.InsertBefore(insertBefore, Instruction.Create(OpCodes.Callvirt, setShowWithoutFadingRef));
+
+        Console.WriteLine($"OK   {fileName}: inserted `this.ShowWithoutFading = true;` after autoHide assignment in {targetType}::.ctor");
         patched = true;
 
         module.Write(destPath);
