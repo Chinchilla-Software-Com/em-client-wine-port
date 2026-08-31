@@ -313,6 +313,16 @@ theory:
    result: the repeated animation ticks aren't just cosmetic opacity changes, they're also
    apparently doing something necessary to make the layered window's content composite at all --
    removing them doesn't sidestep the bug, it just removes the one thing that (eventually) fixes it.
+   **Caveat flagged by the user, not yet re-tested:** eM Client is known to suppress notifications
+   entirely when its own window has focus (normal, expected behavior). This test's main window may
+   have had focus by mistake when the test email arrived, which would produce the same visible
+   symptom (nothing appears) for a completely different, mundane reason -- unrelated to the
+   `ShowWithoutFading`/timer-never-started mechanism above. **Do not treat this result as confirmed
+   until re-run with the main window deliberately unfocused when the email arrives.** The `xwininfo`
+   evidence (a window matching the sender's name, correct 310x125 geometry, `IsViewable`) argues
+   the notification *was* actually created and shown, not suppressed at the point of creation --
+   suppression-on-focus most likely happens earlier, before a `FormMailNotification` is even
+   constructed -- but this is inference, not confirmation, and should be checked directly.
 2. **The user's own test, independently, on a second machine**: with `NotificationsHideAfterTimeout`
    turned off via Settings (autoHide=false; normal fade animation still active, no patch involved)
    the notification displayed with no text and stayed that way *indefinitely* -- not ~6s, however
@@ -333,12 +343,23 @@ suggests some other path into `Hide()`/a tick fires sooner than modeled -- not r
 round, but worth reconciling if this picked up again, ideally alongside the `updateLayeredBackground`
 angle noted above.
 
-**New, separate wrinkle:** eM Client hung (stopped responding, requiring force-quit) twice in a
-row this round, both times shortly after the user clicked a no-text notification with auto-hide
-disabled. Not yet investigated as its own issue -- could be coincidental (unrelated Wine/CEF
-instability) or could be connected to this bug's mechanism; flagging here since it happened
-consistently (2/2) under this specific combination (auto-hide off + click) and hasn't been seen
-under any other test in this investigation.
+**New, separate wrinkle -- precisely characterized after further testing:** eM Client hangs
+(stops responding, requiring force-quit -- which then forces an unavoidable DB-check dialog on the
+next launch) when a no-text notification (auto-hide disabled) is clicked **after** the normal
+~6-second `NotificationsHideTimeout` mark has passed. The user isolated this precisely: with
+auto-hide back on, no freeze. With auto-hide off, clicking *within* the first ~6 seconds opens the
+email cleanly, no freeze. Clicking *after* ~6 seconds elapses -- i.e. after the point where the
+timer would naturally have fired and started the real fade-out, had auto-hide been on -- hangs the
+app, reproduced twice in a row under this exact condition. This lines up neatly with everything
+else in this investigation: something real changes in the notification's state right around
+`timeToStay` elapsing (state was already suspected to matter more than wall-clock time as such,
+per the click-triggers-`Hide()` finding above), and a user click arriving at/after that same moment
+likely races with it -- plausibly a second, concurrent path into `Hide()`/the state machine (one
+from the click handler, one from whatever fires at the timeout mark despite auto-hide being off)
+deadlocking or corrupting shared state. Not yet root-caused; a strong, cleanly reproducible next
+lead if this investigation continues, and probably worth its own instrumented test (e.g.
+`--patch-diag`-style logging in `Hide()`/`timer_OnTimer`/the click handler) rather than more
+screen-recording-based inference, since the mechanism is now narrowed enough to look at directly.
 
 Both this round's builds/settings changes were reverted; `emClient_win_8_x64` is back on the
 confirmed-working stage-7 baseline (`NotificationsHideAfterTimeout` should be re-confirmed still
