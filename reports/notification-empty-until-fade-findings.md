@@ -120,6 +120,102 @@ anti-aliased text produces hundreds of distinct colors with sharp bright/dark ed
 of that here. **The content is genuinely absent from what's composited to screen at that moment —
 not a low-contrast/color problem, not something subtly present.**
 
+## Confirmed, via reading Wine's actual `winex11.drv` source (`dlls/winex11.drv/window.c`,
+wine-mirror/wine)
+
+`X11DRV_SetLayeredWindowAttributes` does **no compositing itself** — it only sets the standard
+X11 `_NET_WM_WINDOW_OPACITY` property (`sync_window_opacity()`): `XChangeProperty` for any
+alpha value other than fully-opaque, or **`XDeleteProperty`** when opacity resolves to exactly
+0xffffffff (alpha=255, i.e. `Opacity = 1.0`). Actually compositing the window — reading that
+property plus the window's damage/content and blending it onto the screen — is entirely the
+window manager/compositor's job, not Wine's. This is consistent with everything already
+confirmed: Wine's own responsibility (paint into its surface, set the property, flag damage) is
+demonstrably done correctly and completely; the remaining step is out of Wine's hands.
+
+This produced a specific, testable hypothesis: that the `XChangeProperty`-vs-`XDeleteProperty`
+split (a real, different code path depending on whether opacity is *exactly* 1.0) causes
+different compositor behavior. **Tested directly and found not to be it** — see the third fix
+attempt above (the dip-and-recover sequence deliberately avoids ever landing on exactly 1.0
+mid-sequence and still produced zero effect).
+
+## Five minimal-repro-app iterations, none reproduce the bug
+
+To get a much faster iteration loop than patching `MailClient.dll` via Cecil for every experiment,
+built a small standalone WinForms app (`notif-repro.exe`, self-contained `net8.0-windows`/`win-x86`
+publish, run directly under the same Wine bottle) replicating the real mechanism piece by piece.
+Each iteration was checked via a cropped/full-screen `ffmpeg` recording of a live run (frame
+extraction + distinct-color-count sampling, not just a single screenshot), so "does it show text
+immediately" is a measured result, not a guess:
+
+1. **Base mechanism**: `WS_EX_LAYERED` (`AllowTransparency` + `TransparencyKey`), `Opacity`
+   animated by a `Timer` (fade in → hold → fade out, same 25ms tick interval), `UserPaint` +
+   `AllPaintingInWmPaint` + `OptimizedDoubleBuffer`, `TextRenderer.DrawText` content (matching the
+   real `NtGdiExtTextOutW` call, not GDI+'s `DrawString`). **Text rendered correctly and
+   immediately** — no blank period at all.
+2. **+ drop-shadow companion window** (separate `WS_EX_LAYERED` hwnd driven by
+   `UpdateLayeredWindow`, matching `LayeredBaseForm.layeredWindow`) **+ raw
+   `ShowWindow`/`SetWindowPos(HWND_TOPMOST)` show sequence** (bypassing WinForms' own `Show()`,
+   matching `FormGenericNotification.Show()`'s real implementation). Still immediate.
+3. **+ avatar/icon image** (a filled circle + initials, matching `FormMailNotification`'s
+   `Image`/avatar area) drawn synchronously in `OnPaint`. Still immediate.
+4. **+ secondary window while a large "main window" is already active** (an
+   `Application.Run`-hosted mock main form shows first and stays open; the notification is created
+   and shown ~1.5s later as an independent `Form.Show()` on the same UI thread) — closer to the
+   real scenario where the notification is never the process's only/first window. Still immediate.
+5. **+ cross-thread avatar delivery** (a background `Thread` sleeps ~180ms then marshals back via
+   `Invoke()` to set the avatar and call `Invalidate()`, matching the real
+   `AvatarManager_AvatarUpdated` → `SafeInvoke` → `Invalidate()` pattern instead of a same-thread
+   synchronous draw). Still immediate.
+
+None of these — individually or combined — reproduce the bug. This is a real, useful negative
+result: it rules out the WinForms layered-window mechanism, the shadow window, the raw show
+sequence, the avatar (both sync and async-via-cross-thread-Invoke), and "being a secondary window
+alongside an active main window" as the cause in isolation. Whatever's different about the real
+app is something this project's tooling hasn't been able to isolate yet — most likely something
+about em Client's actual process complexity (multiple CEF subprocesses, genuine background
+load from IMAP sync/indexing, or a specific Win32 call sequence not yet replicated) rather than a
+flaw in the notification's own code shape.
+
+The stub's source is tracked nowhere in this repo yet (built and iterated in a scratch directory)
+— worth promoting into `il-patches/` (as a new "not itself deployed, but built and run against a
+live bottle" tool, following `font-systemlink-writer/`'s precedent) if a future session picks this
+back up, rather than rebuilding it from scratch.
+
+## Ruled out: Muffin's X11-Sync-extension frame-freeze mechanism
+
+Reading `linuxmint/muffin`'s actual compositor source (`src/compositor/meta-window-actor.c`,
+`src/x11/window-x11.c`) turned up a real, named freeze/thaw mechanism: a window actor can be held
+`INITIALLY_FROZEN` (or frozen later) based on `meta_window_x11_are_updates_frozen()`, which is
+driven by the **X11 Sync extension "frame sync" protocol** — the compositor can hold a window's
+displayed texture frozen (ignoring all further damage/content changes, and even opacity changes,
+until it explicitly thaws) while waiting for the client to acknowledge frame completion via an
+XSync counter, with a hard-coded 1-second timeout fallback if the client never responds. This
+looked like an excellent candidate: it would explain the correct-content-but-frozen-display
+symptom, and the "even a forced opacity swing does nothing" result from the third fix attempt,
+in one mechanism.
+
+**Ruled out directly via `xprop`, on both the stub and the real notification window.** This
+protocol requires the client to advertise `_NET_WM_SYNC_REQUEST` in `WM_PROTOCOLS` and set a
+`_NET_WM_SYNC_REQUEST_COUNTER` property; without both, the compositor never engages this freeze
+path for that window at all (`send_sync_request()` explicitly checks
+`window->sync_request_counter != None` first). Checked both: the real `LayeredBaseForm` window's
+`WM_PROTOCOLS` is `WM_DELETE_WINDOW, _NET_WM_PING, WM_TAKE_FOCUS` only — no
+`_NET_WM_SYNC_REQUEST`, no counter property anywhere. Wine simply doesn't participate in this
+protocol for its windows (confirmed on both the stub's window and the genuine notification's
+window, not just inferred from one). This specific mechanism cannot be the cause.
+
+## Is this Wayland-specific (X11-only), i.e. would it go away under Wayland?
+
+Very likely yes, though unconfirmed. Every mechanism traced in this investigation is deeply
+X11-specific: `winex11.drv` setting the `_NET_WM_WINDOW_OPACITY` X11 property, X11
+window-surface/pixmap flushing, and Muffin's X11-specific compositor code built on X11 extensions
+(Sync, Shape). Under Wayland, Wine uses an entirely different driver (`winewayland.drv`) with a
+fundamentally different compositing model — direct Wayland surface buffers, no X11 properties, no
+X11 Sync extension. The specific interaction chased in this investigation wouldn't exist in that
+code path at all. Two caveats: this hasn't been tested (there could be an analogous
+Wayland-side bug waiting to be found), and CrossOver's own Wayland driver maturity may lag behind
+or differ from upstream Wine's `winewayland.drv`.
+
 ## Where this leaves it
 
 Every mechanism inspectable via app instrumentation and Wine API tracing — data correctness,
@@ -139,21 +235,37 @@ moved it.
 - A live X11 pixmap dump (e.g. `xwd`/`import`) precisely synchronized with the broken window's
   timeframe, to inspect the actual server-side composited pixmap content directly, rather than
   inferring from Wine's own trace log of what it *believes* it did.
-- Reading Wine's `window_surface`/layered-window implementation source directly for the specific
-  code path used by a `WS_EX_LAYERED` top-level window combined with WinForms'
-  `OptimizedDoubleBuffer`, rather than black-box trace observation.
+- Reading Wine's and Muffin's source did narrow things down (see above — Wine's role ends at
+  setting `_NET_WM_WINDOW_OPACITY`; Muffin's X11-Sync-extension freeze mechanism is ruled out) but
+  didn't find the actual mechanism. The remaining unread territory: Muffin's damage-tracking and
+  texture-upload code specifically (`meta-surface-actor-x11.c` and the Cogl/Clutter texture-update
+  path it feeds into) for anything else that could cause a window's displayed texture to go stale
+  independent of the Sync-extension freeze path already ruled out.
+- A minimal repro app was built and iterated five times without reproducing the bug (see above) —
+  worth a sixth iteration simulating genuine background CPU/thread load (the one structural
+  difference from the real app not yet tried) if this gets picked up again, though the diminishing
+  hit-rate of the last five attempts makes this a lower-confidence next step than the Muffin
+  source options above.
 - Testing under a different desktop environment/window manager (non-Cinnamon) to determine
-  whether this reproduces identically elsewhere, or is specific to this Mint/Muffin combination.
+  whether this reproduces identically elsewhere, or is specific to this Mint/Muffin combination —
+  strengthened as a lead now that Wayland is a plausible clean escape (see above), since Wayland
+  and a different X11 WM/compositor (e.g. KWin, Picom+a non-compositing WM) are two different,
+  separately informative tests.
 - Testing against a different CrossOver/Wine build to bound whether it's version-specific.
 - The user separately observed the notification's sender avatar/icon appearing to draw before the
-  text in an earlier manual (non-recorded) repro. Not reproduced in the recorded session analyzed
-  here (the box was uniformly blank in every sampled frame during the hold, no icon visible before
-  the text+fade moment) — worth another look if a future session can catch it on video, since if
-  real it would suggest the icon (a `DrawImage`/bitmap blit) and the text (`ExtTextOutW`) take
-  different paths to the screen, and only one of them is affected.
+  text in an earlier manual (non-recorded) repro on the real app. Not reproduced in the recorded
+  session analyzed here, nor in the repro-app iteration that specifically added an avatar (sync or
+  cross-thread-async) — worth another look on the real app if a future session can catch it on
+  video, since if real it would suggest the icon (a `DrawImage`/bitmap blit) and the text
+  (`ExtTextOutW`) take different paths to the screen, and only one of them is affected.
 
 ## Status
 
-**Unresolved.** All experimental changes (diagnostic instrumentation, all three fix attempts) have
-been reverted — `emClient_win_8_x64` is back to its confirmed-working baseline (all 7 prior patch
-stages intact, nothing extra deployed). No fix is currently applied or shipped for this issue.
+**Unresolved.** All experimental changes (diagnostic instrumentation, all three fix attempts, the
+real app instance used for the final `xprop` check) have been reverted/closed out —
+`emClient_win_8_x64` is back to its confirmed-working baseline (all 7 prior patch stages intact,
+nothing extra deployed). No fix is currently applied or shipped for this issue. Two specific,
+well-evidenced hypotheses (Wine's opacity-property delete-vs-change split; Muffin's X11-Sync-
+extension frame-freeze) have been directly tested and ruled out this round, narrowing the
+remaining search space to Muffin's texture/damage-tracking code specifically, or to something
+about the real app's process complexity that a minimal repro hasn't yet replicated.

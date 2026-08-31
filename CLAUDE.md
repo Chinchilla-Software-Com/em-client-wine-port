@@ -36,6 +36,16 @@
                       reports/splash-tip-icon-findings.md). Optional, wired into
                       releases/<version>/deploy.sh's `--install-fonts` step; not part of the core
                       IL-patch pipeline and not required by any of it.
+                      il-patches/notification-repro-stub/ (tracked in full, same reason as
+                      font-systemlink-writer/ above) is a minimal standalone WinForms app
+                      replicating FormGenericNotification's layered-window mechanism piece by
+                      piece, built to test hypotheses about the notification empty-box bug (see
+                      Status below and reports/notification-empty-until-fade-findings.md) far
+                      faster than patching MailClient.dll via Cecil for every experiment — normal
+                      C# source, `dotnet publish` + `wine <exe>`, no IL patching involved. Not
+                      wired into deploy.sh or any pipeline; a standalone diagnostic tool, run
+                      manually. Five iterations tried against the real bug, none reproduced it —
+                      see the findings report for what that ruled out.
                       il-patches/output*/ and il-patches/backup/ are gitignored build output —
                       regenerate via the pipeline below, don't hand-edit or commit them.
 - reports/crossover-backlog.json — one entry per CONFIRMED freeze point
@@ -382,10 +392,24 @@ anyway since it's a real bug and the fix is cheap:**
   separately confirmed the content is genuinely absent from what's composited to screen at that
   moment, not a low-contrast/color issue. Every mechanism inspectable via instrumentation, trace,
   and recording is confirmed correct, yet the screen doesn't reflect it — a real gap between "the
-  app/GDI did the work" and "the screen shows it" with no specific mechanism identified. All
-  experimental changes reverted; bottle back to its confirmed-working baseline. Full history,
-  including everything ruled out and what's not yet tried:
-  `reports/notification-empty-until-fade-findings.md`.
+  app/GDI did the work" and "the screen shows it" with no specific mechanism identified.
+  Follow-up round: read Wine's actual `winex11.drv` source and confirmed `SetLayeredWindowAttributes`
+  does no compositing itself — it just sets/deletes the X11 `_NET_WM_WINDOW_OPACITY` property and
+  leaves the actual compositing to the window manager, consistent with everything else found. Built
+  a minimal standalone repro app (`notif-repro.exe`, not yet tracked in the repo) to iterate faster
+  than patching `MailClient.dll`; five iterations (base layered-window mechanism, +drop-shadow
+  window +raw Win32 show sequence, +avatar image, +secondary-window-alongside-active-main-window,
+  +cross-thread avatar via `Invoke`) all failed to reproduce the bug — real, useful negative
+  evidence that rules out the WinForms mechanism itself as sufficient cause. Read Muffin's (Mint's
+  Mutter fork) actual compositor source and found a real, named window-freeze mechanism tied to the
+  X11 Sync extension frame-completion protocol — a strong candidate, but directly ruled out via
+  `xprop` on both the repro app and the real notification window (`WM_PROTOCOLS` has no
+  `_NET_WM_SYNC_REQUEST`, no counter property — Wine never engages this protocol for its windows at
+  all). Very likely X11-specific given how deeply tied to X11 properties/extensions every confirmed
+  mechanism is — plausibly avoided entirely on Wayland (`winewayland.drv`, a different driver and
+  compositing model), though untested. All experimental changes reverted; bottle back to its
+  confirmed-working baseline. Full history, including everything ruled out and what's not yet
+  tried: `reports/notification-empty-until-fade-findings.md`.
 
 The two bugs originally reported (blank Settings panel, and the category-click crash found once
 the panel worked), the License Activation failure and "Get a license" icon bug found during that
