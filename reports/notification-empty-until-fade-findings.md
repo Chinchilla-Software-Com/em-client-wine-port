@@ -394,14 +394,35 @@ enabled next session, since it was toggled off via Settings mid-investigation, n
 
 ## Status
 
-**Unresolved.** All experimental changes across both rounds (diagnostic instrumentation, all five
-fix/isolation attempts, the real app instance used for the final `xprop` check) have been
-reverted/closed out — `emClient_win_8_x64` is back to its confirmed-working baseline (all 7 prior
-patch stages intact, nothing extra deployed). No fix is currently applied or shipped for this
-issue. Several specific, well-evidenced hypotheses have now been directly tested and ruled out:
-Wine's opacity-property delete-vs-change split; Muffin's X11-Sync-extension frame-freeze; and, this
-round, the idea that any amount of app-side repaint/opacity/message-pump activity (or the deliberate
-absence of it) has a causal effect on release timing. The remaining, currently-favored explanation
-is a wall-clock/compositor-side effect whose duration tracks `NotificationsHideTimeout` — narrowing
-the search toward Muffin's texture/damage-tracking code, or the `updateLayeredBackground`/
-`timeToStay` code path noted above, rather than anything in the paint/timer state machine itself.
+**Unresolved, but substantially narrowed as of this session (2026-09-01).** All experimental
+changes across all three rounds this session (diagnostic instrumentation, all six fix/isolation
+attempts including `--patch-notification-no-fading`, the real app instance used for the final
+`xprop` check and the two focus/no-fading re-tests) have been reverted/closed out —
+`emClient_win_8_x64` is back on its confirmed-working stage-7 baseline (`md5sum`-verified against
+`il-patches/backup/MailClient.dll.stage7-confirmed-working`), and the app is currently closed
+(quit gracefully, not force-killed). `NotificationsHideAfterTimeout` was toggled off via Settings
+mid-investigation and back on again by the user before this checkpoint -- worth a quick glance at
+Settings -> Notifications next session just to confirm it's still on before assuming baseline
+behavior.
+
+**Current best understanding, superseding the "wall-clock/compositor timeout" theory from earlier
+in this session:** content becomes visible when `Hide()` actually runs (state -> Disappearing),
+triggered either by the auto-hide timer naturally elapsing or by a user click -- not by a fixed
+elapsed-time threshold as such. The fourth round's burst/silent-wait tests, which all released
+around the same ~6s mark regardless of what the app was doing, are now best explained as all
+indirectly reaching that same natural `Hide()` trigger rather than each release being caused by
+its own mechanism -- exactly how remains unresolved (see the fifth-round section above for the
+specific unreconciled timing detail in the silent-wait test). Ruled out this session: Wine's
+opacity-property delete-vs-change split; Muffin's X11-Sync-extension frame-freeze; disabling the
+fade animation entirely (makes it worse -- permanently invisible, confirmed not a focus-suppression
+artifact); and the idea that app-side repaint/opacity/message-pump activity during the blank window
+has any causal effect by itself.
+
+**Freshest, most actionable lead (not yet investigated) -- resume here next:** clicking a
+no-text notification (auto-hide off) hangs the app if clicked *after* ~6 seconds have elapsed,
+but not if clicked within that window (reproduced 2/2). This is cleanly reproducible without any
+patch (just the existing Settings toggle + click timing) and points directly at a likely race
+between the click handler and whatever fires at the `timeToStay` mark. Planned next step, agreed
+with the user before this checkpoint: instrument `Hide()`, `timer_OnTimer`, and the notification's
+click handler with `--patch-diag`-style logging to see exactly what collides, rather than
+continuing to infer from screen recordings alone.
