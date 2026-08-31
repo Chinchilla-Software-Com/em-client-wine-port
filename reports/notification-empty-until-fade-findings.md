@@ -230,6 +230,15 @@ screen reflects it" — narrowed considerably from where the investigation start
 specific mechanism identified, and three independent, reasonably-targeted fix attempts have not
 moved it.
 
+## Reference: confirmed-working native Windows behavior
+(`supporting/notifications-working-example-from-windows.png`)
+
+Captured on real Windows (not Wine) for comparison: a notification toast with sender/subject
+text ("Test Sender" / "Re: Testing notifications") fully visible immediately, no blank period.
+Confirms the expected behavior this project is chasing is standard/correct on native Windows —
+i.e. this is purely a Wine/Linux-compositor-side gap, not a difference in how eM Client itself
+behaves by design on different platforms.
+
 ## Not yet tried
 
 - A live X11 pixmap dump (e.g. `xwd`/`import`) precisely synchronized with the broken window's
