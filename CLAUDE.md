@@ -366,20 +366,25 @@ anyway since it's a real bug and the fix is cheap:**
 - **New-mail notification toast shows an empty box until it starts to fade out.** The one open
   bug as of this writing. Direct app instrumentation confirmed the data (title/content) and the
   fade animation's state machine are both correct from the very first paint — not a timing or
-  data bug. Two hypothesis-driven fixes (an extra `Invalidate()` call; forcing a genuine
-  `SetLayeredWindowAttributes` alpha change) both made no observable difference, and were later
-  confirmed via trace to have been patching mechanisms that were never actually broken: Wine's
-  `window_surface_flush` and `SetLayeredWindowAttributes` handling both check out correct, and a
+  data bug. Three hypothesis-driven fixes all made no observable difference: an extra
+  `Invalidate()` call; forcing a genuine `SetLayeredWindowAttributes` alpha change; and a deliberate
+  dip-and-recover opacity sequence using real message-loop cycles (`Application.DoEvents()` +
+  `Thread.Sleep()` between steps, mimicking the working fade-out's own mechanism). All three were
+  confirmed via trace/recording to have been patching mechanisms that were never actually broken:
+  Wine's `window_surface_flush` and `SetLayeredWindowAttributes` handling both check out correct, a
   further trace confirmed `NtGdiExtTextOutW` and per-glyph `NtGdiGetGlyphOutline` calls fire
-  correctly — with the right content, at the right position — on the very first paint. Cinnamon's
-  window-open "Map" animation effect looked like a strong compositor-level candidate but was ruled
-  out (user tested with all Cinnamon desktop effects disabled — no change). Pixel-level analysis
-  of the existing screenshot confirmed the content is genuinely absent from what's composited to
-  screen at that moment, not a low-contrast/color issue. Every mechanism inspectable via
-  instrumentation and trace is confirmed correct, yet the pixels don't reach the screen the first
-  time — a real gap between "GDI did the work" and "the screen shows it" with no specific
-  mechanism identified. All experimental changes reverted; bottle back to its confirmed-working
-  baseline. Full history, including everything ruled out and what's not yet tried:
+  correctly on the very first paint, and a frame-by-frame screen-recording analysis of the third
+  attempt showed the fix's own deliberate, drastic opacity swing (1.0→0.1→1.0) produced **zero
+  visible change** during the blank period — the whole window's on-screen appearance is frozen
+  from the compositor's perspective, not just its text content. Cinnamon's window-open "Map"
+  animation effect looked like a strong compositor-level candidate but was ruled out (user tested
+  with all Cinnamon desktop effects disabled — no change). Pixel-level analysis of a screenshot
+  separately confirmed the content is genuinely absent from what's composited to screen at that
+  moment, not a low-contrast/color issue. Every mechanism inspectable via instrumentation, trace,
+  and recording is confirmed correct, yet the screen doesn't reflect it — a real gap between "the
+  app/GDI did the work" and "the screen shows it" with no specific mechanism identified. All
+  experimental changes reverted; bottle back to its confirmed-working baseline. Full history,
+  including everything ruled out and what's not yet tried:
   `reports/notification-empty-until-fade-findings.md`.
 
 The two bugs originally reported (blank Settings panel, and the category-click crash found once
@@ -478,13 +483,30 @@ session, all worth guarding against explicitly next time:
    flags nesting-order violations) to verify both **before** deploying, any time a patch adds,
    moves, or extends an exception-handler region — this class of bug doesn't show up in a
    decompile.
+4. **Inserting enough new instructions can silently corrupt a nearby short-form branch.**
+   `bne.un.s`, `br.s`, `brtrue.s`, `brfalse.s`, etc. encode their target as a single **signed
+   byte** relative offset (±127 bytes). Mono.Cecil does **not** automatically widen these to their
+   long-form equivalents (`bne.un`, `br`, ...) as a method body grows from inserted instructions —
+   if enough new code lands between a short branch and its target that the true offset no longer
+   fits in an sbyte, `module.Write()` still emits *something*, silently wrong, rather than
+   erroring. Decompiles as garbled control flow with spurious "stack underflow" errors, often in a
+   completely unrelated branch of the same method (hit for real: a 48-instruction insertion in
+   `--patch-notification-invalidate`'s third revision broke a nearby `bne.un.s`; two earlier,
+   much smaller insertions in the same method had stayed under the range by luck, which is why
+   this wasn't caught sooner). Fix: call `body.SimplifyMacros()` (from `Mono.Cecil.Rocks` — needs
+   `using Mono.Cecil.Rocks;`; the assembly ships inside the same `Mono.Cecil` NuGet package, no
+   extra package reference needed) once, before making any insertions, on any method whose body
+   might grow by more than a trivial amount. It converts every short-form branch in the method to
+   long form up front, which has no functional downside and removes the range problem entirely.
+   Cheap enough to just always call before inserting, rather than judging case-by-case whether a
+   given insertion is "small enough".
 
 **Always re-decompile and read the result before deploying** anything beyond a simple operand
 rewrite — `ilspycmd -m "<doc-id>" <dll>` or `ilspycmd -t "<type>" <dll>` on the patched output.
-This caught bugs 1 and 2 above before they ever reached the bottle: bug 1 as an explicit
-decompiler error ("Stack underflow"), bug 2 as the new code visibly appearing inside the wrong
-`if` block in the decompiled C#. A clean scan-mode pass (`$ILP <dir>`, no flags) confirms
-operand-rewrite patches but does *not* catch any of these three — it doesn't attempt to
+This caught bugs 1, 2, and 4 above before they ever reached the bottle: bug 1 and bug 4 as an
+explicit decompiler error ("Stack underflow"), bug 2 as the new code visibly appearing inside the
+wrong `if` block in the decompiled C#. A clean scan-mode pass (`$ILP <dir>`, no flags) confirms
+operand-rewrite patches but does *not* catch any of these — it doesn't attempt to
 decompile control flow or validate exception regions. Bug 3 is the sharpest lesson here: it
 decompiled perfectly cleanly (ilspycmd doesn't validate handler-region bounds) and only surfaced
 as a real crash after deploying — `--dump-handlers` exists specifically because decompiling

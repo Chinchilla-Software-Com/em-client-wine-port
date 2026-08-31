@@ -1,10 +1,11 @@
 # New-mail notification toast shows empty until it starts to fade out — UNRESOLVED
 
-> Extensively investigated across multiple rounds (direct app instrumentation, two independent
-> fix attempts, three separate trace configurations, a desktop-compositor test, and pixel-level
-> screenshot analysis). Every mechanism checked is confirmed working correctly. No root cause
-> found. Documented in full so this doesn't get re-investigated from scratch, and so the next
-> session has a clear list of what's already ruled out.
+> Extensively investigated across multiple rounds (direct app instrumentation, three independent
+> fix attempts, three separate trace configurations, a desktop-compositor test, pixel-level
+> screenshot analysis, and a frame-by-frame screen-recording analysis). Every mechanism checked is
+> confirmed working correctly. No root cause found. Documented in full so this doesn't get
+> re-investigated from scratch, and so the next session has a clear list of what's already ruled
+> out.
 
 ## Symptom
 
@@ -71,6 +72,38 @@ unambiguous window (matched by its confirmed 310×125 size)
 GDI genuinely processes and rasterizes the correct glyphs, at the individual-character level, on
 the very first paint.
 
+## Third fix attempt, also confirmed ineffective — and why the first two couldn't have worked
+
+The working fade-out phase isn't just "opacity changes" — it's dozens of *separate* ticks ~25ms
+apart, each a genuine pass through the OS message loop, giving Wine's X11 compositor real
+wall-clock time and repeated opportunities to catch up. A single synchronous property-setter pair
+(attempts 1 and 2) can't replicate that. Third attempt: deliberately trigger a brief, real
+dip-and-recover using the actual opacity/`Invalidate()` machinery, with real elapsed time between
+each step (`Application.DoEvents()` to pump the message loop, then `Thread.Sleep()` to give the
+compositor genuine wall-clock time), right at the `Appearing`→`Visible` transition.
+
+Hit a real Mono.Cecil bug while building this one, documented as a new lesson in `CLAUDE.md`'s
+"IL-patching lessons": the patch's 48 inserted instructions pushed a nearby short-form branch
+(`bne.un.s`, 1-byte relative offset) out of range, and Cecil silently emitted a corrupted branch
+rather than erroring — caught by decompiling before deploying (garbled control flow, spurious
+"stack underflow"). Fixed with `body.SimplifyMacros()` (from `Mono.Cecil.Rocks`) before inserting.
+
+**Confirmed ineffective via a full-screen video recording of a live repro** (not just user report
+this time — frame-by-frame pixel analysis of the recording): the notification box appears blank at
+~25.1s into the recording, stays *completely static* (zero pixel change across ~30 sampled frames)
+until ~28.2s, when text becomes visible as the box starts fading out — the same multi-second
+blank-then-fix pattern as the unpatched build. The fix's dip-and-recover sequence executes within
+~150ms of the box appearing (confirmed present in the deployed build's decompiled IL), yet nothing
+observable happens for another ~3 seconds.
+
+The sharper finding from the recording: during that blank window, the fix forces `Opacity` from
+1.0 down to 0.1 and back — a drastic, deliberate change, several times larger than anything
+naturally occurring during the hold. **Zero visible flicker in any sampled frame.** Not just the
+text — the entire window's on-screen appearance is unresponsive to a large forced opacity swing
+during this period. That's a stronger, more specific result than "text doesn't render": the
+window's visual state appears completely frozen from the compositor's perspective, not just its
+content.
+
 ## Ruled out: Cinnamon/Muffin's window-open animation effect
 
 A documented, older Cinnamon bug (linuxmint/cinnamon#3547: the "Fade" map effect for newly-opened
@@ -93,9 +126,13 @@ Every mechanism inspectable via app instrumentation and Wine API tracing — dat
 paint/timer state machine, GDI draw-call issuance, per-glyph rasterization, window-surface push,
 and layered-window attribute handling — is confirmed working correctly, identically, on the first
 (broken) paint as on a later (working) one. Yet the pixels genuinely don't reach the screen the
-first time. That's a real gap between "GDI did the work" (confirmed, down to individual glyphs)
-and "the screen shows it" — narrowed considerably from where the investigation started, but without
-a specific mechanism identified.
+first time. The screen-recording evidence sharpens this further: the window's entire on-screen
+appearance is frozen during the blank period, unresponsive even to a large forced opacity change
+— not just its painted content. That's a real gap between "GDI/the app did the work" (confirmed,
+down to individual glyphs, and confirmed the app-side opacity property genuinely changed) and "the
+screen reflects it" — narrowed considerably from where the investigation started, but without a
+specific mechanism identified, and three independent, reasonably-targeted fix attempts have not
+moved it.
 
 ## Not yet tried
 
@@ -108,9 +145,15 @@ a specific mechanism identified.
 - Testing under a different desktop environment/window manager (non-Cinnamon) to determine
   whether this reproduces identically elsewhere, or is specific to this Mint/Muffin combination.
 - Testing against a different CrossOver/Wine build to bound whether it's version-specific.
+- The user separately observed the notification's sender avatar/icon appearing to draw before the
+  text in an earlier manual (non-recorded) repro. Not reproduced in the recorded session analyzed
+  here (the box was uniformly blank in every sampled frame during the hold, no icon visible before
+  the text+fade moment) — worth another look if a future session can catch it on video, since if
+  real it would suggest the icon (a `DrawImage`/bitmap blit) and the text (`ExtTextOutW`) take
+  different paths to the screen, and only one of them is affected.
 
 ## Status
 
-**Unresolved.** All experimental changes (diagnostic instrumentation, both fix attempts) have been
-reverted — `emClient_win_8_x64` is back to its confirmed-working baseline (all 7 prior patch
+**Unresolved.** All experimental changes (diagnostic instrumentation, all three fix attempts) have
+been reverted — `emClient_win_8_x64` is back to its confirmed-working baseline (all 7 prior patch
 stages intact, nothing extra deployed). No fix is currently applied or shipped for this issue.

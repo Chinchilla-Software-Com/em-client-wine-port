@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
+using Mono.Cecil.Rocks;
 
 if (args.Length > 0 && args[0] == "--patch")
 {
@@ -691,30 +692,34 @@ static int RunPatchDiag(string[] args)
 //
 // Fixes notification toasts (FormMailNotification etc., via their shared base
 // FormGenericNotification) appearing as an empty box: real content is painted correctly
-// (confirmed via --patch-diag instrumentation -- title/content fields are already correct on
-// the very first OnPaint) but Wine's layered-window compositor doesn't push that painted
-// content to the visible screen surface until much later, when the rapid repaint burst during
-// fade-out finally forces a recomposite. See reports/notification-empty-until-fade-findings.md.
+// (confirmed via --patch-diag instrumentation, and via CX_DEBUGMSG trace all the way down to
+// individual glyph rasterization -- see reports/notification-empty-until-fade-findings.md) but
+// doesn't reach the visible screen until the rapid repaint burst during fade-out.
 //
-// First attempt (Invalidate() alone at the Appearing->Visible transition, matching what every
-// other opacity-changing branch in timer_OnTimer already does) made no observable difference --
-// user-confirmed. Root cause is therefore NOT a missing repaint *request*; a plain WM_PAINT was
-// almost certainly already happening from the very next tick or two regardless. What's actually
-// different about the fade-out phase (where content reliably becomes visible) isn't "more
-// repaints" but "the window's layered alpha genuinely changes on every one of those ticks" --
-// Opacity ramps down, which calls SetLayeredWindowAttributes with a new byte value each time.
-// During the long "hold" (multi-second, Opacity pinned at exactly 1.0 the whole time), nothing
-// ever calls SetLayeredWindowAttributes again after the single call that set it to 1.0 on entry.
-// Revised fix: force a second, genuine SetLayeredWindowAttributes call right as the hold begins
-// by nudging Opacity to a value that rounds to a different byte and immediately back to 1.0 --
-// giving Wine's compositor the same kind of "alpha actually changed" signal it evidently needs
-// to recomposite, rather than relying on repaint requests alone.
+// Two earlier attempts, both confirmed by the user to make no observable difference:
+// 1. A single Invalidate() call at the Appearing->Visible transition -- ruled out "missing
+//    repaint request" as the cause.
+// 2. A single synchronous Opacity nudge (1.0 -> 0.999 -> 1.0, no delay in between) at the same
+//    point -- ruled out "needs one more SetLayeredWindowAttributes call" as the cause, since both
+//    calls landed in the same message-loop pass with no real elapsed time between them.
+//
+// Third attempt (this one): the working fade-out phase isn't just "opacity changes" -- it's
+// dozens of *separate* ticks ~25ms apart, each a genuine pass through the OS message loop, giving
+// Wine's X11 compositor real wall-clock time and repeated opportunities to catch up. A single
+// synchronous property-setter pair can't replicate that. This patch deliberately triggers a
+// brief, real dip-and-recover using the actual opacity/Invalidate() machinery, WITH real elapsed
+// time between each step (Application.DoEvents() to pump the message loop, then Thread.Sleep to
+// give the compositor genuine wall-clock time) right at the Appearing->Visible transition, before
+// settling into the normal multi-second hold. Expected to cause a brief (~150ms), visible flicker
+// -- deliberate, for this test; worth minimizing later if it turns out to actually fix the bug.
 //
 // Touches MailClient.dll only (FormGenericNotification.timer_OnTimer). Insertion point is deep
 // inside the method's single try block, nowhere near TryStart/TryEnd/HandlerStart/HandlerEnd,
 // and confirmed (both by inspection via `ilspycmd -il` before writing this, and by a runtime
 // check below) not to be the target of any branch in the method -- the two IL-patching pitfalls
-// documented in CLAUDE.md that would silently produce wrong or invalid IL here.
+// documented in CLAUDE.md that would silently produce wrong or invalid IL here. No new branches
+// are introduced (the dip-and-recover sequence is fully unrolled, not a loop), so neither pitfall
+// is a risk from this patch's own insertion either.
 static int RunPatchNotificationInvalidate(string[] args)
 {
     if (args.Length < 3)
@@ -782,7 +787,31 @@ static int RunPatchNotificationInvalidate(string[] args)
         if (setOpacityDef is null) { Console.Error.WriteLine("FAIL: Form missing set_Opacity"); return 1; }
         var setOpacityRef = module.ImportReference(setOpacityDef);
 
+        // Application.DoEvents() is a static method, not reachable via the instance base-type
+        // chain walk above -- Application lives in the same module Control resolved into, so
+        // look it up there directly.
+        var applicationType = controlType.Module.GetType("System.Windows.Forms.Application");
+        if (applicationType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Application"); return 1; }
+        var doEventsDef = applicationType.Methods.FirstOrDefault(m => m.Name == "DoEvents" && m.Parameters.Count == 0);
+        if (doEventsDef is null) { Console.Error.WriteLine("FAIL: Application missing DoEvents()"); return 1; }
+        var doEventsRef = module.ImportReference(doEventsDef);
+
+        MethodReference Import2(System.Reflection.MethodBase mb) => module.ImportReference(mb);
+        var threadSleepRef = Import2(typeof(System.Threading.Thread).GetMethod("Sleep", new[] { typeof(int) })!);
+
         var body = method.Body;
+        // SimplifyMacros converts every short-form branch (bne.un.s, br.s, etc. -- single-byte
+        // relative offsets) in this method to its long-form equivalent (4-byte offset) before any
+        // insertion happens. Mono.Cecil does NOT do this automatically: inserting enough new
+        // instructions can push a short branch's target further away than an sbyte can encode,
+        // and module.Write() silently emits a corrupted offset rather than erroring -- hit for
+        // real on this patch's first version (48 new instructions was enough to break a nearby
+        // bne.un.s; the two earlier, much smaller notification-invalidate attempts happened to
+        // stay under the range by luck). Decompiled as garbled logic with "stack underflow"
+        // errors in an unrelated branch -- caught by the project's own "always re-decompile
+        // instruction-insertion patches" rule, not by a clean scan-mode pass. Cheap and has no
+        // functional downside to call unconditionally, so do it before every insertion here.
+        body.SimplifyMacros();
         var instrs = body.Instructions;
 
         // Find the method's one-and-only `stfld state` -- confirmed unique by inspection
@@ -826,19 +855,36 @@ static int RunPatchNotificationInvalidate(string[] args)
         }
 
         var il = body.GetILProcessor();
-        il.InsertBefore(insertBefore, Instruction.Create(OpCodes.Ldarg_0));
-        il.InsertBefore(insertBefore, Instruction.Create(OpCodes.Call, invalidateRef));
-        // Nudge Opacity to a value that rounds to a different native alpha byte and immediately
-        // back to 1.0 -- two genuine SetLayeredWindowAttributes calls, not just a repaint
-        // request. See doc comment above for why this, not Invalidate() alone, is the fix.
-        il.InsertBefore(insertBefore, Instruction.Create(OpCodes.Ldarg_0));
-        il.InsertBefore(insertBefore, Instruction.Create(OpCodes.Ldc_R8, 0.999));
-        il.InsertBefore(insertBefore, Instruction.Create(OpCodes.Call, setOpacityRef));
-        il.InsertBefore(insertBefore, Instruction.Create(OpCodes.Ldarg_0));
-        il.InsertBefore(insertBefore, Instruction.Create(OpCodes.Ldc_R8, 1.0));
-        il.InsertBefore(insertBefore, Instruction.Create(OpCodes.Call, setOpacityRef));
+        void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(insertBefore, i); }
 
-        Console.WriteLine($"OK   {fileName}: inserted Invalidate() + Opacity nudge after state=Visible in {targetType}::{targetMethod}");
+        // One dip-and-recover step: Opacity = value; Invalidate(); DoEvents(); Sleep(ms).
+        // DoEvents() pumps the message loop (processing whatever WM_PAINT/X11 events are
+        // pending right now); the Sleep after it gives the compositor genuine wall-clock time
+        // to actually act on them before the next step -- the two things a single synchronous
+        // property-set (attempt #2) couldn't provide.
+        void EmitStep(double opacity, int sleepMs)
+        {
+            Emit(
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldc_R8, opacity),
+                Instruction.Create(OpCodes.Call, setOpacityRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Call, invalidateRef),
+                Instruction.Create(OpCodes.Call, doEventsRef),
+                Instruction.Create(OpCodes.Ldc_I4, sleepMs),
+                Instruction.Create(OpCodes.Call, threadSleepRef)
+            );
+        }
+
+        // Fully unrolled (no branches introduced) brief dip down and back up, ~150ms total.
+        EmitStep(0.6, 20);
+        EmitStep(0.3, 20);
+        EmitStep(0.1, 20);
+        EmitStep(0.3, 20);
+        EmitStep(0.6, 20);
+        EmitStep(1.0, 20);
+
+        Console.WriteLine($"OK   {fileName}: inserted dip-and-recover sequence after state=Visible in {targetType}::{targetMethod}");
         patched = true;
 
         module.Write(destPath);
