@@ -313,16 +313,14 @@ theory:
    result: the repeated animation ticks aren't just cosmetic opacity changes, they're also
    apparently doing something necessary to make the layered window's content composite at all --
    removing them doesn't sidestep the bug, it just removes the one thing that (eventually) fixes it.
-   **Caveat flagged by the user, not yet re-tested:** eM Client is known to suppress notifications
-   entirely when its own window has focus (normal, expected behavior). This test's main window may
-   have had focus by mistake when the test email arrived, which would produce the same visible
-   symptom (nothing appears) for a completely different, mundane reason -- unrelated to the
-   `ShowWithoutFading`/timer-never-started mechanism above. **Do not treat this result as confirmed
-   until re-run with the main window deliberately unfocused when the email arrives.** The `xwininfo`
-   evidence (a window matching the sender's name, correct 310x125 geometry, `IsViewable`) argues
-   the notification *was* actually created and shown, not suppressed at the point of creation --
-   suppression-on-focus most likely happens earlier, before a `FormMailNotification` is even
-   constructed -- but this is inference, not confirmation, and should be checked directly.
+   **Re-tested and confirmed, focus ruled out as a confound:** eM Client is known to suppress
+   notifications entirely when its own window has focus (normal, expected behavior), which raised
+   a concern that this test's original result was really just that, by accident. Re-ran with the
+   main window deliberately kept unfocused throughout (confirmed via `xprop -root
+   _NET_ACTIVE_WINDOW` before and after the test email arrived) -- the notification window still
+   appeared (`xwininfo`: correct 310x125 geometry, matching sender name as title, `IsViewable`) and
+   was still **completely invisible** in a live capture of that exact screen region. The original
+   conclusion holds: this is a genuinely permanent invisibility, not focus-suppression.
 2. **The user's own test, independently, on a second machine**: with `NotificationsHideAfterTimeout`
    turned off via Settings (autoHide=false; normal fade animation still active, no patch involved)
    the notification displayed with no text and stayed that way *indefinitely* -- not ~6s, however
