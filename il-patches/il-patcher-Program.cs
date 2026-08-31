@@ -48,6 +48,16 @@ if (args.Length > 0 && args[0] == "--patch-notification-invalidate")
     return RunPatchNotificationInvalidate(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-long-burst")
+{
+    return RunPatchNotificationLongBurst(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-notification-silent-wait")
+{
+    return RunPatchNotificationSilentWait(args);
+}
+
 if (args.Length > 0 && args[0] == "--version")
 {
     return RunVersion(args);
@@ -885,6 +895,350 @@ static int RunPatchNotificationInvalidate(string[] args)
         EmitStep(1.0, 20);
 
         Console.WriteLine($"OK   {fileName}: inserted dip-and-recover sequence after state=Visible in {targetType}::{targetMethod}");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-long-burst <input-dir> <output-dir> [totalMs] [stepMs] [minOpacity]
+//
+// Fourth attempt at the notification empty-box bug (see reports/notification-empty-until-fade-findings.md
+// for the first three, all confirmed ineffective). The third attempt's dip-and-recover was brief
+// (~150ms, 6 steps) and had zero observable effect even though executed within 150ms of the box
+// appearing -- the box stayed frozen for the full ~3s hold regardless. That result is consistent
+// with two different explanations that a brief burst can't distinguish between: (a) a fixed
+// wall-clock compositor timeout unrelated to app activity, or (b) a burst just needs to run much
+// longer / cover far more ticks than 150ms's worth to have any effect. This patch tests which, by
+// running the *same* dip-and-recover mechanism for far longer -- long enough to either (1) show
+// text appearing at a point clearly decoupled from any fixed ~3s mark (supports "just needs more
+// ticks"), or (2) still not show anything until ~3s regardless of burst length (supports "fixed
+// timeout, app activity is irrelevant"). Ends the burst pinned at Opacity=1.0 with one final
+// Invalidate(), then falls through into the method's normal state machine unmodified -- if the
+// freeze does lift during the burst, the window is left sitting fully opaque with (hopefully)
+// visible text for whatever's left of the configured hold, then fades and closes exactly as
+// normal. That's the "pause it there" behavior: not a separate hold step, just letting the
+// pre-existing Visible-state hold do its job once the freeze is already gone.
+//
+// totalMs/stepMs/minOpacity default to 6000/25/0.05 -- a triangle wave (1.0 -> minOpacity -> 1.0,
+// repeating) at stepMs spacing until totalMs elapses, landing exactly on 1.0. All parameters are
+// baked in at patch-build time (fully unrolled, same reason as the third attempt: no branches
+// introduced, so neither of the two branch-related IL-patching pitfalls in CLAUDE.md apply) --
+// re-run this command with different values and rebuild to iterate, rather than expecting runtime
+// configurability. At 6000ms/25ms this unrolls to ~240 steps (~1900 new instructions); confirmed
+// SimplifyMacros (already called below) keeps the method's existing short-form branches valid at
+// this size -- verify again with ilspycmd if these defaults are increased substantially further.
+//
+// Touches MailClient.dll only (FormGenericNotification.timer_OnTimer), same insertion point and
+// same validated safety checks (not a branch target, not an exception-handler region boundary) as
+// --patch-notification-invalidate.
+static int RunPatchNotificationLongBurst(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-long-burst <input-dir> <output-dir> [totalMs] [stepMs] [minOpacity]");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    int totalMs = args.Length > 3 ? int.Parse(args[3]) : 6000;
+    int stepMs = args.Length > 4 ? int.Parse(args[4]) : 25;
+    double minOpacity = args.Length > 5 ? double.Parse(args[5]) : 0.05;
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+    const string targetMethod = "timer_OnTimer";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var method = type.Methods.FirstOrDefault(m => m.Name == targetMethod && m.HasBody);
+        if (method is null) { Console.Error.WriteLine($"FAIL: method not found: {targetType}::{targetMethod}"); return 1; }
+
+        TypeDefinition? controlType = type;
+        while (controlType is not null && controlType.FullName != "System.Windows.Forms.Control")
+        {
+            controlType = controlType.BaseType?.Resolve();
+        }
+        if (controlType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control in base-type chain"); return 1; }
+        var invalidateDef = controlType.Methods.FirstOrDefault(m => m.Name == "Invalidate" && m.Parameters.Count == 0);
+        if (invalidateDef is null) { Console.Error.WriteLine("FAIL: Control missing parameterless Invalidate()"); return 1; }
+        var invalidateRef = module.ImportReference(invalidateDef);
+
+        TypeDefinition? formType = type;
+        while (formType is not null && formType.FullName != "System.Windows.Forms.Form")
+        {
+            formType = formType.BaseType?.Resolve();
+        }
+        if (formType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Form in base-type chain"); return 1; }
+        var setOpacityDef = formType.Methods.FirstOrDefault(m => m.Name == "set_Opacity");
+        if (setOpacityDef is null) { Console.Error.WriteLine("FAIL: Form missing set_Opacity"); return 1; }
+        var setOpacityRef = module.ImportReference(setOpacityDef);
+
+        var applicationType = controlType.Module.GetType("System.Windows.Forms.Application");
+        if (applicationType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Application"); return 1; }
+        var doEventsDef = applicationType.Methods.FirstOrDefault(m => m.Name == "DoEvents" && m.Parameters.Count == 0);
+        if (doEventsDef is null) { Console.Error.WriteLine("FAIL: Application missing DoEvents()"); return 1; }
+        var doEventsRef = module.ImportReference(doEventsDef);
+
+        MethodReference Import2(System.Reflection.MethodBase mb) => module.ImportReference(mb);
+        var threadSleepRef = Import2(typeof(System.Threading.Thread).GetMethod("Sleep", new[] { typeof(int) })!);
+
+        var body = method.Body;
+        body.SimplifyMacros();
+        var instrs = body.Instructions;
+
+        Instruction? stateStfld = null;
+        foreach (var instr in instrs)
+        {
+            if (instr.OpCode == OpCodes.Stfld && instr.Operand is FieldReference fr && fr.Name == "state")
+            {
+                if (stateStfld is not null)
+                {
+                    Console.Error.WriteLine("FAIL: more than one `stfld state` found in timer_OnTimer -- method shape changed, review needed");
+                    return 1;
+                }
+                stateStfld = instr;
+            }
+        }
+        if (stateStfld is null) { Console.Error.WriteLine("FAIL: couldn't find `stfld state` in timer_OnTimer"); return 1; }
+
+        int stfldIndex = instrs.IndexOf(stateStfld);
+        var insertBefore = instrs[stfldIndex + 1];
+
+        foreach (var instr in instrs)
+        {
+            if (instr.Operand == insertBefore)
+            {
+                Console.Error.WriteLine("FAIL: insertion point is a branch target -- would need retargeting, review needed");
+                return 1;
+            }
+        }
+        foreach (var handler in body.ExceptionHandlers)
+        {
+            if (handler.TryStart == insertBefore || handler.TryEnd == insertBefore ||
+                handler.HandlerStart == insertBefore || handler.HandlerEnd == insertBefore)
+            {
+                Console.Error.WriteLine("FAIL: insertion point is an exception-handler region boundary -- review needed");
+                return 1;
+            }
+        }
+
+        var il = body.GetILProcessor();
+        void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(insertBefore, i); }
+
+        void EmitStep(double opacity)
+        {
+            Emit(
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldc_R8, opacity),
+                Instruction.Create(OpCodes.Call, setOpacityRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Call, invalidateRef),
+                Instruction.Create(OpCodes.Call, doEventsRef),
+                Instruction.Create(OpCodes.Ldc_I4, stepMs),
+                Instruction.Create(OpCodes.Call, threadSleepRef)
+            );
+        }
+
+        // Triangle wave 1.0 -> minOpacity -> 1.0, repeating, for totalMs; always ends the loop
+        // (at build time, not runtime -- this is fully unrolled) exactly on an upward step so the
+        // very last EmitStep call always lands on 1.0.
+        int stepCount = Math.Max(2, totalMs / stepMs);
+        int half = Math.Max(1, stepCount / 2);
+        int emitted = 0;
+        while (emitted < stepCount)
+        {
+            int intoCycle = emitted % (2 * half);
+            double frac = intoCycle < half ? (double)intoCycle / half : (double)(2 * half - intoCycle) / half;
+            double opacity = 1.0 - frac * (1.0 - minOpacity);
+            EmitStep(opacity);
+            emitted++;
+        }
+        EmitStep(1.0);
+
+        Console.WriteLine($"OK   {fileName}: inserted {emitted + 1}-step long-burst sequence (~{totalMs}ms, min opacity {minOpacity}) after state=Visible in {targetType}::{targetMethod}");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-silent-wait <input-dir> <output-dir> [waitMs]
+//
+// Fifth attempt at the notification empty-box bug. Two long-burst tests (--patch-notification-
+// long-burst, 6000ms and 2000ms) both released at almost exactly the same wall-clock mark (~6s),
+// matching this bottle's configured NotificationsHideTimeout regardless of burst length -- meaning
+// the burst's own repaint/opacity activity had no measurable causal effect on release timing. A
+// likely reason: WinForms' Timer keeps ticking at its normal fast fade-animation interval
+// throughout the burst (never stopped), and Application.DoEvents() inside the burst can let that
+// timer re-fire *reentrantly* into this same handler -- possibly re-triggering the app's own
+// natural Hide()/fade-out path early and often, independent of anything the burst intended.
+//
+// This patch isolates that: stop the timer before waiting (blocking WM_TIMER from firing at all,
+// so no reentrancy is possible), Thread.Sleep for waitMs with *zero* Invalidate/Opacity/DoEvents
+// calls, then restart the timer and let the method's original autoHide logic proceed exactly as
+// before. If release still happens at ~waitMs regardless of doing literally nothing during the
+// wait, that's strong evidence of a pure wall-clock/compositor-side timer fully decoupled from
+// app paint activity. If it does NOT release until later (after the real second natural tick,
+// i.e. waitMs + timeToStay), that means *some* paint/pump activity during the window is actually
+// necessary after all, contrary to what the two burst tests suggested.
+//
+// waitMs defaults to 6000 (the two burst tests' observed release point). Touches MailClient.dll
+// only (FormGenericNotification.timer_OnTimer), same insertion point/safety checks as the two
+// burst patches above.
+static int RunPatchNotificationSilentWait(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-silent-wait <input-dir> <output-dir> [waitMs]");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    int waitMs = args.Length > 3 ? int.Parse(args[3]) : 6000;
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+    const string targetMethod = "timer_OnTimer";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var method = type.Methods.FirstOrDefault(m => m.Name == targetMethod && m.HasBody);
+        if (method is null) { Console.Error.WriteLine($"FAIL: method not found: {targetType}::{targetMethod}"); return 1; }
+
+        // timer is a field on the type itself (System.Windows.Forms.Timer), not inherited --
+        // resolve its Stop()/Start() directly rather than walking a base-type chain.
+        var timerField = type.Fields.FirstOrDefault(f => f.Name == "timer");
+        if (timerField is null) { Console.Error.WriteLine("FAIL: couldn't find `timer` field on type"); return 1; }
+        var timerType = timerField.FieldType.Resolve();
+        if (timerType is null) { Console.Error.WriteLine("FAIL: couldn't resolve timer field's type"); return 1; }
+        var stopDef = timerType.Methods.FirstOrDefault(m => m.Name == "Stop" && m.Parameters.Count == 0);
+        var startDef = timerType.Methods.FirstOrDefault(m => m.Name == "Start" && m.Parameters.Count == 0);
+        if (stopDef is null || startDef is null) { Console.Error.WriteLine("FAIL: timer type missing Stop()/Start()"); return 1; }
+        var stopRef = module.ImportReference(stopDef);
+        var startRef = module.ImportReference(startDef);
+
+        var threadSleepRef = module.ImportReference(typeof(System.Threading.Thread).GetMethod("Sleep", new[] { typeof(int) })!);
+
+        var body = method.Body;
+        body.SimplifyMacros();
+        var instrs = body.Instructions;
+
+        Instruction? stateStfld = null;
+        foreach (var instr in instrs)
+        {
+            if (instr.OpCode == OpCodes.Stfld && instr.Operand is FieldReference fr && fr.Name == "state")
+            {
+                if (stateStfld is not null)
+                {
+                    Console.Error.WriteLine("FAIL: more than one `stfld state` found in timer_OnTimer -- method shape changed, review needed");
+                    return 1;
+                }
+                stateStfld = instr;
+            }
+        }
+        if (stateStfld is null) { Console.Error.WriteLine("FAIL: couldn't find `stfld state` in timer_OnTimer"); return 1; }
+
+        int stfldIndex = instrs.IndexOf(stateStfld);
+        var insertBefore = instrs[stfldIndex + 1];
+
+        foreach (var instr in instrs)
+        {
+            if (instr.Operand == insertBefore)
+            {
+                Console.Error.WriteLine("FAIL: insertion point is a branch target -- would need retargeting, review needed");
+                return 1;
+            }
+        }
+        foreach (var handler in body.ExceptionHandlers)
+        {
+            if (handler.TryStart == insertBefore || handler.TryEnd == insertBefore ||
+                handler.HandlerStart == insertBefore || handler.HandlerEnd == insertBefore)
+            {
+                Console.Error.WriteLine("FAIL: insertion point is an exception-handler region boundary -- review needed");
+                return 1;
+            }
+        }
+
+        var il = body.GetILProcessor();
+        void Emit(params Instruction[] ins) { foreach (var i in ins) il.InsertBefore(insertBefore, i); }
+
+        Emit(
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldfld, timerField),
+            Instruction.Create(OpCodes.Callvirt, stopRef),
+            Instruction.Create(OpCodes.Ldc_I4, waitMs),
+            Instruction.Create(OpCodes.Call, threadSleepRef),
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldfld, timerField),
+            Instruction.Create(OpCodes.Callvirt, startRef)
+        );
+
+        Console.WriteLine($"OK   {fileName}: inserted silent {waitMs}ms wait (timer stopped, zero paint activity) after state=Visible in {targetType}::{targetMethod}");
         patched = true;
 
         module.Write(destPath);

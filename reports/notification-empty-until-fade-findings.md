@@ -239,6 +239,59 @@ Confirms the expected behavior this project is chasing is standard/correct on na
 i.e. this is purely a Wine/Linux-compositor-side gap, not a difference in how eM Client itself
 behaves by design on different platforms.
 
+## Fourth round: freeze duration tracks `NotificationsHideTimeout`, independent of app activity
+
+Prompted by a user idea: rather than keep guessing at *what* unsticks the freeze, empirically
+bisect *when* it lifts under deliberately different app behavior during the blank window, using
+three new `il-patcher` modes (`--patch-notification-long-burst`, parametrized totalMs/stepMs/
+minOpacity; `--patch-notification-silent-wait`, parametrized waitMs) plus live screen recordings
+(`ffmpeg -f x11grab`, frame-extracted and diffed with Pillow) instead of relying on user-described
+timing. All three tests below ran against `emClient_win_8_x64` with `NotificationsHideTimeout`
+configured to 6000ms (confirmed directly: Settings -> Notifications -> "Hide after ___ seconds").
+
+1. **6-second oscillating opacity burst** (`Opacity` triangle-waved between 1.0 and 0.05 every
+   25ms, with real `Invalidate()` + `Application.DoEvents()` + `Thread.Sleep(25)` each step —
+   241 steps, fully unrolled) inserted at the Appearing->Visible transition, ending pinned at
+   Opacity=1.0 before falling through to the method's normal (unmodified) continuation. Recorded
+   full-screen at 30fps. Result: blank from box-appear to **~t=5.9s**, then instantly stable with
+   content visible for the rest of the ~26s recording, no further change.
+2. **Same mechanism, 2-second burst** (81 steps) — the direct bisection test: if the burst's own
+   activity were the cause, a 3x shorter burst should release 3x sooner. Result: blank until
+   **~t=6.5s** (measured from box-appear, in a clean recording once the Claude Code terminal
+   window -- which had partially occluded the first repeat of this test -- was moved off-screen).
+   Essentially the *same* release point as the 6-second burst, not a proportionally shorter one.
+3. **Silent wait -- no burst at all**: `timer.Stop(); Thread.Sleep(6000); timer.Start();` inserted
+   at the same point, with the timer genuinely stopped (blocking any WM_TIMER reentrancy) and
+   *zero* Invalidate/Opacity/DoEvents calls during the wait -- deliberately testing whether any
+   paint activity is needed at all. Result: blank until **~t=7.4s**, content appearing roughly
+   1-1.3s after the silent wait itself ended (the next real timer tick wasn't due for several more
+   seconds at that point, so this wasn't a natural second tick firing early).
+
+All three -- 2s of repainting, 6s of repainting, 6s of doing nothing at all -- released within
+about a second of each other, at approximately `NotificationsHideTimeout`'s own value (6000ms),
+**not** at a point proportional to or explained by what the app itself was doing in that window.
+This is strong evidence against every fix attempt tried so far in this investigation (four now,
+across two rounds): none of them were the actual cause of anything. The freeze increasingly looks
+like a fixed wall-clock/compositor-side effect tied to elapsed time since the notification
+appeared, which happens to track this setting rather than being fixed at some universal constant
+(the original investigation's ~3.1s measurement was presumably taken under a different configured
+`NotificationsHideTimeout` -- worth confirming if this gets revisited, but not re-tested this
+round). Why a Wine/X11-side timing effect would track an eM-Client-internal setting value it has
+no visibility into is not yet explained; one structural note worth chasing if this is picked up
+again: `updateLayeredBackground(refreshBitmap: false)` is called on every tick regardless of
+state, always with `refreshBitmap: false` at this transition -- worth checking whether that flag,
+or something downstream of it, is gated by a duration that happens to be derived from
+`timeToStay` (== `NotificationsHideTimeout`) rather than by wall-clock/compositor timing as such.
+
+One incidental note from the recordings: at 30fps (33ms) resolution, the avatar and text both
+became visible within the *same* captured frame in the burst tests -- I could not confirm the
+user's separately-reported observation that the avatar renders before the text; that would need
+a much higher frame rate to resolve.
+
+All three experimental builds were reverted after testing; `emClient_win_8_x64` is back on the
+confirmed-working stage-7 baseline (verified via `md5sum` against the pre-test backup taken in
+`il-patches/backup/MailClient.dll.stage7-confirmed-working`).
+
 ## Not yet tried
 
 - A live X11 pixmap dump (e.g. `xwd`/`import`) precisely synchronized with the broken window's
@@ -270,11 +323,14 @@ behaves by design on different platforms.
 
 ## Status
 
-**Unresolved.** All experimental changes (diagnostic instrumentation, all three fix attempts, the
-real app instance used for the final `xprop` check) have been reverted/closed out —
-`emClient_win_8_x64` is back to its confirmed-working baseline (all 7 prior patch stages intact,
-nothing extra deployed). No fix is currently applied or shipped for this issue. Two specific,
-well-evidenced hypotheses (Wine's opacity-property delete-vs-change split; Muffin's X11-Sync-
-extension frame-freeze) have been directly tested and ruled out this round, narrowing the
-remaining search space to Muffin's texture/damage-tracking code specifically, or to something
-about the real app's process complexity that a minimal repro hasn't yet replicated.
+**Unresolved.** All experimental changes across both rounds (diagnostic instrumentation, all five
+fix/isolation attempts, the real app instance used for the final `xprop` check) have been
+reverted/closed out — `emClient_win_8_x64` is back to its confirmed-working baseline (all 7 prior
+patch stages intact, nothing extra deployed). No fix is currently applied or shipped for this
+issue. Several specific, well-evidenced hypotheses have now been directly tested and ruled out:
+Wine's opacity-property delete-vs-change split; Muffin's X11-Sync-extension frame-freeze; and, this
+round, the idea that any amount of app-side repaint/opacity/message-pump activity (or the deliberate
+absence of it) has a causal effect on release timing. The remaining, currently-favored explanation
+is a wall-clock/compositor-side effect whose duration tracks `NotificationsHideTimeout` — narrowing
+the search toward Muffin's texture/damage-tracking code, or the `updateLayeredBackground`/
+`timeToStay` code path noted above, rather than anything in the paint/timer state machine itself.
