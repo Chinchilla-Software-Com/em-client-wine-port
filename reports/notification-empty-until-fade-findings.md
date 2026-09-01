@@ -1051,3 +1051,95 @@ on top of no improvement, this is a natural point to stop iterating solo and get
 direction on whether to keep pursuing "separate rendering path" variants (e.g., figuring out the
 broken-image glyph, or trying a genuinely new WinForms child control instead of routing through
 `OnPaintTitle`/`OnPaintContent` at all) or pivot to a different strategy entirely.
+
+## Fifteenth round: a full decompile pass finds a real ordering bug -- partial, measurable improvement, still not a full fix
+
+Prompted directly by the user pushing back on reactive, hypothesis-then-patch investigation
+("have you decompiled all the code involved in notifications and have a full picture... your
+implementation can look the same but take a different approach") -- a fair challenge, since the
+fourteenth round's `OnPaintBackground` surprise was exactly a case of an incomplete picture causing
+a wasted cycle. Ran a full, systematic read-only decompile pass (forked out to keep the raw dump
+volume out of the main session) across every type in the notification pipeline:
+`FormGenericNotification`, `LayeredBaseForm`, `LayeredForm` (the `layeredWindow` companion, not
+previously read at all), `FormMailNotification`, `FormIMMessageNotification`,
+`MailNotificationHandler`, `FormNotificationPresenter`.
+
+**The finding:** `FormNotificationPresenter.ShowNotification()` -- the real trigger for an incoming
+mail -- calls `formGenericNotification.Show()` **first** (while the form is still blank), and only
+*then* calls `formGenericNotification.ShowNotification(notification)`, which sets Title/Content/
+Image via virtual dispatch into `FormMailNotification.OnDisplayedNotificationChanged`. Every fix
+attempt in this investigation's auto-test trigger up to this point did the *opposite* -- set Title/
+Content directly, then call `Show()` -- a real, consequential difference the user's question
+anticipated exactly, not a cosmetic one. Confirmed by decompile: neither the `Title` setter
+(`Text = (title = value);`) nor the `Content` setter (a no-op in practice, since
+`FormMailNotification` sets `AutoHeight = false`) has any repaint side effect; the `Image` setter's
+only effect (`updateBitmapPending = true`) is read solely by `this` form's own (Wine-unreliable)
+`OnPaintBackground`. So on the real path, nothing ever forces a fresh rebuild-and-blit through
+`layeredWindow` -- confirmed by finally reading `LayeredForm.UpdateWindow` directly (not just
+inferred) to be a genuine, always-forced native `UpdateLayeredWindow` P/Invoke call, i.e. the
+reliable half of this whole investigation's story really is reliable; the gap was entirely
+upstream of it.
+
+**Fix -- `--patch-notification-refresh-on-content-change`:** insert
+`updateLayeredBackground(refreshBitmap: true)` immediately after `ShowNotification`'s
+`OnDisplayedNotificationChanged(EventArgs.Empty)` call. Straight-line method, no branches or
+handlers to worry about. Also fixed `--patch-auto-test-notification`, which previously both got the
+order wrong *and* bypassed `ShowNotification()` entirely (setting Title/Content directly) -- meaning
+it could never have exercised this fix. Rewrote it to call `Show()` first, then
+`ShowNotification(new Notification(new NewMailsCount { Value = 3 }))` (the `NewMailsCount` branch of
+`OnDisplayedNotificationChanged`, simpler to construct via raw IL than a full fake `IMail`), so the
+synthetic trigger now genuinely exercises the same virtual-dispatch path a real notification uses.
+
+**Live-tested (fix alone, on top of clean Stage 8, no other experimental patches): a real, visible
+change -- but only a partial one.** Frame-by-frame review (correct crop confirmed this time via
+`wmctrl -l -G` mid-flight rather than assumed, after two rounds of resolution changes -- see
+environment note below) showed the icon **and title/content text together**, clearly readable, for
+roughly the first second after `OnShown` (during the `Appearing` fade-in tick burst) -- the first
+time in this entire investigation that text has been observed on-screen at the *start* of a
+notification's life rather than only at the very end. It then goes blank again once the hold begins
+(state settles to `Visible`, ticking stops) -- icon persists (as it always has, via `layeredWindow`),
+text vanishes. A diag-log trace confirmed the mechanism is doing what was intended: the bitmap
+rebuild (`bgWasNull=0`, i.e. a real rebuild of an existing bitmap, not the initial blank one) landed
+*before* the `Appearing` tick burst even started, meaning every one of those ~18 ticks re-blitted the
+already-correct, text-included bitmap via a genuine native call as `Opacity` climbed from 0.05 to
+1.0 -- and text WAS visible throughout that burst, confirming the twelfth round's "real ticking is
+the gate" finding still holds. But once ticking stops for the ~6s hold (same silent-gap pattern as
+every prior round), the identical, never-rebuilt, still-correct `Bitmap` object -- last blitted at
+full `Opacity = 1.0` -- stops showing its text on screen anyway, while its icon (drawn into the exact
+same bitmap) keeps showing fine. This is a new, sharper puzzle: it rules out "was the bitmap ever
+correctly populated" and "was it ever blitted via a real native call" as the gate, since both are now
+independently confirmed true, and still doesn't explain the icon/text split within one static image.
+
+**Combining with `--patch-notification-suppress-self-paint` made it worse, not better.** Theorized
+that `this` form's own still-active redundant `OnPaintBackground` paint (background+text drawn a
+second time directly onto `this`'s own DC, independently of `layeredWindow`) might be sitting on top
+as a stale, text-less frame, blocking `layeredWindow`'s now-correct content -- so suppressing it
+should let the fixed `layeredWindow` content show through unobstructed. Live-tested: text now never
+appears at all, not even during the `Appearing` burst, and the same "broken image" red-X glyph from
+the fourteenth round reappeared at the fade-out transition. Working theory revised: fully suppressing
+`this`'s own paint doesn't turn it into a clean transparent pass-through -- it likely leaves Wine
+never seeing `this`'s own window surface get realized/painted at all, and whatever Wine shows for an
+unrealized layered surface may be what that broken-image glyph actually is. **Suppress-self-paint is
+now a confirmed dead end, not just a non-improvement** -- reverted, not combined with anything going
+forward.
+
+**Environment note, unrelated to the app but cost real time this round:** the X11 display's
+resolution changed twice mid-session (1680x1188 -> 1920x940, and the Cinnamon screensaver activated
+once, its lock-like screen fully captured by an entire 35s recording before being noticed --
+`cinnamon-screensaver-command -q`/`-d` confirmed it was just the screensaver, `loginctl`'s
+`LockedHint=no` confirmed the session itself was never actually locked, and it was deactivated and
+disabled for the rest of the session via `gsettings set org.cinnamon.desktop.screensaver
+idle-activation-enabled false` plus `xset s off -dpms`). The resolution change also invalidated a
+previously-assumed screen-coordinate mapping (`Location = (100, 100)` in code showed up as `(200,
+200)` via live `wmctrl -l -G` at the old resolution, then somewhere else again after the resolution
+changed) -- cost a full round of misread frames before being caught. Lesson for any future round:
+query `wmctrl -l -G` for the live window geometry at test time rather than reusing a previously
+-observed pixel position, and reconfirm the capture resolution (`xdpyinfo | grep dimensions`) before
+every recording rather than assuming it's stable across a long session.
+
+**Net assessment:** the fifteenth round is the first attempt in this whole investigation grounded in
+an actual, decompile-confirmed application-level bug (not a Wine-timing guess), and it produced the
+first-ever *measurable* improvement (text visible for ~1s at notification start, versus never before
+Hide/click in every prior round) -- but it's a partial fix, not a resolution: the hold period is
+still blank. Given repeated attempts to combine it with other ideas have made things worse rather
+than better, this is a natural point to report back rather than keep stacking speculative patches.
