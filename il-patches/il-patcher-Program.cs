@@ -635,6 +635,14 @@ static int RunPatchDiag(string[] args)
         var tickCountGetter = Import(typeof(Environment).GetProperty("TickCount")!.GetGetMethod()!);
         var stringConcat2 = Import(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) })!);
         var appendAllText = Import(typeof(File).GetMethod("AppendAllText", new[] { typeof(string), typeof(string) })!);
+        // DateTime is a CoreLib/System.Runtime-forwarded type (safe to reflect via typeof() on
+        // il-patcher's own runtime -- see CLAUDE.md's IL-patching lesson 5 on why this is NOT safe
+        // for app-deployed assemblies like System.Drawing.Primitives). Wall-clock alongside
+        // TickCount lets a log line be matched directly against an ffmpeg screen recording's real
+        // timestamps instead of an arbitrary relative counter.
+        var dateTimeNowGetter = Import(typeof(DateTime).GetProperty("Now")!.GetGetMethod()!);
+        var dateTimeToStringFmt = Import(typeof(DateTime).GetMethod("ToString", new[] { typeof(string) })!);
+        var dateTimeTypeRef = module.ImportReference(typeof(DateTime));
 
         // Shared instrumentation: inserts several labeled log lines at the very start of the
         // given method's body (the one insertion point proven safe against all three
@@ -646,13 +654,15 @@ static int RunPatchDiag(string[] args)
             body.InitLocals = true;
             var tmpInt = new VariableDefinition(module.TypeSystem.Int32);
             var tmpMsg = new VariableDefinition(module.TypeSystem.String);
+            var tmpDate = new VariableDefinition(dateTimeTypeRef);
             body.Variables.Add(tmpInt);
             body.Variables.Add(tmpMsg);
+            body.Variables.Add(tmpDate);
             var il = body.GetILProcessor();
             var first = body.Instructions[0];
             void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(first, i); }
 
-            // "<label> tick=<TickCount> type=<TypeName>\n"
+            // "<label> tick=<TickCount> type=<TypeName> wall=<HH:mm:ss.fff>\n"
             Emit(
                 Instruction.Create(OpCodes.Call, tickCountGetter),
                 Instruction.Create(OpCodes.Stloc, tmpInt),
@@ -665,6 +675,14 @@ static int RunPatchDiag(string[] args)
                 Instruction.Create(OpCodes.Ldarg_0),
                 Instruction.Create(OpCodes.Callvirt, objectGetType),
                 Instruction.Create(OpCodes.Callvirt, typeGetName),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldstr, " wall="),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Call, dateTimeNowGetter),
+                Instruction.Create(OpCodes.Stloc, tmpDate),
+                Instruction.Create(OpCodes.Ldloca, tmpDate),
+                Instruction.Create(OpCodes.Ldstr, "HH:mm:ss.fff"),
+                Instruction.Create(OpCodes.Call, dateTimeToStringFmt),
                 Instruction.Create(OpCodes.Call, stringConcat2),
                 Instruction.Create(OpCodes.Ldstr, "\n"),
                 Instruction.Create(OpCodes.Call, stringConcat2),
@@ -756,8 +774,10 @@ static int RunPatchDiag(string[] args)
             body.InitLocals = true;
             var tmpInt = new VariableDefinition(module.TypeSystem.Int32);
             var tmpMsg = new VariableDefinition(module.TypeSystem.String);
+            var tmpDate = new VariableDefinition(dateTimeTypeRef);
             body.Variables.Add(tmpInt);
             body.Variables.Add(tmpMsg);
+            body.Variables.Add(tmpDate);
             var il = body.GetILProcessor();
             var first = body.Instructions[0];
             void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(first, i); }
@@ -774,6 +794,14 @@ static int RunPatchDiag(string[] args)
                 Instruction.Create(OpCodes.Ldarg_0),
                 Instruction.Create(OpCodes.Callvirt, objectGetType),
                 Instruction.Create(OpCodes.Callvirt, typeGetName),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldstr, " wall="),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Call, dateTimeNowGetter),
+                Instruction.Create(OpCodes.Stloc, tmpDate),
+                Instruction.Create(OpCodes.Ldloca, tmpDate),
+                Instruction.Create(OpCodes.Ldstr, "HH:mm:ss.fff"),
+                Instruction.Create(OpCodes.Call, dateTimeToStringFmt),
                 Instruction.Create(OpCodes.Call, stringConcat2),
                 Instruction.Create(OpCodes.Ldstr, "\n"),
                 Instruction.Create(OpCodes.Call, stringConcat2),
@@ -801,13 +829,15 @@ static int RunPatchDiag(string[] args)
             mBody.InitLocals = true;
             var tmpInt = new VariableDefinition(module.TypeSystem.Int32);
             var tmpMsg = new VariableDefinition(module.TypeSystem.String);
+            var tmpDate = new VariableDefinition(dateTimeTypeRef);
             mBody.Variables.Add(tmpInt);
             mBody.Variables.Add(tmpMsg);
+            mBody.Variables.Add(tmpDate);
             var il = mBody.GetILProcessor();
             var first = mBody.Instructions[0];
             void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(first, i); }
 
-            // "<label> tick=<T> type=<Type> bgWasNull=<0/1>\n"
+            // "<label> tick=<T> type=<Type> wall=<HH:mm:ss.fff> bgWasNull=<0/1>\n"
             Emit(
                 Instruction.Create(OpCodes.Call, tickCountGetter),
                 Instruction.Create(OpCodes.Stloc, tmpInt),
@@ -820,6 +850,14 @@ static int RunPatchDiag(string[] args)
                 Instruction.Create(OpCodes.Ldarg_0),
                 Instruction.Create(OpCodes.Callvirt, objectGetType),
                 Instruction.Create(OpCodes.Callvirt, typeGetName),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldstr, " wall="),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Call, dateTimeNowGetter),
+                Instruction.Create(OpCodes.Stloc, tmpDate),
+                Instruction.Create(OpCodes.Ldloca, tmpDate),
+                Instruction.Create(OpCodes.Ldstr, "HH:mm:ss.fff"),
+                Instruction.Create(OpCodes.Call, dateTimeToStringFmt),
                 Instruction.Create(OpCodes.Call, stringConcat2),
                 Instruction.Create(OpCodes.Ldstr, " bgWasNull="),
                 Instruction.Create(OpCodes.Call, stringConcat2),

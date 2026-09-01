@@ -498,6 +498,66 @@ the fade-out proceeded cleanly with no hang or crash, app still running normally
 is currently the fix+diag combined build; next step is redeploying the fix alone (without
 `--patch-diag`) for normal, non-instrumented use, once the user is ready.
 
+## Eighth round: bitmap-rebuild timing confirmed via instrumentation -- correct content reaches
+the window within ~30ms, yet stayed blank; also a genuine crash caused by the diag patch itself
+
+Chased the user's request to pin down exactly what triggers text to become visible, by reading
+`LayeredBaseForm.updateLayeredBackground(bool refreshBitmap)`/`updateBackgroundBitmap()` directly.
+Found a real caching gate: `updateBackgroundBitmap()` only runs when `refreshBitmap || 
+backgroundBitmap == null`, and `FormNotificationPresenter.ShowNotification()` calls `Show()` once
+*before* Title/Content are set and once *after* (via `ShowNotification()`'s own `Reshow()`), with
+every notification code path passing `refreshBitmap: false` -- a plausible caching bug (second
+`Show()` skips the rebuild if a bitmap already exists from the first, blank one).
+
+Extended `--patch-diag` with `updateBackgroundBitmap`/`doLayout` instrumentation to test this
+directly. First attempt crashed the app for real, confirmed via the app's own `bug.*.txt` report:
+resolving `Rectangle.get_IsEmpty` via `typeof(System.Drawing.Rectangle)` reflection baked in a
+`System.Drawing.Primitives, Version=10.0.0.0` reference that doesn't exist alongside the app
+(ships its own .NET 8 build) -- a bug in the diagnostic patch itself, not the app or Wine. Fixed by
+resolving `Rectangle` from `headerRect`'s own already-correctly-versioned `FieldType` instead (see
+CLAUDE.md's IL-patching lesson 5). The crash's stack trace incidentally confirmed
+`updateBackgroundBitmap()` really is called from `FormMailNotification`'s constructor.
+
+**Corrected instrumentation, redeployed, one live test (`NotificationsHideAfterTimeout` off):**
+- `updateBackgroundBitmap()` ran 3 times during construction (confirms the crash's stack trace);
+  the first two early-returned (`headerEmpty=1`, layout not ready), the third succeeded but with
+  **blank Title/Content** (not yet set).
+- `OnShown` #1 (blank content, `Show()` call #1) then ran; Title/Content were set shortly after.
+- `OnShown` #2 (`Show()` call #2, real content already set) ran with `refreshBitmap:false` and a
+  bitmap already existing from the third construction-time call -- confirming the predicted
+  caching skip actually happens.
+- **But ~30ms later**, `updateBackgroundBitmap` ran *again* (forced, `bgWasNull=0` yet it still
+  ran, so `refreshBitmap:true` fired from somewhere -- likely `OnResize`'s guarded
+  `doLayout(); updateLayeredBackground(refreshBitmap: true);` path, not `setAutoHeight()`'s
+  resize-triggered one, since width/height never changed from 310x125 this run), this time with
+  the **correct** Title/Content already set. Per `updateLayeredBackground`'s own code, this call
+  also pushes the freshly-correct bitmap straight to the real on-screen `layeredWindow` via
+  `UpdateWindow(...)`.
+- Yet the user watched the box for ~20.8 seconds afterward (`layeredWindow_Click` at the point
+  they finally clicked it) and it stayed grey/blank the entire time, **and this particular run the
+  text never appeared even after the click** (contrast with every earlier round, where content did
+  eventually show, whether via elapsed time or a click) -- a genuinely new negative data point,
+  not yet explained, and one the user flagged as inconsistent with the tool's own tick-based
+  timing narration, prompting a wall-clock-timestamp addition to the logging (see below) and a
+  plan to correlate against an `ffmpeg` screen recording rather than relying on log-only inference.
+
+**Conclusion: this closes off the caching-bug hypothesis as the explanation for the blank period.**
+The correct bitmap, with real text, demonstrably reaches the actual visible window within ~30ms of
+the notification appearing -- confirmed directly via instrumentation, not inferred. The multi-
+second (or, this run, indefinite) blank period is not caused by the app failing to build/push the
+right content; it is Wine/the compositor not displaying already-correct content, consistent with
+(and now more strongly confirming) the original rounds 1-5 conclusion. There is no
+earlier-rebuild fix to reach for here, because the rebuild already happens correctly and early.
+The caching gate found in `OnShown` #2 is still a real, independent code smell (a rebuild that
+should arguably happen still gets skipped) but is not what's producing the user-visible symptom.
+
+**Tooling improvement made as a result:** `--patch-diag`'s log lines now include a wall-clock
+`wall=<HH:mm:ss.fff>` timestamp (via `DateTime.Now`, safe to resolve via `typeof()` reflection
+since it's a CoreLib-forwarded type -- unlike `System.Drawing.Rectangle` above) alongside the
+existing relative `tick=<TickCount>`, specifically so a log line can be matched directly against
+a `ffmpeg` screen recording's real timestamps rather than an arbitrary relative counter that's
+easy to mis-narrate. Not yet used in a live correlated test as of this edit -- planned next.
+
 ## Not yet tried
 
 - A live X11 pixmap dump (e.g. `xwd`/`import`) precisely synchronized with the broken window's
