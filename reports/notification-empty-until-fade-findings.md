@@ -732,22 +732,47 @@ branch does that the kick (even now with `Invalidate()` added) still doesn't: th
 actually changing to `Disappearing`, and/or `alphaIncrement` becoming non-zero (which then drives
 `Opacity` down on each subsequent real fade tick).
 
-**Freshest, most actionable lead -- resume here next:** narrow further by making the kick branch
-also set `state = NotificationFormState.Disappearing` (and/or `alphaIncrement` to a small non-zero
-value) *without* actually letting the box fade away -- e.g. flip `state` to `Disappearing` and
-immediately back to `Visible` in the same tick, or hold `alphaIncrement` near zero so `Opacity`
-barely moves -- and see whether text appears the moment `state` itself changes, independent of
-either `Invalidate()` (already ruled out) or an actual visible fade. If it does, the state field
-itself (or something gated on it, e.g. a code path that only composites/redraws differently when
-not `Visible`) is the real trigger, not any Win32-visible side effect tried so far.
+**Follow-up test, same session: transiently flipping `state` to `Disappearing` and straight back
+does not unstick text either -- but confirms the avatar's timing is directly controllable.**
+`--patch-notification-timer-kick-state-flip` added `state = Disappearing; state = Visible;` to
+the kick branch (no real fade, `Opacity` never moves) and, prompted by the user's question about
+whether the avatar could render close to immediately rather than after an arbitrary wait, also
+reduced the kick delay from 2000ms to 100ms. Wall-clock-synced recording result: the kick fired
+at `18:26:53.545` (~94ms after the notification appeared at `18:26:53.451`), and the **avatar
+rendered by frame 358 -- only ~28ms after the kick itself**, i.e. effectively within ~120ms of the
+notification appearing at all. This confirms the ~70-110ms post-kick avatar latency seen in
+earlier rounds is roughly constant regardless of when the kick fires -- moving the kick earlier
+really does make the avatar appear correspondingly earlier, a real and usable fix lever for the
+avatar specifically (fire the same re-arm immediately after the notification's real content is
+set, instead of waiting on the natural 6s timeout or a click). **Text, however, still did not
+appear** at any point checked up to frame 530 (wall ~18:26:59.31, just before the real `Hide()` at
+`18:26:59.554`) -- confirmed by inspecting the cropped notification region across the full ~6s
+gap. Text rendered normally at frame 545, right after the real `Hide()`, confirming the pipeline
+itself worked correctly and this was a genuine negative result, not a test artifact.
 
-Coordination note for future rounds: a screen-recording test needs the recording started *after*
-the user confirms the test email is sent, not before -- mail delivery can take up to a minute, and
-several attempts this round were wasted on fixed-duration recordings that expired before the
-notification even arrived, or before the specific timed event being measured. Cap recording
-duration at 60s to comfortably cover both the wait and the notification's own lifecycle.
+**Status after three isolation attempts (plain re-arm, re-arm+`Invalidate()`, re-arm+transient
+state-flip): the avatar's unstick trigger is now well understood and directly exploitable (the
+Timer re-arm, fireable as early as desired); the text's unstick trigger remains unidentified.**
+None of `Invalidate()`, a transient `state` write, nor the timer re-arm itself explain it in
+isolation. Remaining candidates not yet tried: `alphaIncrement` actually holding a non-zero value
+across at least one real timer tick (as opposed to being written and immediately made moot by
+`state` flipping back before any tick observes it); or the combination of state+alphaIncrement
++timer-interval-25ms all together but stopped after one tick before any real fade completes (i.e.
+a "one real fade tick, then abort" test, closer to what `Hide()` actually does but truncated
+before the box visibly disappears). Given the depth already reached, the user's earlier-noted
+alternative strategy -- rendering text through a normal, non-layered `WM_PAINT` path instead of
+the cached layered-window bitmap, sidestepping the mystery for text specifically -- is worth
+weighing against continuing to chase the exact native trigger.
 
-`emClient_win_8_x64` currently has the timer-kick-invalidate test build (Stage 8 fix + full
-`--patch-diag` instrumentation + the timer-kick+Invalidate experiment) deployed, from this
+Coordination notes for future rounds: (1) a screen-recording test needs the recording started
+*after* the user confirms the test email is sent, not before -- mail delivery can take up to a
+minute, and several attempts this round were wasted on fixed-duration recordings that expired
+before the notification even arrived, or before the specific timed event being measured; cap
+recording duration at 60s. (2) When waiting on `ffmpeg` to finish, poll directly (`ps`/`ffprobe`)
+rather than a blocking wait-loop command, which can get silently backgrounded by the harness and
+stall the turn.
+
+`emClient_win_8_x64` currently has the timer-kick-state-flip test build (Stage 8 fix + full
+`--patch-diag` instrumentation + the state-flip experiment, 100ms kick delay) deployed, from this
 session's live testing. Reverting to a clean Stage 8 build (fix only, no diagnostic/experimental
 logic) for normal use is a pending task, not yet done as of this writing.
