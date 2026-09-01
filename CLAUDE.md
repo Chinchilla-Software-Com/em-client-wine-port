@@ -347,6 +347,27 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   systematic registry check turned up a much wider set of broken attachment types. User confirmed
   after live-testing multiple attachment types: "It worked." Full history:
   `reports/office-file-associations-findings.md`.
+- **New-mail notification click firing its handler twice per single click.** Found while
+  instrumenting the still-open empty-box notification bug below (not the same bug — see that
+  bullet's own note on scope). Root cause: **not a Wine bug** —
+  `FormGenericNotification.OnShown()` runs `layeredWindow.Click += layeredWindow_Click;`
+  unconditionally every time it runs, with no matching `-=` anywhere in the class, and `OnShown()`
+  runs at least twice per notification shown (confirmed via instrumentation: once early while the
+  form is still blank, once again once Title/Content are populated) — each adding another
+  subscription of the same handler to the same event, so a single click invoked
+  `layeredWindow_Click`/`notificationForm_Click`/`PerformAction`/`ShowMailForm` twice. This also
+  explained why real clicks never fire `FormGenericNotification.OnMouseClick` at all — clicks land
+  on the `layeredWindow` drop-shadow companion window, whose own `layeredWindow_Click` handler
+  calls `performMouseClick()` directly. Fixed via a new `--patch-notification-click-resubscribe`
+  mode (Stage 8, not yet folded into `releases/<version>/deploy.sh` — apply manually via
+  `~/tools/il-patcher` on top of Stage 7's output for now) inserting the missing
+  `layeredWindow.Click -= layeredWindow_Click;` immediately before the existing `+=`, the standard
+  unsubscribe-then-subscribe idiom (a no-op on the very first call, since removing a
+  never-added delegate is a documented .NET no-op). User confirmed on a live bottle (with
+  diagnostic logging still layered on top for direct verification): one notification, one click →
+  `layeredWindow_Click`/`notificationForm_Click`/`Hide()` each fired exactly once (previously:
+  twice), fade proceeded cleanly, no hang or crash. Full history:
+  `reports/notification-empty-until-fade-findings.md`'s "Sixth/Seventh round" sections.
 
 **Confirmed as a real, separate Wine bug, but not the cause of anything fixed above — patched
 anyway since it's a real bug and the fix is cheap:**
@@ -408,15 +429,20 @@ anyway since it's a real bug and the fix is cheap:**
   all). Very likely X11-specific given how deeply tied to X11 properties/extensions every confirmed
   mechanism is — plausibly avoided entirely on Wayland (`winewayland.drv`, a different driver and
   compositing model), though untested. All experimental changes reverted; bottle back to its
-  confirmed-working baseline. Full history, including everything ruled out and what's not yet
-  tried: `reports/notification-empty-until-fade-findings.md`.
+  confirmed-working baseline. A later round chasing a click-triggered hang/crash found and fixed a
+  genuine, separate double click-dispatch bug (`OnShown()` double-subscribing `layeredWindow.Click`
+  — see the Stage 8 bullet above) but that fix is not expected to resolve the rendering gap
+  described here; no evidence links the two beyond both surfacing from the same notification code
+  path. Full history, including everything ruled out and what's not yet tried:
+  `reports/notification-empty-until-fade-findings.md`.
 
 The two bugs originally reported (blank Settings panel, and the category-click crash found once
 the panel worked), the License Activation failure and "Get a license" icon bug found during that
-testing, and the attachment file-type-association gap found during multi-OS testing, are all
-fixed and confirmed. The notification empty-box bug above remains open as of this writing. Stage
-2/3/Hold interpolation items above remain scanned-but-not-pursued if a future session wants to
-extend that work.
+testing, the attachment file-type-association gap found during multi-OS testing, and the
+notification double click-dispatch bug found while investigating the item below, are all fixed
+and confirmed. The notification empty-box-until-fade rendering bug above remains open as of this
+writing. Stage 2/3/Hold interpolation items above remain scanned-but-not-pursued if a future
+session wants to extend that work.
 
 ## Investigation method (what actually worked this round)
 

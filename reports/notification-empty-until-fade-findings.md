@@ -490,6 +490,14 @@ crash both happened while probing click behavior with `NotificationsHideAfterTim
 a non-default diagnostic setting used specifically to keep the box on-screen long enough to
 click), but there's no evidence yet linking it to the blank-rendering symptom itself.
 
+**Deployed and confirmed working (user-tested, live bottle, `--patch-diag` still layered on top
+for direct verification):** one notification shown, one click — `layeredWindow_Click`,
+`notificationForm_Click`, and `Hide()` each fired **exactly once** (previously: twice each), and
+the fade-out proceeded cleanly with no hang or crash, app still running normally afterward. Stage
+8 is confirmed fixing the double-dispatch bug it targets. `emClient_win_8_x64`'s `MailClient.dll`
+is currently the fix+diag combined build; next step is redeploying the fix alone (without
+`--patch-diag`) for normal, non-instrumented use, once the user is ready.
+
 ## Not yet tried
 
 - A live X11 pixmap dump (e.g. `xwd`/`import`) precisely synchronized with the broken window's
