@@ -970,3 +970,84 @@ earlier -- rendering title/content text via a normal, non-layered child control 
 owner-drawn control sitting on top of the layered background) that Wine's compositor would paint
 through its own independent, non-timer-gated path, rather than through the `alphaIncrement`-gated
 cached-bitmap blit that every fix attempt so far has been routed through.
+
+## Fourteenth round: the "separate rendering path" pivot (option 1) -- two fixes tried, neither works
+
+Per the thirteenth round's finding and the user's explicit choice ("option 1" over both a
+lighter-weight Timer tweak and reviving the fade entirely), pivoted away from tuning the Timer
+sustain mechanism toward rerouting *what draws the text* instead.
+
+**Fix attempt 1 -- `--patch-notification-text-in-bitmap`:** re-read `LayeredBaseForm`'s decompiled
+source and found `FormGenericNotification` ("this") and its `layeredWindow` companion (a separate
+`LayeredForm` window, declared on `LayeredBaseForm`) are two distinct windows. `layeredWindow`
+receives `backgroundBitmap` -- confirmed by reading `updateBackgroundBitmap()`'s full body to
+contain only background gradient/border/shadow/avatar, never text -- via a genuine per-pixel
+`UpdateWindow()` blit forced fresh on every call, which is why box/border/avatar have been reliably
+visible from frame one in every recording this whole investigation. Title/content text is drawn by
+`OnPaintTitle()`/`OnPaintContent()`, and at the time this fix was written, the only known call site
+for those two methods appeared to be `this`'s own paint pipeline -- so the fix added a new
+`__drawNotificationTextIntoBitmap()` helper, called at the end of `updateBackgroundBitmap()`, that
+invokes `OnPaintTitle`/`OnPaintContent` (via `Callvirt`, honoring `FormIMMessageNotification`'s
+override) against a fresh `Graphics` on `backgroundBitmap` itself -- so text would ride along on
+the same reliable blit as the background. Required retargeting one `leave` instruction and one
+`finally` handler's `HandlerEnd`, both of which pointed at `updateBackgroundBitmap`'s original final
+`ret` (IL-patching lessons 2 and 3), since the new call needed to run after the method's existing
+`using` block completed, not get silently absorbed into it. Decompiled clean, `--dump-handlers`
+confirmed correct nesting, interpolation-site scan unchanged (13). **Live-tested via the new fully
+automated launch+`ffmpeg` loop (see below): no visible difference at all.** Text still appeared
+only in the frame right after `OnShown` and the frame right at `Hide()`'s fade-out, blank for the
+whole ~6.5s hold in between -- identical to baseline, despite text being verifiably baked into
+`backgroundBitmap` (confirmed via decompile).
+
+**Root cause of *that* non-result:** grepping the assembly's raw IL for actual
+`OnPaintTitle`/`OnPaintContent` **call sites** (not just their declarations) found something the
+earlier decompile-based reading had missed: they're invoked from `FormGenericNotification`'s *own*
+`OnPaintBackground` override -- previously misread as design-mode-only, because a *different*,
+base-class `OnPaintBackground` on `LayeredBaseForm` really is design-mode-only, and that was the
+one actually decompiled and read in an earlier round. `FormGenericNotification`'s own override
+calls the base method first, then -- at real runtime, not design mode -- draws its *own* redundant
+copy of `backgroundBitmap` directly onto `this` form's device context, immediately followed by
+`OnPaintTitle(e)`/`OnPaintContent(e)` painting text onto that same DC. So background/avatar/border
+are actually painted **twice** per frame: once via `layeredWindow`'s reliable forced blit, and again
+via `this`'s own `OnPaintBackground`, which -- per this whole investigation's central, repeatedly-
+confirmed finding -- is itself subject to the SetLayeredWindowAttributes-only-updates-on-a-real-tick
+compositing bug. Working theory: `this`'s own copy gets stuck showing a partially-flushed frame
+(background painted, text not yet reached) sitting fully opaque on top of `layeredWindow`'s
+already-correct, text-included content underneath, blocking it from view for the whole hold.
+
+**Fix attempt 2 -- `--patch-notification-suppress-self-paint`:** since `layeredWindow` alone (with
+fix 1 applied) should already provide background, avatar, border, and text, made `this`'s own
+redundant `OnPaintBackground` drawing a no-op at real runtime, so there's nothing of `this`'s own
+left to get stuck mid-composite -- a single `brfalse`->`br` opcode flip on the existing
+`if (backgroundBitmap != null) { ... }` guard, same operand/target, no new instructions, no
+branch-target or handler-boundary retargeting needed at all. Decompiled clean (confirmed the whole
+block became `//Discarded unreachable code`), `--dump-handlers` and the interpolation scan both
+still clean.
+
+**Live-tested (fixes 1+2 together): still no improvement, plus a new artifact.** First attempt at
+reading this test's recording produced a genuinely wrong conclusion worth recording as its own
+lesson: the test notification's `Location` (bottom-right, `(1360, 1000)`) turned out to coincide
+almost exactly with where this terminal's own inline image-preview widget renders (whatever
+screenshot was last opened via the `Read` tool, complete with its own prev/next/reply/delete
+icons) -- several minutes were spent reading that widget's stale content as if it were the
+notification before this was caught. Moved the auto-trigger's `Location` to `(100, 100)` (top-left)
+to eliminate the ambiguity, confirming the fix was general (not dependent on which screen corner)
+by re-running the automated launch+recording loop again. With the unambiguous position: the
+notification icon area now renders the classic Windows/GDI+ "broken/missing image" glyph (a gray
+box with a red diagonal cross), a symptom **not present** in fix 1 alone or in any earlier round
+-- new, and specific to fix 2. Root cause not yet investigated (a leading theory: something reads
+`backgroundBitmap` on `this`'s side, or a disposed/mid-rebuild reference, that fix 2's removal of
+the redundant draw call newly exposes rather than causes -- not confirmed). Given this is a
+regression, not merely a non-improvement, both fixes were left in place in git (their code is
+correct and clean by every static check) but the live bottle was reverted to the confirmed-working
+Stage 8 build (verified via `md5sum` match against `il-patches/output-stage8/MailClient.dll`) rather
+than left on this experimental state.
+
+**Net result of the "separate rendering path" pivot: negative on both attempts.** Combined with the
+Timer-sustain family's six failed iterations, eight total fix attempts across two structurally
+different strategies have now failed to produce a readable result. Given the standing instruction
+to probe the user when an iteration makes no improvement, and this round produced a new regression
+on top of no improvement, this is a natural point to stop iterating solo and get the user's explicit
+direction on whether to keep pursuing "separate rendering path" variants (e.g., figuring out the
+broken-image glyph, or trying a genuinely new WinForms child control instead of routing through
+`OnPaintTitle`/`OnPaintContent` at all) or pivot to a different strategy entirely.
