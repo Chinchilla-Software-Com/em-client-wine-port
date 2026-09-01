@@ -23,6 +23,11 @@ if (args.Length > 0 && args[0] == "--patch-auto-test-notification")
     return RunPatchAutoTestNotification(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-close-listener")
+{
+    return RunPatchCloseListener(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-settings-refresh")
 {
     return RunPatchSettingsRefresh(args);
@@ -1292,6 +1297,166 @@ static int RunPatchAutoTestNotification(string[] args)
         }
 
         Console.WriteLine($"OK   {fileName}: {mainFormType}::OnShown -- starts a one-shot {delayMs}ms timer that constructs and shows a test {notifFormType} (fixed Title/Content, no dependency on real mail arriving)");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-close-listener <input-dir> <output-dir>
+//
+// Dev/testing-only tool, not a real fix: lets the session controlling the Linux side trigger a
+// graceful eM Client exit itself, without needing to ask the user to close it by hand every test
+// iteration. Never kill/terminate MailClient.exe directly (an unclean termination triggers a
+// DB-repair dialog on next launch -- confirmed the hard way earlier in this project) -- this
+// instead has the app watch for a marker file and, when it appears, calls the app's own REAL
+// File > Exit menu handler (`menuItem_File_Exit_Click` -- found by decompiling formMain and
+// confirming it's what the actual menu item calls: sets `closingFromFileExitMenu = true;` then
+// `Close();`), so the shutdown is indistinguishable from a user actually choosing File > Exit.
+// Same safe top-of-OnShown insertion pattern as --patch-auto-test-notification and --patch-diag.
+//
+// Signal file path: Z:\tmp\claude-close-signal (Z:\ maps to the Linux host's own / -- see
+// CLAUDE.md -- so this is literally /tmp/claude-close-signal from the Linux side). Create that
+// file (`touch /tmp/claude-close-signal` or equivalent) to request a graceful close; the app
+// deletes it and exits within one polling interval (500ms).
+static int RunPatchCloseListener(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-close-listener <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+    const int pollIntervalMs = 500;
+    const string signalPath = @"Z:\tmp\claude-close-signal";
+
+    const string targetAssembly = "MailClient.dll";
+    const string mainFormType = "MailClient.UI.Forms.formMain";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var mainType = module.GetType(mainFormType);
+        if (mainType is null) { Console.Error.WriteLine($"FAIL: type not found: {mainFormType}"); return 1; }
+        var onShownMethod = mainType.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody && m.Parameters.Count == 1);
+        if (onShownMethod is null) { Console.Error.WriteLine($"FAIL: OnShown not found on {mainFormType}"); return 1; }
+        var exitHandlerMethod = mainType.Methods.FirstOrDefault(m => m.Name == "menuItem_File_Exit_Click" && m.HasBody);
+        if (exitHandlerMethod is null) { Console.Error.WriteLine($"FAIL: menuItem_File_Exit_Click not found on {mainFormType}"); return 1; }
+
+        TypeDefinition? formType = mainType;
+        while (formType is not null && formType.FullName != "System.Windows.Forms.Control")
+        {
+            formType = formType.BaseType?.Resolve();
+        }
+        if (formType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control in base-type chain"); return 1; }
+        var timerTypeDef = formType.Module.GetType("System.Windows.Forms.Timer");
+        if (timerTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Timer"); return 1; }
+        var timerCtorDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0);
+        var timerSetIntervalDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "set_Interval");
+        var timerAddTickDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "add_Tick");
+        var timerStartDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "Start" && m.Parameters.Count == 0);
+        if (timerCtorDef is null || timerSetIntervalDef is null || timerAddTickDef is null || timerStartDef is null)
+        {
+            Console.Error.WriteLine("FAIL: Timer missing one of .ctor()/set_Interval/add_Tick/Start()");
+            return 1;
+        }
+        var timerCtorRef = module.ImportReference(timerCtorDef);
+        var timerSetIntervalRef = module.ImportReference(timerSetIntervalDef);
+        var timerAddTickRef = module.ImportReference(timerAddTickDef);
+        var timerStartRef = module.ImportReference(timerStartDef);
+        var timerTypeRef = module.ImportReference(timerTypeDef);
+
+        // File.Exists/File.Delete and EventArgs.Empty are all CoreLib (System.Private.CoreLib,
+        // forwarded via System.Runtime) -- safe to resolve via typeof() reflection, unlike
+        // app-deployed assemblies (IL-patching lesson 5 in CLAUDE.md).
+        var fileExistsRef = module.ImportReference(typeof(File).GetMethod("Exists", new[] { typeof(string) })!);
+        var fileDeleteRef = module.ImportReference(typeof(File).GetMethod("Delete", new[] { typeof(string) })!);
+        var eventArgsEmptyRef = module.ImportReference(typeof(EventArgs).GetField("Empty")!);
+        var eventHandlerCtorRef = module.ImportReference(typeof(EventHandler).GetConstructor(new[] { typeof(object), typeof(IntPtr) })!);
+
+        var timerField = new FieldDefinition("__closeListenerTimer", FieldAttributes.Private, timerTypeRef);
+        mainType.Fields.Add(timerField);
+
+        // --- __closeListenerTick(object, EventArgs):
+        //   if (File.Exists(signalPath)) { File.Delete(signalPath); menuItem_File_Exit_Click(null, EventArgs.Empty); }
+        var tickMethod = new MethodDefinition("__closeListenerTick", MethodAttributes.Private, module.TypeSystem.Void);
+        tickMethod.Parameters.Add(new ParameterDefinition("sender", ParameterAttributes.None, module.TypeSystem.Object));
+        tickMethod.Parameters.Add(new ParameterDefinition("e", ParameterAttributes.None, module.ImportReference(typeof(EventArgs))));
+        mainType.Methods.Add(tickMethod);
+        var tmIl = tickMethod.Body.GetILProcessor();
+        var tmRet = Instruction.Create(OpCodes.Ret);
+        tmIl.Append(Instruction.Create(OpCodes.Ldstr, signalPath));
+        tmIl.Append(Instruction.Create(OpCodes.Call, fileExistsRef));
+        tmIl.Append(Instruction.Create(OpCodes.Brfalse, tmRet));
+        tmIl.Append(Instruction.Create(OpCodes.Ldstr, signalPath));
+        tmIl.Append(Instruction.Create(OpCodes.Call, fileDeleteRef));
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Ldnull));
+        tmIl.Append(Instruction.Create(OpCodes.Ldsfld, eventArgsEmptyRef));
+        tmIl.Append(Instruction.Create(OpCodes.Call, module.ImportReference(exitHandlerMethod)));
+        tmIl.Append(tmRet);
+
+        // --- Prepend to OnShown: __closeListenerTimer = new Timer(); ...Interval = pollIntervalMs;
+        // ...Tick += __closeListenerTick; ...Start(); -- same safe top-of-method insertion as
+        // --patch-diag/--patch-auto-test-notification (a method's own first instruction is never a
+        // branch target, and there's no exception-handler region here to accidentally grow).
+        {
+            var body = onShownMethod.Body;
+            var il = body.GetILProcessor();
+            var first = body.Instructions[0];
+            void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(first, i); }
+
+            Emit(
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Newobj, timerCtorRef),
+                Instruction.Create(OpCodes.Stfld, timerField),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, timerField),
+                Instruction.Create(OpCodes.Ldc_I4, pollIntervalMs),
+                Instruction.Create(OpCodes.Callvirt, timerSetIntervalRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, timerField),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldftn, tickMethod),
+                Instruction.Create(OpCodes.Newobj, eventHandlerCtorRef),
+                Instruction.Create(OpCodes.Callvirt, timerAddTickRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, timerField),
+                Instruction.Create(OpCodes.Callvirt, timerStartRef)
+            );
+        }
+
+        Console.WriteLine($"OK   {fileName}: {mainFormType}::OnShown -- now polls every {pollIntervalMs}ms for {signalPath}; when present, deletes it and calls the real menuItem_File_Exit_Click (same as File > Exit) for a graceful shutdown");
         patched = true;
 
         module.Write(destPath);
