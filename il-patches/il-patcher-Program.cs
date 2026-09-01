@@ -83,6 +83,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-timer-kick-state-flip")
     return RunPatchNotificationTimerKick(args, alsoInvalidate: false, alsoFlipState: true, kickAfterMs: 100);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-real-fade-abort")
+{
+    return RunPatchNotificationRealFadeAbort(args);
+}
+
 if (args.Length > 0 && args[0] == "--version")
 {
     return RunVersion(args);
@@ -2061,6 +2066,270 @@ static int RunPatchNotificationTimerKick(string[] args, bool alsoInvalidate, boo
         }
 
         Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- forced Visible-hold timer to {kickAfterMs}ms; {targetType}::timer_OnTimer -- first tick now re-arms{(alsoFlipState ? " + flips state to Disappearing and back" : "")}{(alsoInvalidate ? " + Invalidate()s" : "")} via __diagKickOrHide() instead of calling Hide(), second tick calls Hide() as normal");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-real-fade-abort <input-dir> <output-dir>
+//
+// Eleventh-round test (reports/notification-empty-until-fade-findings.md): three isolation
+// attempts (plain Timer re-arm, re-arm+Invalidate(), re-arm+transient state-flip) all unstuck the
+// avatar but never the text. All three were also *instantaneous* -- state/Opacity written and
+// (for the flip variant) written back in the very same call, no real elapsed time with the field
+// actually holding its changed value across an actual timer tick. This test drives the REAL,
+// unmodified fade-tick code path instead of imitating it: sets state = Disappearing and
+// alphaIncrement exactly as Hide()'s Visible branch does, re-arms the timer to 25ms, then pumps
+// the message loop (Application.DoEvents() + Thread.Sleep(), the same proven-safe technique
+// `--patch-notification-invalidate`'s dip-and-recover step already used successfully in this
+// codebase) for ~120ms -- long enough for several *genuine* WM_TIMER-dispatched ticks to run
+// through timer_OnTimer's own unmodified Disappearing-branch code (real Opacity decrement, real
+// updateLayeredBackground(false), real Invalidate() on each tick) -- before aborting: snapping
+// Opacity back to 1.0, state back to Visible, alphaIncrement to 0, and re-arming the timer for
+// the real remaining timeToStay. If text appears during the pumped window (even if the abort
+// then makes it invisible again, or leaves it visible at full opacity), a few genuine fade ticks
+// are what's needed, not any single field write in isolation. If it still doesn't, the trigger is
+// something tied to the fade actually completing (reaching Opacity 0 and calling
+// setFormHidden()), not merely being underway.
+static int RunPatchNotificationRealFadeAbort(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-real-fade-abort <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+    const int kickAfterMs = 100;
+    const int pumpStepMs = 30;
+    const int pumpSteps = 4; // ~120ms of real elapsed time, pumped -- several genuine 25ms ticks
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var onShownMethod = type.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody);
+        var timerMethod = type.Methods.FirstOrDefault(m => m.Name == "timer_OnTimer" && m.HasBody);
+        var hideMethod = type.Methods.FirstOrDefault(m => m.Name == "Hide" && m.HasBody && m.Parameters.Count == 0);
+        var updateLayeredBackgroundMethod = type.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground" && m.HasBody) ??
+            type.BaseType?.Resolve()?.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground");
+        if (onShownMethod is null) { Console.Error.WriteLine("FAIL: OnShown not found"); return 1; }
+        if (timerMethod is null) { Console.Error.WriteLine("FAIL: timer_OnTimer not found"); return 1; }
+        if (hideMethod is null) { Console.Error.WriteLine("FAIL: Hide() not found"); return 1; }
+        if (updateLayeredBackgroundMethod is null) { Console.Error.WriteLine("FAIL: updateLayeredBackground not found"); return 1; }
+        var updateLayeredBackgroundRef = module.ImportReference(updateLayeredBackgroundMethod);
+
+        var timerField = type.Fields.FirstOrDefault(f => f.Name == "timer");
+        var timeToStayField = type.Fields.FirstOrDefault(f => f.Name == "timeToStay");
+        var stateField = type.Fields.FirstOrDefault(f => f.Name == "state");
+        var alphaIncrementField = type.Fields.FirstOrDefault(f => f.Name == "alphaIncrement");
+        if (timerField is null) { Console.Error.WriteLine("FAIL: timer field not found"); return 1; }
+        if (timeToStayField is null) { Console.Error.WriteLine("FAIL: timeToStay field not found"); return 1; }
+        if (stateField is null) { Console.Error.WriteLine("FAIL: state field not found"); return 1; }
+        if (alphaIncrementField is null) { Console.Error.WriteLine("FAIL: alphaIncrement field not found"); return 1; }
+
+        // Resolve Timer's set_Interval/Start from timerField's own FieldType, not via typeof()
+        // reflection -- System.Windows.Forms is an app-deployed assembly, same version-mismatch
+        // trap as CLAUDE.md's IL-patching lesson 5.
+        var timerType = timerField.FieldType.Resolve();
+        var setIntervalDef = timerType?.Methods.FirstOrDefault(m => m.Name == "set_Interval");
+        var startDef = timerType?.Methods.FirstOrDefault(m => m.Name == "Start" && m.Parameters.Count == 0);
+        if (setIntervalDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Timer.set_Interval from timer field's own FieldType"); return 1; }
+        if (startDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Timer.Start from timer field's own FieldType"); return 1; }
+        var setIntervalRef = module.ImportReference(setIntervalDef);
+        var startRef = module.ImportReference(startDef);
+
+        // Invalidate() (Control), Opacity (Form), and Application.DoEvents() -- same base-type-
+        // chain-walk technique as --patch-notification-invalidate, not typeof() reflection.
+        TypeDefinition? controlType = type;
+        while (controlType is not null && controlType.FullName != "System.Windows.Forms.Control")
+        {
+            controlType = controlType.BaseType?.Resolve();
+        }
+        if (controlType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control in base-type chain"); return 1; }
+        var invalidateDef = controlType.Methods.FirstOrDefault(m => m.Name == "Invalidate" && m.Parameters.Count == 0);
+        if (invalidateDef is null) { Console.Error.WriteLine("FAIL: Control missing parameterless Invalidate()"); return 1; }
+        var invalidateRef = module.ImportReference(invalidateDef);
+
+        TypeDefinition? formType = type;
+        while (formType is not null && formType.FullName != "System.Windows.Forms.Form")
+        {
+            formType = formType.BaseType?.Resolve();
+        }
+        if (formType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Form in base-type chain"); return 1; }
+        var setOpacityDef = formType.Methods.FirstOrDefault(m => m.Name == "set_Opacity");
+        if (setOpacityDef is null) { Console.Error.WriteLine("FAIL: Form missing set_Opacity"); return 1; }
+        var setOpacityRef = module.ImportReference(setOpacityDef);
+
+        var applicationType = controlType.Module.GetType("System.Windows.Forms.Application");
+        if (applicationType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Application"); return 1; }
+        var doEventsDef = applicationType.Methods.FirstOrDefault(m => m.Name == "DoEvents" && m.Parameters.Count == 0);
+        if (doEventsDef is null) { Console.Error.WriteLine("FAIL: Application missing DoEvents()"); return 1; }
+        var doEventsRef = module.ImportReference(doEventsDef);
+        var threadSleepRef = module.ImportReference(typeof(System.Threading.Thread).GetMethod("Sleep", new[] { typeof(int) })!);
+
+        // --- Step 1: OnShown -- override the Visible-transition's `timer.Interval = timeToStay;`
+        // with a hardcoded short interval, right after the original call.
+        {
+            var body = onShownMethod.Body;
+            body.SimplifyMacros();
+            var instrs = body.Instructions;
+            Instruction? anchor = null;
+            for (int idx = 1; idx < instrs.Count; idx++)
+            {
+                if ((instrs[idx].OpCode == OpCodes.Call || instrs[idx].OpCode == OpCodes.Callvirt) &&
+                    instrs[idx].Operand is MethodReference mr && mr.Name == "set_Interval" &&
+                    instrs[idx - 1].OpCode == OpCodes.Ldfld && instrs[idx - 1].Operand is FieldReference fr && fr.Name == "timeToStay")
+                {
+                    if (anchor is not null) { Console.Error.WriteLine("FAIL: more than one `timer.Interval = timeToStay;` found in OnShown -- method shape changed, review needed"); return 1; }
+                    anchor = instrs[idx];
+                }
+            }
+            if (anchor is null) { Console.Error.WriteLine("FAIL: couldn't find `timer.Interval = timeToStay;` in OnShown"); return 1; }
+
+            var il = body.GetILProcessor();
+            var call = Instruction.Create(OpCodes.Call, setIntervalRef);
+            var pushMs = Instruction.Create(OpCodes.Ldc_I4, kickAfterMs);
+            var pushTimer = Instruction.Create(OpCodes.Ldfld, timerField);
+            var pushThis = Instruction.Create(OpCodes.Ldarg_0);
+            il.InsertAfter(anchor, pushThis);
+            il.InsertAfter(pushThis, pushTimer);
+            il.InsertAfter(pushTimer, pushMs);
+            il.InsertAfter(pushMs, call);
+        }
+
+        // --- Step 2: add `private bool __diagTimerKicked;` field.
+        var kickedField = new FieldDefinition("__diagTimerKicked", FieldAttributes.Private, module.TypeSystem.Boolean);
+        type.Fields.Add(kickedField);
+
+        // --- Step 3: add `private void __diagKickOrHide()`:
+        //   if (!__diagTimerKicked) {
+        //       __diagTimerKicked = true;
+        //       state = Disappearing; alphaIncrement = -0.05f; timer.Interval = 25; timer.Start();
+        //       for (4 times) { Invalidate(); DoEvents(); Sleep(30); }  // real ticks run here
+        //       Opacity = 1.0; state = Visible; alphaIncrement = 0f;
+        //       updateLayeredBackground(false); Invalidate();
+        //       timer.Interval = timeToStay; timer.Start();
+        //   } else { Hide(); }
+        var kickMethod = new MethodDefinition("__diagKickOrHide", MethodAttributes.Private, module.TypeSystem.Void);
+        type.Methods.Add(kickMethod);
+        var kickBody = kickMethod.Body;
+        var kickIl = kickBody.GetILProcessor();
+        var elseLabel = Instruction.Create(OpCodes.Ldarg_0);
+        var ret = Instruction.Create(OpCodes.Ret);
+
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldfld, kickedField));
+        kickIl.Append(Instruction.Create(OpCodes.Brtrue, elseLabel));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldc_I4_1));
+        kickIl.Append(Instruction.Create(OpCodes.Stfld, kickedField));
+
+        // state = Disappearing; alphaIncrement = -0.05f; timer.Interval = 25; timer.Start();
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldc_I4_3));
+        kickIl.Append(Instruction.Create(OpCodes.Stfld, stateField));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldc_R4, -0.05f));
+        kickIl.Append(Instruction.Create(OpCodes.Stfld, alphaIncrementField));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldfld, timerField));
+        kickIl.Append(Instruction.Create(OpCodes.Ldc_I4, 25));
+        kickIl.Append(Instruction.Create(OpCodes.Call, setIntervalRef));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldfld, timerField));
+        kickIl.Append(Instruction.Create(OpCodes.Call, startRef));
+
+        // Pump the message loop so genuine WM_TIMER-dispatched ticks can run through
+        // timer_OnTimer's own unmodified code for real (fully unrolled, no branches introduced).
+        for (int i = 0; i < pumpSteps; i++)
+        {
+            kickIl.Append(Instruction.Create(OpCodes.Call, doEventsRef));
+            kickIl.Append(Instruction.Create(OpCodes.Ldc_I4, pumpStepMs));
+            kickIl.Append(Instruction.Create(OpCodes.Call, threadSleepRef));
+        }
+
+        // Abort: Opacity = 1.0; state = Visible; alphaIncrement = 0f; updateLayeredBackground(false);
+        // Invalidate(); timer.Interval = timeToStay; timer.Start();
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldc_R8, 1.0));
+        kickIl.Append(Instruction.Create(OpCodes.Call, setOpacityRef));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldc_I4_2));
+        kickIl.Append(Instruction.Create(OpCodes.Stfld, stateField));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldc_R4, 0f));
+        kickIl.Append(Instruction.Create(OpCodes.Stfld, alphaIncrementField));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+        kickIl.Append(Instruction.Create(OpCodes.Call, updateLayeredBackgroundRef));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Call, invalidateRef));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldfld, timerField));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldfld, timeToStayField));
+        kickIl.Append(Instruction.Create(OpCodes.Call, setIntervalRef));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldfld, timerField));
+        kickIl.Append(Instruction.Create(OpCodes.Call, startRef));
+        kickIl.Append(Instruction.Create(OpCodes.Br, ret));
+        kickIl.Append(elseLabel); // Ldarg_0, reused as the else-branch's first instruction
+        kickIl.Append(Instruction.Create(OpCodes.Call, module.ImportReference(hideMethod)));
+        kickIl.Append(ret);
+
+        // --- Step 4: timer_OnTimer -- redirect the single `Hide()` call to `__diagKickOrHide()`.
+        {
+            var body = timerMethod.Body;
+            var instrs = body.Instructions;
+            int hideCallCount = 0;
+            foreach (var instr in instrs)
+            {
+                if ((instr.OpCode == OpCodes.Call || instr.OpCode == OpCodes.Callvirt) && instr.Operand is MethodReference mr && mr.Name == "Hide" && mr.Parameters.Count == 0)
+                {
+                    instr.Operand = kickMethod;
+                    hideCallCount++;
+                }
+            }
+            if (hideCallCount != 1) { Console.Error.WriteLine($"FAIL: expected exactly 1 Hide() call in timer_OnTimer, found {hideCallCount} -- method shape changed, review needed"); return 1; }
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- forced Visible-hold timer to {kickAfterMs}ms; {targetType}::timer_OnTimer -- first tick now runs a real ~{pumpSteps * pumpStepMs}ms fade (state=Disappearing, real ticks pumped) then aborts back to Visible/Opacity=1.0, via __diagKickOrHide() instead of calling Hide(); second tick calls Hide() as normal");
         patched = true;
 
         module.Write(destPath);
