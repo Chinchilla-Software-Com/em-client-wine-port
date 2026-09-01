@@ -4,6 +4,7 @@ original/
 # Build artifacts from the Cecil patcher - regenerable from original/ + patch specs
 il-patches/output*/
 il-patches/backup/
+il-patches/backup-live-*/
 il-patches/bottle-backups/
 
 # ilspycmd decompile output - regenerable from original/ or il-patches/output/
