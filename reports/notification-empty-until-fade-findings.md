@@ -901,3 +901,72 @@ stall the turn.
 `--patch-diag` instrumentation + the state-flip experiment, 100ms kick delay) deployed, from this
 session's live testing. Reverting to a clean Stage 8 build (fix only, no diagnostic/experimental
 logic) for normal use is a pending task, not yet done as of this writing.
+
+## New test infrastructure: `--patch-auto-test-notification`
+
+To avoid needing the user to send a real test email for every iteration, added a self-triggering
+test notification (`RunPatchAutoTestNotification`, `il-patcher-Program.cs`): a one-shot
+`System.Windows.Forms.Timer` inserted into `formMain.OnShown`, firing 3000ms after the main window
+appears, that constructs a `FormMailNotification` with fixed `Title`/`Content` strings, sets
+`Location` explicitly, and calls `FormGenericNotification`'s own `Show(IWin32Window)` override
+(not the plain inherited `Control.Show()`, which skips the presenter's positioning and the
+override's own topmost `SetWindowPos`/`ShowWindow` calls -- caught via a first live test where the
+notification rendered at the default `(0,0)`, mostly hidden behind the main window). Combined with
+launching eM Client and `ffmpeg` together from the same command (rather than waiting for the main
+window to be detected first, which reliably arrived too late -- see next section), this makes the
+whole test loop fully self-contained: no email, no waiting on the user to click or confirm
+anything.
+
+## Thirteenth round: v6 tested live via the auto-trigger -- no improvement; found *why*
+
+First attempt at using the new auto-trigger started screen recording only after detecting the main
+window via `wmctrl`, on the assumption that meant the notification hadn't fired yet. Wrong: the
+diag log showed the entire notification lifecycle (`OnShown` through `Hide()`, ~7s) had already
+completed *before* the detection loop even found the window, because by the time `wmctrl` reported
+the window as mapped, eM Client had already been running long enough for the 3s auto-trigger delay
+and the full notification hold to elapse. Fixed by starting `ffmpeg` and launching `MailClient.exe`
+in the same command, both timestamped, so the recording covers the entire process lifetime from
+before the main window even exists.
+
+Re-run this way (recording from `21:00:28.87`, notification `OnShown` at `21:00:38.852`, `Hide()`
+at `21:00:45.355`) reproduced the **exact original symptom** against the `output-keep-alive-v6`
+build (monotonic `-0.01f`/tick fade with a `0.5` opacity floor, from the twelfth round's finding):
+text visible in the frame immediately after `OnShown` (frame at ~10.0s), blank again within
+~800ms (frame at ~10.8s), and not visible again until the frame coinciding with `Hide()`'s fade-out
+(~16.4s) -- no different from the unpatched baseline. Zero improvement, exactly the case the user
+asked to be probed about ("remember to probe me to switch if we make no improvement").
+
+**Found the specific reason v6 didn't work, from the diag log's raw tick trace (not just frames):**
+`timer_OnTimer` fired continuously (~25ms apart) during `Appearing` (`38.901`-`39.351`), then
+**zero ticks of any kind for 6.003 seconds** -- no `timer_OnTimer`, no `OnPaint`, nothing -- until a
+single `timer_OnTimer` at `45.354`, immediately followed by `Hide()` at `45.355`. That 6.003s gap
+is `timeToStay` (the real configured hold duration) almost to the millisecond, not the 25ms
+sustain interval v6 was supposed to keep running. Decompiling the deployed `OnShown` explains why:
+the `Visible`/`Appearing` case sets `timer.Interval = timeToStay;` **first**, then (for `autoHide`)
+calls `timer.Start()`, then only *afterward* sets `timer.Interval = 25;` and calls `timer.Start()`
+again for the brief 4-cycle `DoEvents()+Sleep(30)` unlock pump, before resetting `alphaIncrement`
+to the monotonic `-0.01f` value and returning -- with no further `Interval`/`Start()` call once the
+pump ends. `DoEvents()` forces the queued `WM_TIMER` messages to be processed immediately
+regardless of the programmed native interval, which is why the 4-cycle unlock pump still produced
+real ticks -- but once execution returns to the normal message loop, the timer's *actual* native
+re-arm cadence going forward is governed by whichever `Interval` value the underlying platform
+timer was last armed with outside of a forced pump, which this evidence says was effectively still
+`timeToStay`, not `25`. In other words: v6's sustain mechanism only ever ran during the four
+synchronous, forced `DoEvents()` cycles (~120ms) immediately after `OnShown`, not for the rest of
+the hold -- so it stopped mattering almost immediately, and the notification silently reverted to
+the original inert `timeToStay`-interval wait for the remaining ~5.9s, reproducing the original bug
+exactly.
+
+**This closes out the "tune the Timer-driven sustain-tick" family of fixes (v1 through v6, six
+iterations).** Every version that got a real per-tick native alpha change running did keep text
+visible for as long as ticks were actually occurring (twelfth round's finding stands: it's
+genuinely `alphaIncrement`/real ticking, not `state`, that gates visibility) -- but no version has
+managed to keep the *timer itself* reliably ticking for the entire ~6s hold once it's not being
+forced by a synchronous `DoEvents()` pump, and synchronously pumping for the *entire* hold (as
+opposed to a brief unlock window) was already tried and rejected earlier in the investigation as
+freezing the rest of the UI. Next step flagged to the user: pivot away from trying to keep the
+existing layered-window/cached-bitmap timer mechanism ticking, toward the alternative discussed
+earlier -- rendering title/content text via a normal, non-layered child control (a `Label` or
+owner-drawn control sitting on top of the layered background) that Wine's compositor would paint
+through its own independent, non-timer-gated path, rather than through the `alphaIncrement`-gated
+cached-bitmap blit that every fix attempt so far has been routed through.
