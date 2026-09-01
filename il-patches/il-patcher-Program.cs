@@ -63,6 +63,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-no-fading")
     return RunPatchNotificationNoFading(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-click-resubscribe")
+{
+    return RunPatchNotificationClickResubscribe(args);
+}
+
 if (args.Length > 0 && args[0] == "--version")
 {
     return RunVersion(args);
@@ -476,17 +481,32 @@ static int RunPatchAllPaintingInWmPaint(string[] args)
 // --patch-diag <input-dir> <output-dir>
 //
 // Temporary instrumentation patch (not meant to ship) -- current target superseded from the
-// ControlDataGrid/Settings-panel investigation (see git history for that version). Now
-// instruments MailClient.dll's UI.Forms.NotificationForms.FormGenericNotification (the shared
-// base class behind every notification toast, e.g. FormMailNotification) to answer: for the
-// notification a user sees as "an empty box that only shows text right as it starts to fade",
-// which concrete window (type/handle/size) is it, and what are `state`/`title`/`content` (the
-// fields OnPaint/OnPaintTitle draw from) at each actual OnPaint call and each timer_OnTimer
-// fade-animation tick? A CX_DEBUGMSG=+win,+win32u,+x11drv,+event,+message trace of this
-// investigation found two different LayeredBaseForm windows in one repro with ambiguous
-// evidence pointing at either as "the" box (see reports/ -- not yet written up, investigation
-// in progress) -- this settles it directly from the app's own state instead of guessing from
-// window-surface flush geometry.
+// ControlDataGrid/Settings-panel investigation (see git history for that version), then from the
+// original OnPaint/timer_OnTimer-only version (see git history for that revision). Now also
+// instruments FormGenericNotification.Hide() and OnMouseClick(MouseEventArgs), plus
+// MailClient.UI.Notifications.MailNotificationHandler.notificationForm_Click (the click handler
+// that fires ContentClick -> PerformAction -> formMail.ShowMailForm), to chase the fifth-round
+// finding in reports/notification-empty-until-fade-findings.md: clicking a no-text notification
+// (auto-hide disabled) after ~6s (~timeToStay) hangs the app, but clicking within that window
+// doesn't. Goal: see the actual interleaving of state/timer/click activity around the hang,
+// rather than continuing to infer it from screen recordings.
+//
+// Sixth round found real clicks never fire OnMouseClick at all (0 hits every time) -- they land
+// on LayeredBaseForm's separate drop-shadow companion window, whose own layeredWindow_Click
+// handler calls performMouseClick() directly -- and that a single physical click fired
+// notificationForm_Click *twice*, 207ms apart. OnShown() does `layeredWindow.Click +=
+// layeredWindow_Click;` with no matching -= anywhere in the class, and Show()/OnShown() can run
+// more than once per notification's lifecycle (e.g. via Reshow()) -- if OnShown() ran twice
+// before the click, the same handler would be subscribed to the event twice, and one Click raise
+// would invoke it twice. OnShown and layeredWindow_Click are now instrumented too, to confirm
+// this directly: does OnShown fire more than once before the first click, and does
+// layeredWindow_Click itself fire twice per physical click (consistent with double-subscription)
+// or is there some other explanation (e.g. two genuine separate click messages)?
+//
+// Original instrumentation still in place: for the notification a user sees as "an empty box
+// that only shows text right as it starts to fade", which concrete window (type/handle/size) is
+// it, and what are `state`/`title`/`content` (the fields OnPaint/OnPaintTitle draw from) at each
+// actual OnPaint call and each timer_OnTimer fade-animation tick?
 static int RunPatchDiag(string[] args)
 {
     if (args.Length < 3)
@@ -530,8 +550,22 @@ static int RunPatchDiag(string[] args)
 
         var onPaintMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaint" && m.HasBody && m.Parameters.Count == 1);
         var timerMethod = type.Methods.FirstOrDefault(m => m.Name == "timer_OnTimer" && m.HasBody);
+        var hideMethod = type.Methods.FirstOrDefault(m => m.Name == "Hide" && m.HasBody && m.Parameters.Count == 0);
+        var onMouseClickMethod = type.Methods.FirstOrDefault(m => m.Name == "OnMouseClick" && m.HasBody && m.Parameters.Count == 1);
+        var onShownMethod = type.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody);
+        var layeredWindowClickMethod = type.Methods.FirstOrDefault(m => m.Name == "layeredWindow_Click" && m.HasBody);
         if (onPaintMethod is null) { Console.Error.WriteLine("FAIL: OnPaint(PaintEventArgs) not found"); return 1; }
         if (timerMethod is null) { Console.Error.WriteLine("FAIL: timer_OnTimer not found"); return 1; }
+        if (hideMethod is null) { Console.Error.WriteLine("FAIL: Hide() not found"); return 1; }
+        if (onMouseClickMethod is null) { Console.Error.WriteLine("FAIL: OnMouseClick(MouseEventArgs) not found"); return 1; }
+        if (onShownMethod is null) { Console.Error.WriteLine("FAIL: OnShown not found"); return 1; }
+        if (layeredWindowClickMethod is null) { Console.Error.WriteLine("FAIL: layeredWindow_Click not found"); return 1; }
+
+        const string handlerTypeName = "MailClient.UI.Notifications.MailNotificationHandler";
+        var handlerType = module.GetType(handlerTypeName);
+        if (handlerType is null) { Console.Error.WriteLine($"FAIL: type not found: {handlerTypeName}"); return 1; }
+        var clickHandlerMethod = handlerType.Methods.FirstOrDefault(m => m.Name == "notificationForm_Click" && m.HasBody);
+        if (clickHandlerMethod is null) { Console.Error.WriteLine("FAIL: notificationForm_Click not found"); return 1; }
 
         var stateField = type.Fields.FirstOrDefault(f => f.Name == "state");
         var titleField = type.Fields.FirstOrDefault(f => f.Name == "title");
@@ -684,11 +718,60 @@ static int RunPatchDiag(string[] args)
             );
         }
 
+        // Minimal instrumentation for a method on a type that doesn't have state/title/content
+        // fields or derive from Control (MailNotificationHandler is a plain class) -- just
+        // "<label> tick=<TickCount> type=<TypeName>\n", reusing the same tick+type Emit shape as
+        // the first block of Instrument() above, but as its own insertion (no shared locals with
+        // Instrument's closure, since this runs against a different MethodDefinition/body).
+        void InstrumentMinimal(MethodDefinition method, string label)
+        {
+            var body = method.Body;
+            body.InitLocals = true;
+            var tmpInt = new VariableDefinition(module.TypeSystem.Int32);
+            var tmpMsg = new VariableDefinition(module.TypeSystem.String);
+            body.Variables.Add(tmpInt);
+            body.Variables.Add(tmpMsg);
+            var il = body.GetILProcessor();
+            var first = body.Instructions[0];
+            void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(first, i); }
+
+            Emit(
+                Instruction.Create(OpCodes.Call, tickCountGetter),
+                Instruction.Create(OpCodes.Stloc, tmpInt),
+                Instruction.Create(OpCodes.Ldstr, label + " tick="),
+                Instruction.Create(OpCodes.Ldloca, tmpInt),
+                Instruction.Create(OpCodes.Call, int32ToString),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldstr, " type="),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Callvirt, objectGetType),
+                Instruction.Create(OpCodes.Callvirt, typeGetName),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldstr, "\n"),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Stloc, tmpMsg),
+                Instruction.Create(OpCodes.Ldstr, logPath),
+                Instruction.Create(OpCodes.Ldloc, tmpMsg),
+                Instruction.Create(OpCodes.Call, appendAllText)
+            );
+        }
+
         Instrument(onPaintMethod, "OnPaint");
         Instrument(timerMethod, "timer_OnTimer");
+        Instrument(hideMethod, "Hide");
+        Instrument(onMouseClickMethod, "OnMouseClick");
+        Instrument(onShownMethod, "OnShown");
+        Instrument(layeredWindowClickMethod, "layeredWindow_Click");
+        InstrumentMinimal(clickHandlerMethod, "notificationForm_Click");
 
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnPaint -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::timer_OnTimer -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::Hide -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnMouseClick -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnShown -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::layeredWindow_Click -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {handlerTypeName}::notificationForm_Click -> {logPath}");
         patched = true;
 
         module.Write(destPath);
@@ -1398,6 +1481,174 @@ static int RunPatchNotificationNoFading(string[] args)
         il.InsertBefore(insertBefore, Instruction.Create(OpCodes.Callvirt, setShowWithoutFadingRef));
 
         Console.WriteLine($"OK   {fileName}: inserted `this.ShowWithoutFading = true;` after autoHide assignment in {targetType}::.ctor");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-click-resubscribe <input-dir> <output-dir>
+//
+// Root cause of the double click-dispatch found via --patch-diag instrumentation (sixth round,
+// reports/notification-empty-until-fade-findings.md): FormGenericNotification.OnShown() runs
+// `layeredWindow.Click += layeredWindow_Click;` unconditionally every time it runs, with no
+// matching `-=` anywhere in the class -- and OnShown() runs at least twice per notification shown
+// (confirmed via instrumentation: once early with the form still blank/Hidden, once again once
+// Title/Content are populated), each adding another subscription of the *same* handler to the
+// *same* event. A single physical click then invokes layeredWindow_Click (and everything
+// downstream -- performMouseClick -> notificationForm_Click -> PerformAction -> ShowMailForm) once
+// per accumulated subscription. Confirmed via log: one click fired layeredWindow_Click and
+// notificationForm_Click twice, 207ms apart, on a mailForm shown only once so far in that Wine
+// session -- the count would only grow further for a mailForm instance reused across more
+// notifications, since it's a persistent singleton (see MailNotificationHandler.
+// EnsureValidNotificationForm), with each Show() adding one more subscription on top of whatever's
+// already there. Plausible explanation for this investigation's flakiness across attempts (fine
+// once, hung once, crashed once): reentrant/concurrent calls into PerformAction/ShowMailForm from
+// the same click landing badly under Wine/CEF, worse the more redundant subscriptions have piled
+// up in a given session.
+//
+// Fix: insert `layeredWindow.Click -= layeredWindow_Click;` immediately before the existing
+// `layeredWindow.Click += layeredWindow_Click;` in OnShown() -- the standard unsubscribe-then-
+// subscribe idiom. Removing a delegate that was never added is a documented no-op on .NET
+// multicast events, so this is safe on the very first call too, and caps the subscription count at
+// exactly one no matter how many times OnShown() runs. All five operands (the layeredWindow field,
+// the layeredWindow_Click method, and the EventHandler ctor) are read back from the existing
+// add_Click call's own instructions rather than assumed, so the new remove_Click call is
+// guaranteed to reference the exact same field/handler/delegate type as the code it's paired with.
+static int RunPatchNotificationClickResubscribe(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-click-resubscribe <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var onShown = type.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody);
+        if (onShown is null) { Console.Error.WriteLine($"FAIL: OnShown not found on {targetType}"); return 1; }
+
+        var body = onShown.Body;
+        body.SimplifyMacros();
+        var instrs = body.Instructions;
+
+        // SimplifyMacros() (called above, per CLAUDE.md's IL-patching lessons, before any
+        // insertion) turns the short-form `ldarg.0` macro into the long-form `ldarg <this>` --
+        // both need to be accepted below, not just the short form.
+        bool IsLdThis(Instruction i) => i.OpCode == OpCodes.Ldarg_0 ||
+            (i.OpCode == OpCodes.Ldarg && ReferenceEquals(i.Operand, body.ThisParameter));
+
+        // Find the `callvirt add_Click` that wires layeredWindow_Click up, then walk back over the
+        // exact 5-instruction sequence that pushes its arguments (ldarg.0; ldfld layeredWindow;
+        // ldarg.0; ldftn layeredWindow_Click; newobj EventHandler::.ctor) so every operand reused
+        // for the new remove_Click call is read from the real code, not assumed.
+        int addClickIndex = -1;
+        MethodReference? addClickRef = null;
+        for (int idx = 0; idx < instrs.Count; idx++)
+        {
+            if (instrs[idx].OpCode == OpCodes.Callvirt && instrs[idx].Operand is MethodReference mr && mr.Name == "add_Click")
+            {
+                if (addClickIndex != -1)
+                {
+                    Console.Error.WriteLine($"FAIL: more than one `add_Click` call in {targetType}::OnShown -- method shape changed, review needed");
+                    return 1;
+                }
+                addClickIndex = idx;
+                addClickRef = mr;
+            }
+        }
+        if (addClickIndex == -1 || addClickRef is null) { Console.Error.WriteLine($"FAIL: no `add_Click` call found in {targetType}::OnShown"); return 1; }
+        if (addClickIndex < 5) { Console.Error.WriteLine("FAIL: add_Click found too early in method body to have the expected 5-instruction preamble"); return 1; }
+
+        var i0 = instrs[addClickIndex - 5]; // ldarg.0
+        var i1 = instrs[addClickIndex - 4]; // ldfld layeredWindow
+        var i2 = instrs[addClickIndex - 3]; // ldarg.0
+        var i3 = instrs[addClickIndex - 2]; // ldftn layeredWindow_Click
+        var i4 = instrs[addClickIndex - 1]; // newobj EventHandler::.ctor
+
+        if (!IsLdThis(i0) ||
+            !(i1.OpCode == OpCodes.Ldfld && i1.Operand is FieldReference fieldRef && fieldRef.Name == "layeredWindow") ||
+            !IsLdThis(i2) ||
+            !(i3.OpCode == OpCodes.Ldftn && i3.Operand is MethodReference clickHandlerRef && clickHandlerRef.Name == "layeredWindow_Click") ||
+            !(i4.OpCode == OpCodes.Newobj && i4.Operand is MethodReference ctorRef && ctorRef.DeclaringType.FullName == "System.EventHandler"))
+        {
+            Console.Error.WriteLine("FAIL: unexpected instruction shape immediately before add_Click -- method shape changed, review needed");
+            return 1;
+        }
+
+        var fieldRefFinal = (FieldReference)i1.Operand;
+        var clickHandlerRefFinal = (MethodReference)i3.Operand;
+        var ctorRefFinal = (MethodReference)i4.Operand;
+
+        var removeClickDef = addClickRef.Resolve()?.DeclaringType.Methods.FirstOrDefault(m => m.Name == "remove_Click");
+        if (removeClickDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve sibling remove_Click for add_Click's declaring type"); return 1; }
+        var removeClickRef = module.ImportReference(removeClickDef);
+
+        var anchor = i0;
+        foreach (var instr in instrs)
+        {
+            if (instr.Operand == anchor)
+            {
+                Console.Error.WriteLine("FAIL: insertion point is a branch target -- would need retargeting, review needed");
+                return 1;
+            }
+        }
+        foreach (var handler in body.ExceptionHandlers)
+        {
+            if (handler.TryStart == anchor || handler.TryEnd == anchor ||
+                handler.HandlerStart == anchor || handler.HandlerEnd == anchor)
+            {
+                Console.Error.WriteLine("FAIL: insertion point is an exception-handler region boundary -- review needed");
+                return 1;
+            }
+        }
+
+        var il = body.GetILProcessor();
+        il.InsertBefore(anchor, Instruction.Create(OpCodes.Ldarg_0));
+        il.InsertBefore(anchor, Instruction.Create(OpCodes.Ldfld, fieldRefFinal));
+        il.InsertBefore(anchor, Instruction.Create(OpCodes.Ldarg_0));
+        il.InsertBefore(anchor, Instruction.Create(OpCodes.Ldftn, clickHandlerRefFinal));
+        il.InsertBefore(anchor, Instruction.Create(OpCodes.Newobj, ctorRefFinal));
+        il.InsertBefore(anchor, Instruction.Create(OpCodes.Callvirt, removeClickRef));
+
+        Console.WriteLine($"OK   {fileName}: inserted `layeredWindow.Click -= layeredWindow_Click;` immediately before the existing += in {targetType}::OnShown");
         patched = true;
 
         module.Write(destPath);

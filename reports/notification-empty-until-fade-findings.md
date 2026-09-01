@@ -363,6 +363,133 @@ Both this round's builds/settings changes were reverted; `emClient_win_8_x64` is
 confirmed-working stage-7 baseline (`NotificationsHideAfterTimeout` should be re-confirmed still
 enabled next session, since it was toggled off via Settings mid-investigation, not via a patch).
 
+## Sixth round: extended `--patch-diag` with `Hide()`/`OnMouseClick`/click-handler logging; a
+genuine crash surfaced, unrelated to the click test itself
+
+Following directly from the fifth round's plan, `il-patcher --patch-diag` (`il-patches/
+il-patcher-Program.cs`) was extended with three more instrumentation points beyond the existing
+`OnPaint`/`timer_OnTimer` (same tick/handle/size/state/title/content logging pattern, reusing the
+existing `Instrument()` helper unchanged for the two `FormGenericNotification` methods, plus a new
+minimal `InstrumentMinimal()` — tick+type only — for `MailNotificationHandler`, which has no
+state/title/content/`Control` fields to read):
+
+- `FormGenericNotification.Hide()`
+- `FormGenericNotification.OnMouseClick(MouseEventArgs)`
+- `MailNotificationHandler.notificationForm_Click` (the shared handler behind
+  `TitleClick`/`ContentClick`/`ImageClick`, which calls `PerformAction` → ... →
+  `formMail.ShowMailForm(item)`)
+
+Rebuilt the full pipeline from `original/8/` through all 7 stages (confirmed byte-identical to the
+live `emClient_win_8_x64` bottle at stage 7 before patching further), applied `--patch-diag` on
+top, decompiled all three new instrumentation sites before deploying (clean, no control-flow
+corruption — none of the three methods have exception-handler regions to worry about either), and
+deployed to `emClient_win_8_x64`.
+
+**First logged event (tick 3206951, ~30s after a notification's first paint) turned out not to be
+the click test at all.** The user clarified after reviewing the log: this notification arrived
+while they had the Settings dialog open (independently confirming `NotificationsHideAfterTimeout`
+was already off), and `Hide()` fired the moment they clicked Save-and-close on that dialog — not
+from clicking the notification itself. This cleanly explains why neither `OnMouseClick` nor
+`notificationForm_Click` logged anything before that `Hide()` call: the trigger wasn't a click on
+the notification at all. Likely mechanism (not yet confirmed by instrumentation): closing Settings
+reactivates the main window, and `MailNotificationHandler.UIUtils_ApplicationActivated` →
+`handleAllNotifications()` → `OnNotificationHandled` for the pending tray/popup notification →
+(presumably, via a presenter subscriber not yet traced) `removeCurrentNotification()` → `Hide()` —
+i.e. app activation alone can dismiss a pending notification, independent of any click. Worth
+confirming directly (instrument `UIUtils_ApplicationActivated`/`handleAllNotifications`) if this
+activation-dismisses-notification path becomes relevant again. The `Hide()`→fade sequence that
+followed (state 2→3, correct ~25ms ticks) looked entirely normal.
+
+**Second event (tick 3285999, ~78.5s of total silence later) was the user's actual intended test
+attempt (send a fresh notification, let it sit past 6s, then click) — but the whole Wine session
+crashed before they got a chance to click.** The log shows exactly one `OnPaint` entry for this
+new notification, and it's truncated mid-instrumentation: only the first of the four sequential
+`File.AppendAllText` log writes for that `OnPaint` call landed before the process died (the label+
+tick+type line; the handle/size/state, title, and content lines never got written). This pins the
+crash to very shortly after entering this notification's first `OnPaint` — apparently before any
+user click occurred at all, unlike every previous round's click-after-6s hang.
+
+This is a **new failure mode**, more severe than anything hit in prior rounds: not a UI freeze
+requiring force-quit, but the entire Wine session dying outright (`winewrapper.exe` and
+`MailClient.exe` both gone from `ps`, confirmed via `ps aux`). Checked for the usual crash
+artifacts and found none: no `bug.*.txt` in the bottle's Temp folder (the mechanism `MailClient`
+itself uses to report *managed* exceptions), no `coredumpctl` entries, nothing in `journalctl -k`
+or `dmesg` matching a segfault, no CrossOver-level crash log found. The absence of any of these
+suggests either a very hard native-level crash CrossOver isn't configured to catch/report in this
+environment, or the whole Wine process tree being torn down by something other than a single
+faulting instruction (e.g. a fatal error in `wineserver` itself). Not yet explained.
+
+Not yet reproduced a second time, so it's unknown whether this is: (a) a new, real crash bug
+exposed only now because a notification finally got to sit through its full uninstrumented history
+of state transitions with `Hide()`/`OnMouseClick` instrumentation freshly added (i.e. the new
+instrumentation itself somehow contributing — though the *same* `OnPaint` instrumentation ran
+successfully once already earlier in this exact session, for the first notification, arguing
+against a simple instrumentation bug), or (b) a genuine pre-existing crash in the real app that
+just hadn't been hit yet in this investigation, possibly connected to the same underlying
+compositor-side gap this whole investigation is chasing. The bottle is back to idle (no Wine
+processes running) and ready for another attempt with the same instrumented build already
+deployed — next session/attempt should watch the process closely enough to catch the crash instant
+live (rather than reconstructing it from a truncated log afterward) and immediately check
+`coredumpctl`/`dmesg` right after it happens, in case the artifacts are still present momentarily.
+
+## Seventh round: root cause of the double click-dispatch confirmed and fixed — `OnShown()`
+double-subscribes `layeredWindow.Click` with no matching unsubscribe
+
+Extended `--patch-diag` further to instrument `OnShown(EventArgs)` and `layeredWindow_Click`
+directly, to settle the sixth round's open question about *why* one physical click fired
+`notificationForm_Click` twice. Result, unambiguous:
+
+```
+OnShown tick=5554145 type=FormMailNotification   state=Hidden(0)     title="" content=""
+OnShown tick=5554167 type=FormMailNotification   state=Appearing(1)  title="Test Sender" ...
+OnPaint tick=5554178 ...
+layeredWindow_Click tick=5555722 ...   (the click, 1st dispatch)
+notificationForm_Click tick=5555725 ...
+Hide tick=5555930 ...
+layeredWindow_Click tick=5555933 ...   (the SAME click, 2nd dispatch, 211ms later)
+notificationForm_Click tick=5555937 ...
+```
+
+`OnShown()` ran **twice** for this one notification — once early while the form was still blank
+(`state=Hidden`, empty title/content), once again once `Title`/`Content` were populated — and both
+runs executed `OnShown()`'s unconditional `layeredWindow.Click += layeredWindow_Click;`, with no
+matching `-=` anywhere in the class. That subscribes the same handler to the same event twice, so
+the next single `Click` raise invokes it twice. This fully explains the double-fire, and gives a
+concrete, testable explanation for every previous round's flakiness (fine once, hung once, crashed
+once): a `mailForm` singleton (see `MailNotificationHandler.EnsureValidNotificationForm`) reused
+across a session accumulates one more subscription per `Show()`, so later notifications in a
+longer session would double-fire (or worse) `PerformAction`/`ShowMailForm` more and more badly.
+This also cleanly answers the fifth/sixth-round mystery of why `OnMouseClick` never once fired
+(0/0 across every test): real clicks land on `layeredWindow`, whose own `Click` event dispatches
+straight to `layeredWindow_Click`, entirely bypassing the main form's `OnMouseClick` override.
+
+**Fix implemented and verified (not yet deployed to a live bottle at time of writing — pending
+the user confirming eM Client is fully closed first, per this project's now-strict "always ask,
+never close/kill it yourself" rule):** new `il-patcher --patch-notification-click-resubscribe`
+mode inserts `layeredWindow.Click -= layeredWindow_Click;` immediately before the existing `+=` in
+`OnShown()` — the standard unsubscribe-then-subscribe idiom. Removing a delegate that was never
+added is a documented .NET no-op, so this is safe on the very first call too, and caps the
+subscription count at exactly one regardless of how many times `OnShown()` runs. All reused
+operands (the `layeredWindow` field, the `layeredWindow_Click` method reference, the
+`EventHandler` ctor) are read back from the existing `add_Click` call's own instructions rather
+than assumed, so the new `remove_Click` call is guaranteed to match. Verified before deployment:
+decompiles clean (`layeredWindow.Click -= layeredWindow_Click; layeredWindow.Click +=
+layeredWindow_Click;`, exactly as intended), the 13-site interpolation regression scan is
+unchanged, and `--dump-handlers` confirms `OnShown`'s one exception-handler region (a
+`catch(Win32Exception)` well before the insertion point) is untouched. Built as Stage 8, on top of
+a freshly-regenerated, byte-identical-to-live stage-7 baseline. Still needs a live-bottle
+functional test: confirm a single click now fires `notificationForm_Click` exactly once (via
+`--patch-diag` still layered on top, or by observing real behavior — e.g. does clicking now
+reliably open exactly one mail item instead of whatever double-`ShowMailForm` was doing before).
+
+**Important scope note:** this is a genuine, real, independently-worth-fixing eM Client bug — not
+a Wine gap — but fixing it is not expected to resolve the original empty-box-until-fade rendering
+mystery by itself (that remains the unexplained compositor-side gap from rounds 1–5). It's
+plausible it explains *some* of the instability found while testing that bug (the hang and the
+crash both happened while probing click behavior with `NotificationsHideAfterTimeout` disabled,
+a non-default diagnostic setting used specifically to keep the box on-screen long enough to
+click), but there's no evidence yet linking it to the blank-rendering symptom itself.
+
 ## Not yet tried
 
 - A live X11 pixmap dump (e.g. `xwd`/`import`) precisely synchronized with the broken window's
