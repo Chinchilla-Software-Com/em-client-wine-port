@@ -550,6 +550,29 @@ session, all worth guarding against explicitly next time:
    long form up front, which has no functional downside and removes the range problem entirely.
    Cheap enough to just always call before inserting, rather than judging case-by-case whether a
    given insertion is "small enough".
+5. **`typeof(X)` reflection to build a `MethodReference`/`FieldReference` bakes in the *patching
+   tool's own* runtime's assembly version, not the target app's.** Several instrumentation helpers
+   resolve BCL members via reflection on the running `il-patcher` process itself (e.g.
+   `typeof(Environment).GetProperty("TickCount")`, `typeof(File).GetMethod("AppendAllText", ...)`)
+   and this is safe for types in `System.Private.CoreLib`/its forwarding facades (`System.Runtime`,
+   `System.Collections`, ...) because the CLR's default framework resolution unifies/forwards these
+   across versions transparently. It is **not** safe for a type in an app-local, deps.json-pinned
+   assembly the target app ships its own copy of alongside itself — `il-patcher` targets `net10.0`,
+   so `typeof(System.Drawing.Rectangle).GetProperty("IsEmpty")` bakes in a
+   `System.Drawing.Primitives, Version=10.0.0.0` reference, but MailClient.exe ships and runs on
+   .NET 8 with its own `System.Drawing.Primitives.dll` at `Version=8.0.3026.36720` — no v10 copy
+   exists alongside it, and unlike CoreLib-forwarded types this doesn't get silently redirected.
+   Hit for real: a `--patch-diag` revision instrumenting `headerRect.IsEmpty` crashed the app with
+   `FileNotFoundException: Could not load file or assembly 'System.Drawing.Primitives,
+   Version=10.0.0.0...'` the moment the instrumented method ran — decompiled clean (ilspycmd
+   doesn't validate assembly-reference versions against what's actually deployed) and only
+   surfaced as a real runtime crash, exactly the "decompiling clean is not sufficient proof" shape
+   as lesson 3's exception-handler bug. Fix: never reflect on the patching tool's own process for a
+   type outside CoreLib/its facades — resolve it from a field/parameter/return type *already*
+   present in the module being patched instead (e.g. `someExistingField.FieldType.Resolve()`, then
+   find the member on that already-correctly-versioned `TypeDefinition`), the same technique
+   already used elsewhere in this file for `System.Windows.Forms.Control` (walk the base-type
+   chain rather than reflect on `typeof(Control)`).
 
 **Always re-decompile and read the result before deploying** anything beyond a simple operand
 rewrite — `ilspycmd -m "<doc-id>" <dll>` or `ilspycmd -t "<type>" <dll>` on the patched output.

@@ -554,12 +554,39 @@ static int RunPatchDiag(string[] args)
         var onMouseClickMethod = type.Methods.FirstOrDefault(m => m.Name == "OnMouseClick" && m.HasBody && m.Parameters.Count == 1);
         var onShownMethod = type.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody);
         var layeredWindowClickMethod = type.Methods.FirstOrDefault(m => m.Name == "layeredWindow_Click" && m.HasBody);
+        var updateBackgroundBitmapMethod = type.Methods.FirstOrDefault(m => m.Name == "updateBackgroundBitmap" && m.HasBody);
+        var doLayoutMethod = type.Methods.FirstOrDefault(m => m.Name == "doLayout" && m.HasBody);
         if (onPaintMethod is null) { Console.Error.WriteLine("FAIL: OnPaint(PaintEventArgs) not found"); return 1; }
         if (timerMethod is null) { Console.Error.WriteLine("FAIL: timer_OnTimer not found"); return 1; }
         if (hideMethod is null) { Console.Error.WriteLine("FAIL: Hide() not found"); return 1; }
         if (onMouseClickMethod is null) { Console.Error.WriteLine("FAIL: OnMouseClick(MouseEventArgs) not found"); return 1; }
         if (onShownMethod is null) { Console.Error.WriteLine("FAIL: OnShown not found"); return 1; }
         if (layeredWindowClickMethod is null) { Console.Error.WriteLine("FAIL: layeredWindow_Click not found"); return 1; }
+        if (updateBackgroundBitmapMethod is null) { Console.Error.WriteLine("FAIL: updateBackgroundBitmap not found"); return 1; }
+        if (doLayoutMethod is null) { Console.Error.WriteLine("FAIL: doLayout not found"); return 1; }
+
+        var layeredBaseFormType = type.BaseType?.Resolve();
+        if (layeredBaseFormType is null || layeredBaseFormType.FullName != "MailClient.UI.Forms.LayeredBaseForm")
+        {
+            Console.Error.WriteLine($"FAIL: expected base type MailClient.UI.Forms.LayeredBaseForm, got {layeredBaseFormType?.FullName}");
+            return 1;
+        }
+        var backgroundBitmapField = layeredBaseFormType.Fields.FirstOrDefault(f => f.Name == "backgroundBitmap");
+        if (backgroundBitmapField is null) { Console.Error.WriteLine("FAIL: LayeredBaseForm missing backgroundBitmap field"); return 1; }
+        var headerRectField = type.Fields.FirstOrDefault(f => f.Name == "headerRect");
+        if (headerRectField is null) { Console.Error.WriteLine($"FAIL: {targetType} missing headerRect field"); return 1; }
+        // Resolve Rectangle.get_IsEmpty from headerRectField's own FieldType rather than via
+        // `typeof(System.Drawing.Rectangle)` reflection -- reflecting on the *patching tool's*
+        // own .NET 10 runtime bakes in a `System.Drawing.Primitives, Version=10.0.0.0` reference,
+        // which doesn't exist alongside the app (it ships its own .NET 8 build, Version=8.0.x) and
+        // isn't unified/forwarded the way core BCL types (Environment, File, int) are -- hit this
+        // for real: crashed with FileNotFoundException on that exact assembly/version the moment
+        // updateBackgroundBitmap() ran. Resolving from the field's already-correctly-versioned
+        // FieldType avoids the mismatch entirely.
+        var rectangleType = headerRectField.FieldType.Resolve();
+        var rectangleIsEmptyGetterDef = rectangleType?.Methods.FirstOrDefault(m => m.Name == "get_IsEmpty");
+        if (rectangleIsEmptyGetterDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Rectangle.get_IsEmpty from headerRect's own FieldType"); return 1; }
+        var rectangleIsEmptyGetter = module.ImportReference(rectangleIsEmptyGetterDef);
 
         const string handlerTypeName = "MailClient.UI.Notifications.MailNotificationHandler";
         var handlerType = module.GetType(handlerTypeName);
@@ -757,13 +784,105 @@ static int RunPatchDiag(string[] args)
             );
         }
 
+        // Bitmap-caching diagnostic: was backgroundBitmap null *before* this call (i.e. is a
+        // rebuild about to happen at all, per updateLayeredBackground's `refreshBitmap ||
+        // backgroundBitmap == null` gate), and would updateBackgroundBitmap's own early-return
+        // guard (`headerRect.IsEmpty || Width == 0 || Height < headerHeight`) skip the rebuild
+        // even if attempted? Chases the theory in reports/notification-empty-until-fade-
+        // findings.md's eighth round: FormNotificationPresenter.ShowNotification() calls Show()
+        // once before Title/Content are set and once after (via ShowNotification->Reshow), and
+        // every OnShown()/timer_OnTimer() call passes refreshBitmap:false -- so if a bitmap
+        // already exists (built blank on the first Show()), the second Show() (with real content)
+        // never rebuilds it, leaving a stale/blank bitmap on screen until something else forces a
+        // refreshBitmap:true rebuild.
+        void InstrumentBitmapDiag(MethodDefinition method, string label)
+        {
+            var mBody = method.Body;
+            mBody.InitLocals = true;
+            var tmpInt = new VariableDefinition(module.TypeSystem.Int32);
+            var tmpMsg = new VariableDefinition(module.TypeSystem.String);
+            mBody.Variables.Add(tmpInt);
+            mBody.Variables.Add(tmpMsg);
+            var il = mBody.GetILProcessor();
+            var first = mBody.Instructions[0];
+            void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(first, i); }
+
+            // "<label> tick=<T> type=<Type> bgWasNull=<0/1>\n"
+            Emit(
+                Instruction.Create(OpCodes.Call, tickCountGetter),
+                Instruction.Create(OpCodes.Stloc, tmpInt),
+                Instruction.Create(OpCodes.Ldstr, label + " tick="),
+                Instruction.Create(OpCodes.Ldloca, tmpInt),
+                Instruction.Create(OpCodes.Call, int32ToString),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldstr, " type="),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Callvirt, objectGetType),
+                Instruction.Create(OpCodes.Callvirt, typeGetName),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldstr, " bgWasNull="),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, backgroundBitmapField),
+                Instruction.Create(OpCodes.Ldnull),
+                Instruction.Create(OpCodes.Ceq),
+                Instruction.Create(OpCodes.Stloc, tmpInt),
+                Instruction.Create(OpCodes.Ldloca, tmpInt),
+                Instruction.Create(OpCodes.Call, int32ToString),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldstr, "\n"),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Stloc, tmpMsg),
+                Instruction.Create(OpCodes.Ldstr, logPath),
+                Instruction.Create(OpCodes.Ldloc, tmpMsg),
+                Instruction.Create(OpCodes.Call, appendAllText)
+            );
+
+            // "<label> headerEmpty=<0/1> w=<W> h=<H>\n"
+            Emit(
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldflda, headerRectField),
+                Instruction.Create(OpCodes.Call, rectangleIsEmptyGetter),
+                Instruction.Create(OpCodes.Stloc, tmpInt),
+                Instruction.Create(OpCodes.Ldstr, label + " headerEmpty="),
+                Instruction.Create(OpCodes.Ldloca, tmpInt),
+                Instruction.Create(OpCodes.Call, int32ToString),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldstr, " w="),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Callvirt, getWidth),
+                Instruction.Create(OpCodes.Stloc, tmpInt),
+                Instruction.Create(OpCodes.Ldloca, tmpInt),
+                Instruction.Create(OpCodes.Call, int32ToString),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldstr, " h="),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Callvirt, getHeight),
+                Instruction.Create(OpCodes.Stloc, tmpInt),
+                Instruction.Create(OpCodes.Ldloca, tmpInt),
+                Instruction.Create(OpCodes.Call, int32ToString),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Ldstr, "\n"),
+                Instruction.Create(OpCodes.Call, stringConcat2),
+                Instruction.Create(OpCodes.Stloc, tmpMsg),
+                Instruction.Create(OpCodes.Ldstr, logPath),
+                Instruction.Create(OpCodes.Ldloc, tmpMsg),
+                Instruction.Create(OpCodes.Call, appendAllText)
+            );
+        }
+
         Instrument(onPaintMethod, "OnPaint");
         Instrument(timerMethod, "timer_OnTimer");
         Instrument(hideMethod, "Hide");
         Instrument(onMouseClickMethod, "OnMouseClick");
         Instrument(onShownMethod, "OnShown");
         Instrument(layeredWindowClickMethod, "layeredWindow_Click");
+        Instrument(doLayoutMethod, "doLayout");
         InstrumentMinimal(clickHandlerMethod, "notificationForm_Click");
+        InstrumentBitmapDiag(updateBackgroundBitmapMethod, "updateBackgroundBitmap");
 
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnPaint -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::timer_OnTimer -> {logPath}");
@@ -771,7 +890,9 @@ static int RunPatchDiag(string[] args)
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnMouseClick -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnShown -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::layeredWindow_Click -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::doLayout -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {handlerTypeName}::notificationForm_Click -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::updateBackgroundBitmap -> {logPath}");
         patched = true;
 
         module.Write(destPath);
