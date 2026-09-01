@@ -716,16 +716,38 @@ forcing a genuine `WM_PAINT` dispatch on the main form is the strongest remainin
 what specifically unsticks *text*, since the avatar (blitted directly into the bitmap during
 `updateBackgroundBitmap()`, independent of `WM_PAINT`) apparently doesn't need it.
 
-**Freshest, most actionable lead -- resume here next:** repeat the same kick-test pattern, but
-have the "kick" (fired at 2s, no state/opacity change) call `Invalidate()` a few times (or once)
-instead of / in addition to the timer re-arm, and check by recording whether *text* now also
-appears early. If it does, that pins the text-specific trigger to `Invalidate()`/`WM_PAINT`
-specifically, separate from whatever the timer re-arm does for the avatar -- and gives a real,
-narrow, two-part fix shape: something that forces a repaint (for text) plus something that
-re-arms/kicks the timer (for the avatar), inserted right when a notification's real content is
-set, instead of waiting six seconds for `Hide()` to incidentally do both.
+**Follow-up test, same session: `Invalidate()` alone does not unstick text either.**
+`--patch-notification-timer-kick-invalidate` added `this.Invalidate();` to the kick branch
+(alongside the same timer re-arm), testing whether forcing a genuine `WM_PAINT` dispatch --
+something every real fade tick does on each 25ms step but the idle Visible-hold never does -- was
+the text-specific trigger. A clean, wall-clock-synced recording (kick logged at `15:53:55.840`,
+real `Hide()` at `15:54:01.845`) showed: avatar renders again right around the kick (frame ~552,
+consistent with the earlier result), and **text still does not appear at any point up to frame
+720 (wall ~15:54:01.452, ~0.4s before the real `Hide()`)** -- confirmed by inspecting the cropped
+notification region across many frames spanning the full ~6s gap. Text renders as usual within a
+few frames of the real `Hide()` (frame 735, wall ~15:54:01.9). **This rules out `Invalidate()`/
+`WM_PAINT` dispatch as the text-specific trigger** -- it isn't merely a missing repaint request;
+whatever unsticks text specifically requires something else `Hide()`'s Visible→Disappearing
+branch does that the kick (even now with `Invalidate()` added) still doesn't: the `state` field
+actually changing to `Disappearing`, and/or `alphaIncrement` becoming non-zero (which then drives
+`Opacity` down on each subsequent real fade tick).
 
-`emClient_win_8_x64` currently has the timer-kick test build (Stage 8 fix + full `--patch-diag`
-instrumentation + the timer-kick experiment) deployed, from this session's live testing.
-Reverting to a clean Stage 8 build (fix only, no diagnostic/experimental logic) for normal use is
-a pending task, not yet done as of this writing.
+**Freshest, most actionable lead -- resume here next:** narrow further by making the kick branch
+also set `state = NotificationFormState.Disappearing` (and/or `alphaIncrement` to a small non-zero
+value) *without* actually letting the box fade away -- e.g. flip `state` to `Disappearing` and
+immediately back to `Visible` in the same tick, or hold `alphaIncrement` near zero so `Opacity`
+barely moves -- and see whether text appears the moment `state` itself changes, independent of
+either `Invalidate()` (already ruled out) or an actual visible fade. If it does, the state field
+itself (or something gated on it, e.g. a code path that only composites/redraws differently when
+not `Visible`) is the real trigger, not any Win32-visible side effect tried so far.
+
+Coordination note for future rounds: a screen-recording test needs the recording started *after*
+the user confirms the test email is sent, not before -- mail delivery can take up to a minute, and
+several attempts this round were wasted on fixed-duration recordings that expired before the
+notification even arrived, or before the specific timed event being measured. Cap recording
+duration at 60s to comfortably cover both the wait and the notification's own lifecycle.
+
+`emClient_win_8_x64` currently has the timer-kick-invalidate test build (Stage 8 fix + full
+`--patch-diag` instrumentation + the timer-kick+Invalidate experiment) deployed, from this
+session's live testing. Reverting to a clean Stage 8 build (fix only, no diagnostic/experimental
+logic) for normal use is a pending task, not yet done as of this writing.
