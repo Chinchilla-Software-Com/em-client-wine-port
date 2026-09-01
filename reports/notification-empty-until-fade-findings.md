@@ -556,7 +556,58 @@ should arguably happen still gets skipped) but is not what's producing the user-
 since it's a CoreLib-forwarded type -- unlike `System.Drawing.Rectangle` above) alongside the
 existing relative `tick=<TickCount>`, specifically so a log line can be matched directly against
 a `ffmpeg` screen recording's real timestamps rather than an arbitrary relative counter that's
-easy to mis-narrate. Not yet used in a live correlated test as of this edit -- planned next.
+easy to mis-narrate.
+
+## Ninth round: frame-precise confirmation, via a wall-clock-correlated recording -- content
+appears within ~1-2 frames (33-67ms) of `Hide()` running, after a full ~6s of confirmed-blank
+
+Repeated the test with `NotificationsHideAfterTimeout` back on (default ~6s) and a full-screen
+`ffmpeg -f x11grab -framerate 30` recording running throughout. `ffmpeg`'s own reported input
+start timestamp (`start: 1788232159.962655`, a Unix epoch value logged by x11grab itself -- far
+more reliable than noting the wall-clock via a separate `date` call before launching, which has
+startup-lag error) gave an exact frame-0 wall-clock reference, letting every frame number convert
+directly to a wall-clock time comparable against the diag log's new `wall=` field.
+
+**First analysis attempt was wrong and the user correctly called it out**: cropped frames showed a
+dark rectangle in the lower-right where the notification appears, and it was misidentified as the
+Claude Code terminal window occluding the notification (a real confound in an earlier round, see
+the fourth round above) -- it was not; it was the notification's own dark-themed header/body
+chrome, just genuinely blank of text. Correctly cropping tighter into the actual notification
+region (`crop=500:250:1180:900` on the 1680x1188 capture) and re-examining resolved this.
+
+**Frame-by-frame result, precise:**
+- Notification's first paint: wall ~15:09:50.5 (log: `OnPaint` at `15:09:50.602`, bitmap with
+  correct content already built and pushed to the real window by `15:09:50.592`, ~30ms after
+  appearing -- see eighth round above).
+- Frames at wall ~50.6s, ~51.6s (frame 950), ~53.3s (frame 1000), ~55.9s (frame 1090), and
+  **~56.56s (frame 1098, essentially the exact `Hide()` timestamp of `15:09:56.565`)**: all
+  confirmed **fully blank** (header/body chrome only, no avatar, no text) by direct visual
+  inspection of the cropped region -- a full ~6 seconds of confirmed-blank display despite the
+  correct bitmap having reached the window within 30ms of appearing.
+- **Frame 1099** (~33ms after `Hide()`): the avatar icon begins rendering (a partial dark circle,
+  top-left) -- **text still not present**.
+- **Frame 1100** (~67ms after `Hide()`): full text ("Test Sender" / "Re: Testing notifications")
+  and the reply/flag/delete action icons are all visible.
+
+This is the tightest, most direct confirmation yet of the round-5 theory (`Hide()` running is the
+trigger, not a fixed wall-clock threshold) -- previously inferred from ~1s-resolution screen
+recordings and indirect timing correlation, now pinned to a ~33-67ms window immediately following
+the actual `Hide()` call, with a wall-clock-synchronized log line as ground truth for exactly when
+`Hide()` ran. It also independently confirms, at real resolution for the first time, the user's
+earlier informal observation that the avatar renders one frame before the text -- round four's
+30fps analysis of a different test couldn't resolve this (avatar and text appeared in the same
+captured frame there); this run's 30fps recording happened to land a frame exactly in the ~33ms
+gap between the two.
+
+**This also means the eighth round's framing ("closes off the caching-bug hypothesis... not what's
+producing the user-visible symptom") undersold how solid the underlying compositor-freeze evidence
+actually is** -- it doesn't just "remain consistent with" rounds 1-5's conclusion, this round
+directly, frame-precisely reconfirms it: correct content sitting ready in the app/window for a
+full ~6 seconds with nothing on screen, then appearing within two frames of `Hide()`, is about as
+clean a demonstration of "the app did the work, the compositor didn't show it until told to
+transition away" as this investigation has produced. The caching gate found in `OnShown` #2 is
+still real as an independent code smell, worth fixing on its own merits, but is confirmed here to
+have no bearing on the blank-period symptom.
 
 ## Not yet tried
 
@@ -580,44 +631,64 @@ easy to mis-narrate. Not yet used in a live correlated test as of this edit -- p
   and a different X11 WM/compositor (e.g. KWin, Picom+a non-compositing WM) are two different,
   separately informative tests.
 - Testing against a different CrossOver/Wine build to bound whether it's version-specific.
-- The user separately observed the notification's sender avatar/icon appearing to draw before the
-  text in an earlier manual (non-recorded) repro on the real app. Not reproduced in the recorded
-  session analyzed here, nor in the repro-app iteration that specifically added an avatar (sync or
-  cross-thread-async) — worth another look on the real app if a future session can catch it on
-  video, since if real it would suggest the icon (a `DrawImage`/bitmap blit) and the text
-  (`ExtTextOutW`) take different paths to the screen, and only one of them is affected.
+- ~~The user separately observed the notification's sender avatar/icon appearing to draw before
+  the text~~ — **confirmed in the ninth round above**: a wall-clock-synchronized 30fps recording
+  caught the avatar rendering one frame (~33ms) before the text, both within ~67ms of `Hide()`
+  running. Suggests the icon (a `DrawImage`/bitmap blit) and the text (`ExtTextOutW`) may take
+  different paths to the screen, or simply that the compositor's "catch up" isn't a single atomic
+  event — not yet investigated further.
 
 ## Status
 
-**Unresolved, but substantially narrowed as of this session (2026-09-01).** All experimental
-changes across all three rounds this session (diagnostic instrumentation, all six fix/isolation
-attempts including `--patch-notification-no-fading`, the real app instance used for the final
-`xprop` check and the two focus/no-fading re-tests) have been reverted/closed out —
-`emClient_win_8_x64` is back on its confirmed-working stage-7 baseline (`md5sum`-verified against
-`il-patches/backup/MailClient.dll.stage7-confirmed-working`), and the app is currently closed
-(quit gracefully, not force-killed). `NotificationsHideAfterTimeout` was toggled off via Settings
-mid-investigation and back on again by the user before this checkpoint -- worth a quick glance at
-Settings -> Notifications next session just to confirm it's still on before assuming baseline
-behavior.
+**Unresolved as a root cause, but now characterized with frame-level precision, as of this session
+(2026-09-01, second sitting).** The prior sitting's "freshest lead" (clicking a no-text
+notification after ~6s hangs the app) was chased down and **fully resolved** -- not by finding a
+race in this bug's own mechanism, but by finding and fixing a real, separate, independently-
+confirmed bug: `FormGenericNotification.OnShown()` re-subscribes `layeredWindow.Click` on every
+call with no matching unsubscribe, and runs at least twice per notification shown, so a single
+click double-fired the entire click-handling chain (`layeredWindow_Click` →
+`notificationForm_Click` → `PerformAction` → `ShowMailForm`). Fixed via
+`--patch-notification-click-resubscribe` (Stage 8: `layeredWindow.Click -= layeredWindow_Click;`
+before the existing `+=`), user-confirmed on a live bottle (one click now fires the chain exactly
+once, no hang, no crash). **Not yet folded into `releases/<version>/deploy.sh`** -- apply manually
+via `~/tools/il-patcher --patch-notification-click-resubscribe` on top of Stage 7's output until
+it is. This bug is real and worth having fixed regardless, but is now confirmed **unrelated** to
+the empty-box rendering bug itself (see below) -- it only ever affected click *handling*, not the
+blank-display symptom.
 
-**Current best understanding, superseding the "wall-clock/compositor timeout" theory from earlier
-in this session:** content becomes visible when `Hide()` actually runs (state -> Disappearing),
-triggered either by the auto-hide timer naturally elapsing or by a user click -- not by a fixed
-elapsed-time threshold as such. The fourth round's burst/silent-wait tests, which all released
-around the same ~6s mark regardless of what the app was doing, are now best explained as all
-indirectly reaching that same natural `Hide()` trigger rather than each release being caused by
-its own mechanism -- exactly how remains unresolved (see the fifth-round section above for the
-specific unreconciled timing detail in the silent-wait test). Ruled out this session: Wine's
-opacity-property delete-vs-change split; Muffin's X11-Sync-extension frame-freeze; disabling the
-fade animation entirely (makes it worse -- permanently invisible, confirmed not a focus-suppression
-artifact); and the idea that app-side repaint/opacity/message-pump activity during the blank window
-has any causal effect by itself.
+**The empty-box rendering bug's root cause is still not found**, but this session's ninth round
+(a wall-clock-synchronized `ffmpeg` recording, made possible by adding `wall=<HH:mm:ss.fff>`
+timestamps to `--patch-diag`'s log output) sharpened the evidence considerably: the correct
+bitmap, with real text, is confirmed built and pushed to the actual on-screen window within ~30ms
+of the notification appearing (via direct `updateBackgroundBitmap`/`updateLayeredBackground`
+instrumentation) -- yet the screen stayed confirmed-blank (verified by inspecting the actual pixel
+region in extracted video frames, not inferred) for a full ~6 seconds, until content appeared
+within **~33-67ms of `Hide()` running** (avatar one frame before text). This is the tightest,
+most direct confirmation yet of "the app did the work correctly and early; the compositor didn't
+reflect it until `Hide()`'s own machinery ran" -- previously inferred at ~1s screen-recording
+resolution, now pinned to two video frames with a synchronized log line as ground truth. A
+caching bug that looked like it might explain this (`OnShown` #2 skipping a bitmap rebuild because
+one already exists from `OnShown` #1's blank pre-content call) was found to be real as a code
+pattern but **directly ruled out** as the cause of the blank period, precisely because the correct
+bitmap already reaches the window so early.
 
-**Freshest, most actionable lead (not yet investigated) -- resume here next:** clicking a
-no-text notification (auto-hide off) hangs the app if clicked *after* ~6 seconds have elapsed,
-but not if clicked within that window (reproduced 2/2). This is cleanly reproducible without any
-patch (just the existing Settings toggle + click timing) and points directly at a likely race
-between the click handler and whatever fires at the `timeToStay` mark. Planned next step, agreed
-with the user before this checkpoint: instrument `Hide()`, `timer_OnTimer`, and the notification's
-click handler with `--patch-diag`-style logging to see exactly what collides, rather than
-continuing to infer from screen recordings alone.
+**Freshest, most actionable lead (not yet investigated) -- resume here next:** given content
+reliably appears within ~33-67ms of `Hide()` specifically (not of the timer merely ticking, and not
+of elapsed time as such), the next concrete thing worth isolating is *which specific Win32-level
+side effect of `Hide()`'s Visible→Disappearing branch* is the trigger. Candidates directly visible
+in `Hide()`'s own body: `timer.Interval = 25;` (changing an already-running `Timer`'s interval) and
+`timer.Start()` (re-arming an already-started `Timer`, i.e. a native `SetTimer`/`KillTimer`+
+`SetTimer` call even though the timer was technically already running) -- either could plausibly be
+the specific native call that "kicks" Wine/the X11 compositor into finally compositing already-
+correct, already-queued content, in a way that six seconds of the timer sitting idle at a *long*
+interval apparently doesn't. Testable directly: patch a no-op `timer.Interval = timer.Interval;`
+and/or `timer.Stop(); timer.Start();` into `timer_OnTimer`'s Visible-branch (i.e. partway through
+the blank hold, independent of an actual `Hide()` call) and see whether that alone unsticks the
+display -- a much narrower, more mechanistic test than anything tried in rounds 1-7's
+burst/silent-wait/no-fading attempts, made newly plausible by how precisely `Hide()` itself is
+now implicated.
+
+`emClient_win_8_x64` currently has the Stage 8 fix + full `--patch-diag` instrumentation (including
+wall-clock logging) deployed, from this session's live testing. Reverting to a clean Stage 8 build
+(fix only, no diagnostic logging) for normal use is a pending task, not yet done as of this
+writing.
