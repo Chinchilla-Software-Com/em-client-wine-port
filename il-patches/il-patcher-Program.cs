@@ -1089,18 +1089,37 @@ static int RunPatchAutoTestNotification(string[] args)
         var setTitleRef = module.ImportReference(setTitleDef);
         var setContentRef = module.ImportReference(setContentDef);
 
-        // Show() (parameterless) is declared on Control, not Form -- Form only adds the
-        // Show(IWin32Window) overload. Walk to Control instead (same technique used elsewhere in
-        // this file for Invalidate()).
+        // First attempt used the plain inherited Control.Show() -- decompiled/verified clean and
+        // ran the right OnShown() code path, but live-tested: the form rendered at the default
+        // (0,0) position, mostly hidden behind the main window (barely visible top-left sliver).
+        // Real notifications get positioned explicitly by FormNotificationPresenter (never via
+        // Control's own defaults) and shown through FormGenericNotification's own
+        // Show(IWin32Window) override, which does the actual topmost SetWindowPos/ShowWindow
+        // calls -- neither of which the plain Show() path exercises. Use that override instead
+        // (owner: null is valid), and set Location explicitly first.
+        var notifShowDef = genericNotifType.Methods.FirstOrDefault(m => m.Name == "Show" && m.Parameters.Count == 1);
+        if (notifShowDef is null) { Console.Error.WriteLine("FAIL: FormGenericNotification missing Show(IWin32Window)"); return 1; }
+        var notifShowRef = module.ImportReference(notifShowDef);
+
         TypeDefinition? formType = genericNotifType;
         while (formType is not null && formType.FullName != "System.Windows.Forms.Control")
         {
             formType = formType.BaseType?.Resolve();
         }
         if (formType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control in base-type chain"); return 1; }
-        var showDef = formType.Methods.FirstOrDefault(m => m.Name == "Show" && m.Parameters.Count == 0);
-        if (showDef is null) { Console.Error.WriteLine("FAIL: Control missing parameterless Show()"); return 1; }
-        var showRef = module.ImportReference(showDef);
+        var setLocationDef = formType.Methods.FirstOrDefault(m => m.Name == "set_Location");
+        if (setLocationDef is null) { Console.Error.WriteLine("FAIL: Control missing set_Location"); return 1; }
+        var setLocationRef = module.ImportReference(setLocationDef);
+
+        // Point is an app-deployed type (System.Drawing.Primitives) -- resolve it from
+        // set_Location's own parameter type (already correctly versioned within this module),
+        // not via typeof() reflection (CLAUDE.md's IL-patching lesson 5).
+        var pointTypeRef = setLocationDef.Parameters[0].ParameterType;
+        var pointTypeDef = pointTypeRef.Resolve();
+        if (pointTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Point from set_Location's parameter type"); return 1; }
+        var pointCtorDef = pointTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 2);
+        if (pointCtorDef is null) { Console.Error.WriteLine("FAIL: Point missing (int, int) constructor"); return 1; }
+        var pointCtorRef = module.ImportReference(pointCtorDef);
 
         // Timer lives in the same module as Form/Control -- look it up directly rather than via
         // typeof() reflection (CLAUDE.md's IL-patching lesson 5: System.Windows.Forms is an
@@ -1155,8 +1174,20 @@ static int RunPatchAutoTestNotification(string[] args)
         tmIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
         tmIl.Append(Instruction.Create(OpCodes.Ldstr, "Test Subject Line " + DateTime.Now.ToString("HH:mm:ss")));
         tmIl.Append(Instruction.Create(OpCodes.Callvirt, setContentRef));
+        // Location = new Point(1360, 1000) -- matches where real notifications appear on this
+        // 1680x1188 test screen (bottom-right, with margin for the 310x125 notification size);
+        // real notifications get this from FormNotificationPresenter, which this synthetic
+        // trigger bypasses entirely, so it must be set explicitly here.
         tmIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
-        tmIl.Append(Instruction.Create(OpCodes.Callvirt, showRef));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4, 1360));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4, 1000));
+        tmIl.Append(Instruction.Create(OpCodes.Newobj, pointCtorRef));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, setLocationRef));
+        // Show(null) -- FormGenericNotification's own override (topmost SetWindowPos/ShowWindow),
+        // not the plain inherited Control.Show() (no owner needed, null is valid).
+        tmIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Ldnull));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, notifShowRef));
         tmIl.Append(Instruction.Create(OpCodes.Ret));
 
         // --- Step 2: insert at the very top of formMain.OnShown (same safe insertion point used
