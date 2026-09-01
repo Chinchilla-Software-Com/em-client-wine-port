@@ -672,23 +672,60 @@ one already exists from `OnShown` #1's blank pre-content call) was found to be r
 pattern but **directly ruled out** as the cause of the blank period, precisely because the correct
 bitmap already reaches the window so early.
 
-**Freshest, most actionable lead (not yet investigated) -- resume here next:** given content
-reliably appears within ~33-67ms of `Hide()` specifically (not of the timer merely ticking, and not
-of elapsed time as such), the next concrete thing worth isolating is *which specific Win32-level
-side effect of `Hide()`'s Visible→Disappearing branch* is the trigger. Candidates directly visible
-in `Hide()`'s own body: `timer.Interval = 25;` (changing an already-running `Timer`'s interval) and
-`timer.Start()` (re-arming an already-started `Timer`, i.e. a native `SetTimer`/`KillTimer`+
-`SetTimer` call even though the timer was technically already running) -- either could plausibly be
-the specific native call that "kicks" Wine/the X11 compositor into finally compositing already-
-correct, already-queued content, in a way that six seconds of the timer sitting idle at a *long*
-interval apparently doesn't. Testable directly: patch a no-op `timer.Interval = timer.Interval;`
-and/or `timer.Stop(); timer.Start();` into `timer_OnTimer`'s Visible-branch (i.e. partway through
-the blank hold, independent of an actual `Hide()` call) and see whether that alone unsticks the
-display -- a much narrower, more mechanistic test than anything tried in rounds 1-7's
-burst/silent-wait/no-fading attempts, made newly plausible by how precisely `Hide()` itself is
-now implicated.
+## Tenth round: the Timer re-arm alone unsticks the avatar (not the text) -- the icon and text
+genuinely take different paths to the screen, confirmed directly
 
-`emClient_win_8_x64` currently has the Stage 8 fix + full `--patch-diag` instrumentation (including
-wall-clock logging) deployed, from this session's live testing. Reverting to a clean Stage 8 build
-(fix only, no diagnostic logging) for normal use is a pending task, not yet done as of this
-writing.
+Built `--patch-notification-timer-kick` to isolate the Timer re-arm from everything else `Hide()`
+does. It forces the Visible-hold timer to fire quickly (2s instead of the real `timeToStay`) via
+an override write right after `OnShown`'s own `timer.Interval = timeToStay;`; the first time
+`timer_OnTimer`'s Visible-branch would normally call `Hide()`, it's redirected (by swapping just
+that one call instruction's operand, not restructuring control flow) to a new
+`__diagKickOrHide()` method that, on its first invocation, *only* re-arms the timer (`timer.
+Interval = timeToStay; timer.Start();` -- the same Win32-level `SetTimer` re-arm `Hide()` itself
+does) and returns -- no state change, no `alphaIncrement`, no `Opacity` change, no `Invalidate()`.
+The second invocation (the real `timeToStay` later) calls `Hide()` as normal.
+
+Two recording attempts were lost to process/coordination issues before a clean one landed: an
+`ffmpeg` file corrupted on stop (external `timeout` killing the process before the mp4 trailer/
+moov atom could be written -- fixed by using `-t <duration>` as ffmpeg's own flag instead of an
+external `timeout` wrapper, which finalizes the container properly), and one recording that
+completed before the user had a chance to trigger the notification (needed a longer window and
+tighter go/trigger coordination).
+
+**Result, frame-precise, from the successful recording:** the kick tick was logged at
+`15:39:19.578`. Frame 1067 (wall ~15:39:19.63) is still fully blank. **Frames 1068-1069 (wall
+~15:39:19.65-19.69, ~70-110ms after the kick) show the avatar/icon rendering** -- with no `Hide()`
+call, no state change, and no opacity change anywhere in the code path that produced it. The
+recording continued for another ~4.5 seconds (up to frame 1199, wall ~15:39:24.05, still ~1.5s
+before the real `Hide()` at `15:39:25.582`) and **the text never appeared in that window** --
+still just the avatar, confirmed by direct visual inspection of the cropped notification region
+across multiple frames. The user's own live observation matched exactly: "a very slight change in
+opacity just a frame or so before the image, then text appeared [in the previous, unmodified
+round]... this time the image appeared much earlier."
+
+**This is decisive: the Timer re-arm alone is sufficient to unstick the avatar/icon, but not the
+text.** It directly confirms the "Not yet tried" item from earlier in this document (the avatar
+and text may take different paths to the screen) -- no longer a guess, now observed directly at
+frame level with a controlled experiment that separates the two. The remaining difference between
+the kick (avatar unsticks, text doesn't) and a real `Hide()` (both unstick) is state -> 
+`Disappearing`, `alphaIncrement` becoming non-zero, and -- notably -- the fade-out ticks that
+follow real `Hide()` each call `Invalidate()` explicitly (`timer_OnTimer`'s opacity-stepping
+branch: `base.Opacity += alphaIncrement; updateLayeredBackground(refreshBitmap: false);
+Invalidate();`), which nothing in the idle Visible-hold or the kick path ever does. `Invalidate()`
+forcing a genuine `WM_PAINT` dispatch on the main form is the strongest remaining candidate for
+what specifically unsticks *text*, since the avatar (blitted directly into the bitmap during
+`updateBackgroundBitmap()`, independent of `WM_PAINT`) apparently doesn't need it.
+
+**Freshest, most actionable lead -- resume here next:** repeat the same kick-test pattern, but
+have the "kick" (fired at 2s, no state/opacity change) call `Invalidate()` a few times (or once)
+instead of / in addition to the timer re-arm, and check by recording whether *text* now also
+appears early. If it does, that pins the text-specific trigger to `Invalidate()`/`WM_PAINT`
+specifically, separate from whatever the timer re-arm does for the avatar -- and gives a real,
+narrow, two-part fix shape: something that forces a repaint (for text) plus something that
+re-arms/kicks the timer (for the avatar), inserted right when a notification's real content is
+set, instead of waiting six seconds for `Hide()` to incidentally do both.
+
+`emClient_win_8_x64` currently has the timer-kick test build (Stage 8 fix + full `--patch-diag`
+instrumentation + the timer-kick experiment) deployed, from this session's live testing.
+Reverting to a clean Stage 8 build (fix only, no diagnostic/experimental logic) for normal use is
+a pending task, not yet done as of this writing.
