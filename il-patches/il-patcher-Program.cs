@@ -143,6 +143,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-suppress-self-paint")
     return RunPatchNotificationSuppressSelfPaint(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-refresh-on-content-change")
+{
+    return RunPatchNotificationRefreshOnContentChange(args);
+}
+
 if (args.Length > 0 && args[0] == "--version")
 {
     return RunVersion(args);
@@ -1092,12 +1097,34 @@ static int RunPatchAutoTestNotification(string[] args)
             Console.Error.WriteLine($"FAIL: expected {notifFormType}'s base type to be FormGenericNotification, got {genericNotifType?.FullName}");
             return 1;
         }
-        var setTitleDef = genericNotifType.Methods.FirstOrDefault(m => m.Name == "set_Title");
-        var setContentDef = genericNotifType.Methods.FirstOrDefault(m => m.Name == "set_Content");
-        if (setTitleDef is null) { Console.Error.WriteLine("FAIL: FormGenericNotification missing set_Title"); return 1; }
-        if (setContentDef is null) { Console.Error.WriteLine("FAIL: FormGenericNotification missing set_Content"); return 1; }
-        var setTitleRef = module.ImportReference(setTitleDef);
-        var setContentRef = module.ImportReference(setContentDef);
+        // Set Title/Content via ShowNotification(Notification), not the direct property setters --
+        // a full decompile pass of the notification pipeline found the real trigger path
+        // (FormNotificationPresenter.ShowNotification) calls Show() FIRST, then
+        // FormGenericNotification.ShowNotification(notification), which is what actually sets
+        // Title/Content/Image (via virtual dispatch into FormMailNotification's own
+        // OnDisplayedNotificationChanged override). The original version of this trigger set Title/
+        // Content directly and called Show() last -- the opposite order, and bypassing
+        // ShowNotification() (and therefore --patch-notification-refresh-on-content-change's fix,
+        // which lives inside it) entirely. Route through the real method instead, using the
+        // NewMailsCount branch of OnDisplayedNotificationChanged (simpler to construct than a full
+        // fake IMail): a plain `new Notification(new NewMailsCount { Value = 3 }, null)`.
+        var notificationType = module.GetType("MailClient.UI.Notifications.Notification");
+        if (notificationType is null) { Console.Error.WriteLine("FAIL: type not found: MailClient.UI.Notifications.Notification"); return 1; }
+        var notificationCtorDef = notificationType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 2);
+        if (notificationCtorDef is null) { Console.Error.WriteLine("FAIL: Notification missing (object, IAccount) constructor"); return 1; }
+        var notificationCtorRef = module.ImportReference(notificationCtorDef);
+
+        var newMailsCountType = module.GetType("MailClient.UI.Notifications.NewMailsCount");
+        if (newMailsCountType is null) { Console.Error.WriteLine("FAIL: type not found: MailClient.UI.Notifications.NewMailsCount"); return 1; }
+        var newMailsCountCtorDef = newMailsCountType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0);
+        var newMailsCountSetValueDef = newMailsCountType.Methods.FirstOrDefault(m => m.Name == "set_Value");
+        if (newMailsCountCtorDef is null || newMailsCountSetValueDef is null) { Console.Error.WriteLine("FAIL: NewMailsCount missing .ctor()/set_Value"); return 1; }
+        var newMailsCountCtorRef = module.ImportReference(newMailsCountCtorDef);
+        var newMailsCountSetValueRef = module.ImportReference(newMailsCountSetValueDef);
+
+        var showNotificationDef = genericNotifType.Methods.FirstOrDefault(m => m.Name == "ShowNotification" && m.HasBody && m.Parameters.Count == 1);
+        if (showNotificationDef is null) { Console.Error.WriteLine("FAIL: FormGenericNotification missing ShowNotification(Notification)"); return 1; }
+        var showNotificationRef = module.ImportReference(showNotificationDef);
 
         // First attempt used the plain inherited Control.Show() -- decompiled/verified clean and
         // ran the right OnShown() code path, but live-tested: the form rendered at the default
@@ -1170,7 +1197,11 @@ static int RunPatchAutoTestNotification(string[] args)
         var tmBody = tickMethod.Body;
         tmBody.InitLocals = true;
         var notifLocal = new VariableDefinition(module.ImportReference(notifType));
+        var nmcLocal = new VariableDefinition(module.ImportReference(newMailsCountType));
+        var notificationLocal = new VariableDefinition(module.ImportReference(notificationType));
         tmBody.Variables.Add(notifLocal);
+        tmBody.Variables.Add(nmcLocal);
+        tmBody.Variables.Add(notificationLocal);
         var tmIl = tmBody.GetILProcessor();
 
         tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
@@ -1178,12 +1209,6 @@ static int RunPatchAutoTestNotification(string[] args)
         tmIl.Append(Instruction.Create(OpCodes.Callvirt, timerStopRef));
         tmIl.Append(Instruction.Create(OpCodes.Newobj, notifCtorRef));
         tmIl.Append(Instruction.Create(OpCodes.Stloc, notifLocal));
-        tmIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
-        tmIl.Append(Instruction.Create(OpCodes.Ldstr, "Test Sender"));
-        tmIl.Append(Instruction.Create(OpCodes.Callvirt, setTitleRef));
-        tmIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
-        tmIl.Append(Instruction.Create(OpCodes.Ldstr, "Test Subject Line " + DateTime.Now.ToString("HH:mm:ss")));
-        tmIl.Append(Instruction.Create(OpCodes.Callvirt, setContentRef));
         // Location = new Point(100, 100) -- deliberately top-LEFT, not the real bottom-right spot
         // real notifications use. Moved here after discovering the bottom-right corner of this
         // 1680x1188 test screen also happens to be where the terminal's own inline image-preview
@@ -1198,11 +1223,29 @@ static int RunPatchAutoTestNotification(string[] args)
         tmIl.Append(Instruction.Create(OpCodes.Ldc_I4, 100));
         tmIl.Append(Instruction.Create(OpCodes.Newobj, pointCtorRef));
         tmIl.Append(Instruction.Create(OpCodes.Callvirt, setLocationRef));
-        // Show(null) -- FormGenericNotification's own override (topmost SetWindowPos/ShowWindow),
-        // not the plain inherited Control.Show() (no owner needed, null is valid).
+        // Show(null) FIRST, while still blank -- matches the real trigger order found by the
+        // decompile pass (FormNotificationPresenter calls Show() before ShowNotification()).
+        // FormGenericNotification's own override (topmost SetWindowPos/ShowWindow), not the plain
+        // inherited Control.Show() (no owner needed, null is valid).
         tmIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
         tmIl.Append(Instruction.Create(OpCodes.Ldnull));
         tmIl.Append(Instruction.Create(OpCodes.Callvirt, notifShowRef));
+        // THEN ShowNotification(new Notification(new NewMailsCount { Value = 3 }, null)) -- sets
+        // Title/Content/Image via the real virtual OnDisplayedNotificationChanged dispatch, and
+        // (once --patch-notification-refresh-on-content-change is layered on top of this) exercises
+        // the actual fixed code path, not a synthetic shortcut around it.
+        tmIl.Append(Instruction.Create(OpCodes.Newobj, newMailsCountCtorRef));
+        tmIl.Append(Instruction.Create(OpCodes.Stloc, nmcLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Ldloc, nmcLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4_3));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, newMailsCountSetValueRef));
+        tmIl.Append(Instruction.Create(OpCodes.Ldloc, nmcLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Ldnull));
+        tmIl.Append(Instruction.Create(OpCodes.Newobj, notificationCtorRef));
+        tmIl.Append(Instruction.Create(OpCodes.Stloc, notificationLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Ldloc, notificationLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, showNotificationRef));
         tmIl.Append(Instruction.Create(OpCodes.Ret));
 
         // --- Step 2: insert at the very top of formMain.OnShown (same safe insertion point used
@@ -5104,6 +5147,155 @@ static int RunPatchNotificationSuppressSelfPaint(string[] args)
         // Operand (the branch target) is untouched -- same instruction, now reached unconditionally.
 
         Console.WriteLine($"OK   {fileName}: {targetType}::OnPaintBackground -- the `if (backgroundBitmap != null) {{ draw background copy + OnPaintTitle + OnPaintContent onto `this`'s own DC }}` block is now unconditionally skipped at real runtime (DesignMode early-return above it is untouched), since layeredWindow's own blit (see --patch-notification-text-in-bitmap) already reliably provides all of it");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-refresh-on-content-change <input-dir> <output-dir>
+//
+// A structurally different fix from every prior attempt in this investigation (six-iteration
+// Timer-sustain family, then the two-part "separate rendering path" pivot, both dead ends -- see
+// reports/notification-empty-until-fade-findings.md's thirteenth/fourteenth rounds) -- this one is
+// grounded in an actual discovered ordering bug, found by a full systematic decompile pass of the
+// whole notification pipeline (not another Wine-compositor-timing guess).
+//
+// The real trigger path (`FormNotificationPresenter.ShowNotification`) calls
+// `formGenericNotification.Show()` FIRST (while the form is still blank -- this is what starts the
+// Hidden->Appearing fade timer and builds the very first backgroundBitmap, with empty title/
+// content), and only THEN calls `formGenericNotification.ShowNotification(notification)`, which is
+// what actually sets Title/Content/Image (via virtual dispatch into
+// `FormMailNotification.OnDisplayedNotificationChanged`, called from
+// `FormGenericNotification.ShowNotification` itself). The `--patch-auto-test-notification` trigger
+// did the opposite (set Title/Content, then Show()) -- a real, consequential difference, not just
+// a cosmetic one: it means every earlier live test reproduced the bug, but via a different
+// mechanism shape than a real notification actually takes.
+//
+// The actual gap: neither the `Title` setter (`Text = (title = value);`, no repaint side effect)
+// nor the `Content` setter (`if (content != value) { content = value; if (autoHeight)
+// setAutoHeight(); }`, and `FormMailNotification`'s constructor sets `AutoHeight = false`, making
+// this a no-op too) ever triggers a fresh rebuild-and-blit through the reliable `layeredWindow`
+// path. The `Image` setter is the only one with any effect at all (`updateBitmapPending = true;`),
+// and that flag is only ever read inside `this` form's OWN `OnPaintBackground` -- the exact
+// mechanism this whole investigation has shown to be unreliable under Wine without a genuine,
+// already-ticking alpha change. So on the real path, nothing forces `layeredWindow` -- confirmed
+// via full decompile to be a genuine, always-forced native `UpdateLayeredWindow` P/Invoke call,
+// the reliable half of this whole story -- to ever receive a bitmap rebuilt with the real title/
+// content. The only way content has ever reached the screen at all is `this` form's own paint
+// cycle happening to fire on its own, which is exactly the unreliable mechanism previously chased.
+//
+// Fix: `FormGenericNotification.ShowNotification(Notification)` already calls
+// `OnDisplayedNotificationChanged(EventArgs.Empty)` (virtual -- this is what sets Title/Content/
+// Image on the real `FormMailNotification` subclass) before `Reshow()`/`PerformLayout()`/
+// `Invalidate()`. Insert `updateLayeredBackground(refreshBitmap: true)` immediately after that
+// call returns -- forcing an immediate, genuine rebuild-and-blit through the already-reliable
+// `layeredWindow` path with the now-correct content, independent of whether `this` form's own
+// paint pipeline ever manages to fire. `ShowNotification` has no branches or exception handlers of
+// its own (straight-line code), so this is a plain "capture anchor once, insert after it, verify
+// it isn't itself a branch target" insertion -- no lesson-3 handler-boundary concerns here.
+static int RunPatchNotificationRefreshOnContentChange(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-refresh-on-content-change <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var showNotificationMethod = type.Methods.FirstOrDefault(m => m.Name == "ShowNotification" && m.HasBody && m.Parameters.Count == 1);
+        if (showNotificationMethod is null) { Console.Error.WriteLine("FAIL: ShowNotification(Notification) not found"); return 1; }
+        var onDisplayedNotificationChangedMethod = type.Methods.FirstOrDefault(m => m.Name == "OnDisplayedNotificationChanged" && m.HasBody);
+        if (onDisplayedNotificationChangedMethod is null) { Console.Error.WriteLine("FAIL: OnDisplayedNotificationChanged(EventArgs) not found"); return 1; }
+
+        var updateLayeredBackgroundMethod = type.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground" && m.HasBody) ??
+            type.BaseType?.Resolve()?.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground");
+        if (updateLayeredBackgroundMethod is null) { Console.Error.WriteLine("FAIL: updateLayeredBackground(bool) not found on type or base type"); return 1; }
+        var updateLayeredBackgroundRef = module.ImportReference(updateLayeredBackgroundMethod);
+
+        var body = showNotificationMethod.Body;
+        body.SimplifyMacros();
+        var il = body.GetILProcessor();
+        var instrs = body.Instructions;
+
+        Instruction? anchor = null;
+        int matchCount = 0;
+        for (int i = 0; i < instrs.Count; i++)
+        {
+            if ((instrs[i].OpCode == OpCodes.Call || instrs[i].OpCode == OpCodes.Callvirt) &&
+                instrs[i].Operand is MethodReference mr && mr.Name == "OnDisplayedNotificationChanged")
+            {
+                anchor = instrs[i];
+                matchCount++;
+            }
+        }
+        if (matchCount != 1) { Console.Error.WriteLine($"FAIL: expected exactly 1 OnDisplayedNotificationChanged(EventArgs) call in ShowNotification, found {matchCount} -- method shape changed, review needed"); return 1; }
+
+        foreach (var instr in instrs)
+        {
+            if (instr.Operand == anchor)
+            {
+                Console.Error.WriteLine("FAIL: insertion anchor is itself a branch target -- would need retargeting, review needed");
+                return 1;
+            }
+        }
+        foreach (var handler in body.ExceptionHandlers)
+        {
+            if (handler.TryStart == anchor || handler.TryEnd == anchor || handler.HandlerStart == anchor || handler.HandlerEnd == anchor)
+            {
+                Console.Error.WriteLine("FAIL: insertion anchor is an exception-handler region boundary -- review needed");
+                return 1;
+            }
+        }
+
+        var insertAfter = anchor!;
+        void Emit(params Instruction[] toEmit) { foreach (var i in toEmit) { il.InsertAfter(insertAfter, i); insertAfter = i; } }
+        Emit(
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldc_I4_1),
+            Instruction.Create(OpCodes.Call, updateLayeredBackgroundRef)
+        );
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::ShowNotification -- now calls updateLayeredBackground(refreshBitmap: true) immediately after OnDisplayedNotificationChanged() sets the real Title/Content/Image, forcing a fresh rebuild-and-blit through the already-reliable layeredWindow path instead of relying on `this` form's own paint cycle to ever pick up the new content");
         patched = true;
 
         module.Write(destPath);
