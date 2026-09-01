@@ -842,6 +842,53 @@ leaving it at whatever the initial construction value was). A test that flips `s
 `Visible` while leaving `alphaIncrement` at its small non-zero fade value would separate these
 two remaining candidates cleanly.
 
+## Twelfth round: `alphaIncrement`, not `state`, is the gate -- text survives `state == Visible`
+for 100ms+ as long as ticks keep running
+
+Directly prompted by the user's question about whether the notification could just be held in
+"whatever state it's in right before text hides" for the whole display duration, rather than
+chasing the exact Wine mechanism further. Before building the test, walked through the risk with
+the user: `OnMouseEnter` has `if (reShowOnMouseOver && ... && state == Disappearing) { Show(); }`,
+and `Hide()`'s own switch treats `Disappearing` as a no-op case -- so holding `state ==
+Disappearing` for the whole hold would risk a hover-triggered re-fade and break click-to-dismiss.
+Holding `state == Visible` instead (the normal, side-effect-free value) would avoid both, *if*
+`alphaIncrement` turns out to be the real gate rather than `state` itself. The user also separately
+noted the animation itself isn't sacred -- a "just show it at full opacity" version with no visible
+fade would be perfectly acceptable if that's what ends up working.
+
+`--patch-notification-state-vs-alpha` ran the same real-pumped-fade opening as round eleven
+(state=Disappearing, alphaIncrement=-0.05f, ~4 genuine ticks), then -- unlike every prior abort,
+which reset `state` and `alphaIncrement` together -- flipped `state` back to `Visible` while
+*deliberately leaving* `alphaIncrement` at a small non-zero value (`-0.01f`) for a second pumped
+window of ~3 more genuine ticks, only doing the real cleanup (`alphaIncrement = 0`, `Opacity =
+1.0` exactly) at the very end.
+
+**Reconstructing the precise timeline from the diag log's wall-clock ticks (not just frame
+counting, which is too coarse at this resolution) gives an unambiguous result:** `state` flipped
+back to `Visible` at wall `19:15:58.224`, starting phase B's three real ticks (through `58.300`).
+**Frame 124 (wall `58.338`, ~114ms after `state` became `Visible`) still shows full text** --
+confirmed by direct pixel inspection, well past the ~33-70ms compositor-response lag seen
+everywhere else in this investigation, ruling out "just hasn't caught up yet" as an explanation.
+Cleanup (`alphaIncrement -> 0` exactly) ran immediately after phase B ended (~`58.300`-`58.305`).
+**Frame 126 (wall `58.405`, ~100ms after cleanup) is blank again.** Text survived `state ==
+Visible` for over 100ms as long as `alphaIncrement` stayed non-zero and real ticks kept running,
+and only reverted once `alphaIncrement` actually reached exactly `0`.
+
+**This is the clearest, most actionable finding of the investigation: `alphaIncrement` remaining
+non-zero (i.e. real ticks actively running, whatever their sign or magnitude) is the gate --
+`state` itself is not.** This directly answers the user's strategic question: a fix can safely
+hold `state == Visible` (avoiding the `OnMouseEnter`/`Hide()` side-effect risks entirely) while
+keeping a tiny persistent non-zero `alphaIncrement` for the whole display hold, periodically
+nudging `Opacity` back so it doesn't visibly drift toward 0 over the ~6s (or however long
+`NotificationsHideTimeout` is configured) -- rather than needing to hold the riskier
+`Disappearing` state, and without needing to identify the exact underlying Wine/compositor
+mechanism at all. Given the user's explicit openness to a no-visible-animation version, the
+simplest concrete fix shape worth prototyping next: keep the timer ticking at its normal 25ms
+cadence for the *entire* display hold (not just during Appearing/Disappearing) with a minuscule
+non-zero `alphaIncrement` that gets corrected back toward 1.0 every tick (net-zero drift, but
+never letting the value or the ticking itself go static), replacing the current design of a long,
+inert `timeToStay`-interval wait.
+
 Coordination notes for future rounds: (1) a screen-recording test needs the recording started
 *after* the user confirms the test email is sent, not before -- mail delivery can take up to a
 minute, and several attempts this round were wasted on fixed-duration recordings that expired
