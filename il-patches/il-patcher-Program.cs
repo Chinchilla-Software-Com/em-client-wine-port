@@ -3998,38 +3998,53 @@ static int RunPatchNotificationKeepAliveV5(string[] args)
             );
         }
 
-        // --- __keepAliveTick(bool refreshBitmap): if (state == Visible && elapsed >= timeToStay)
-        // { Hide(); } else { alphaIncrement = -alphaIncrement; updateLayeredBackground(refreshBitmap); }
+        // --- __keepAliveTick(bool refreshBitmap):
+        //   if (state != Visible) { updateLayeredBackground(refreshBitmap); return; }  // real
+        //                                     Hide()-driven fade in progress -- don't touch alpha
+        //   if (elapsed >= timeToStay) { Hide(); return; }
+        //   alphaIncrement = -alphaIncrement;
+        //   updateLayeredBackground(refreshBitmap);
+        //
+        // The `state != Visible` guard is essential and was missing from the first version of
+        // this patch (caught live, not by any static check): once the real Hide() runs, state
+        // becomes Disappearing, but this wrapper's two call sites in timer_OnTimer keep firing on
+        // every tick of the *real* fade-out too. Without the guard, the sign-flip logic ran
+        // unconditionally regardless of state -- flipping alphaIncrement's sign on every real
+        // fade-out tick as well, turning what should be a monotonic decrease to 0 into another
+        // oscillation that never reaches <= 0, so setFormHidden() never ran. Live symptom: visible
+        // flicker and the notification never closing. The guard restores the real fade-out's
+        // original, unmodified behavior once Hide() has actually been called.
         var tickWrapper = new MethodDefinition("__keepAliveTick", MethodAttributes.Private,
             module.TypeSystem.Void);
         tickWrapper.Parameters.Add(new ParameterDefinition("refreshBitmap", ParameterAttributes.None, module.TypeSystem.Boolean));
         type.Methods.Add(tickWrapper);
         var twIl = tickWrapper.Body.GetILProcessor();
-        var elseLabel = Instruction.Create(OpCodes.Ldarg_0);
+        var doUpdate = Instruction.Create(OpCodes.Ldarg_0);
+        var doFlip = Instruction.Create(OpCodes.Ldarg_0);
         var ret = Instruction.Create(OpCodes.Ret);
 
         twIl.Append(Instruction.Create(OpCodes.Ldarg_0));
         twIl.Append(Instruction.Create(OpCodes.Ldfld, stateField));
         twIl.Append(Instruction.Create(OpCodes.Ldc_I4_2));
-        twIl.Append(Instruction.Create(OpCodes.Bne_Un, elseLabel));
+        twIl.Append(Instruction.Create(OpCodes.Bne_Un, doUpdate)); // state != Visible -> skip straight to the plain update, no hide-check, no flip
         twIl.Append(Instruction.Create(OpCodes.Call, tickCountGetterRef));
         twIl.Append(Instruction.Create(OpCodes.Ldarg_0));
         twIl.Append(Instruction.Create(OpCodes.Ldfld, startTickField));
         twIl.Append(Instruction.Create(OpCodes.Sub));
         twIl.Append(Instruction.Create(OpCodes.Ldarg_0));
         twIl.Append(Instruction.Create(OpCodes.Ldfld, timeToStayField));
-        twIl.Append(Instruction.Create(OpCodes.Blt, elseLabel));
+        twIl.Append(Instruction.Create(OpCodes.Blt, doFlip));
         twIl.Append(Instruction.Create(OpCodes.Ldarg_0));
         twIl.Append(Instruction.Create(OpCodes.Call, module.ImportReference(hideMethod)));
         twIl.Append(Instruction.Create(OpCodes.Br, ret));
-        twIl.Append(elseLabel); // Ldarg_0, reused as the else-branch's target push
+        twIl.Append(doFlip); // Ldarg_0, reused as this block's target push
         // alphaIncrement = -alphaIncrement; (flips the sign for the NEXT tick's `Opacity +=
         // alphaIncrement`, which already ran with the OLD sign before this wrapper was called)
         twIl.Append(Instruction.Create(OpCodes.Ldarg_0));
         twIl.Append(Instruction.Create(OpCodes.Ldfld, alphaIncrementField));
         twIl.Append(Instruction.Create(OpCodes.Neg));
         twIl.Append(Instruction.Create(OpCodes.Stfld, alphaIncrementField));
-        twIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        twIl.Append(doUpdate); // Ldarg_0, reused as this block's target push (also the not-Visible fallthrough target)
         twIl.Append(Instruction.Create(OpCodes.Ldarg_1));
         twIl.Append(Instruction.Create(OpCodes.Call, updateLayeredBackgroundRef));
         twIl.Append(ret);
