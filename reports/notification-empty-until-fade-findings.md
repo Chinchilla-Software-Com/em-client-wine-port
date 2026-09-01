@@ -1194,12 +1194,64 @@ combine it with these):
    300ms for as long as the notification is in its `Visible` hold, since native blits stopping is
    what causes the compositor to stop honoring previously-shown content.
 
-**Not yet done:** live confirmation against a genuine incoming real email (all testing so far this
-round used the auto-test-notification trigger's synthetic `NewMailsCount` path, which does
-exercise the real `ShowNotification` method but not the full real-mail trigger chain through
-`MailNotificationHandler`/`FormNotificationPresenter`); folding into `releases/<version>/deploy.sh`
-as a new stage; and removing `--patch-diag`'s instrumentation from the final deployed build (it's
-currently layered on top for observability during testing, not meant for normal use). The
-`__periodicReblitTimer` is deliberately never stopped/disposed (it just no-ops once `state !=
-Visible`) -- accepted as negligible overhead (one 300ms timer per app session, since the form
-instance is reused) rather than adding complexity to tear it down on `Hide()`/disposal.
+**Not yet done (at the time this section was first written):** live confirmation against a genuine
+incoming real email; folding into `releases/<version>/deploy.sh` as a new stage; removing
+`--patch-diag`'s instrumentation from the final deployed build. The `__periodicReblitTimer` is
+deliberately never stopped/disposed (it just no-ops once `state != Visible`) -- accepted as
+negligible overhead (one 300ms timer per app session, since the form instance is reused) rather
+than adding complexity to tear it down on `Hide()`/disposal.
+
+## Seventeenth round: real-email confirmation finds a real cosmetic bug (ghost text); fixed
+
+Tested the three-patch chain against a genuine incoming email (not just the synthetic trigger) for
+the first time. User confirmed live: "I saw the text come through" -- but also caught something
+the synthetic-trigger testing had missed: "The formatting was wrong... I think I briefly saw the
+original text in the background appear near the end." Frame extraction confirmed exactly one
+frame, right at the `Hide()`-triggered fade-out transition, showing the correct text from
+`layeredWindow`'s blit *and* a fainter, ~9px-offset duplicate behind it -- a real ghosting defect,
+not a false alarm.
+
+**Root cause:** `this` form's own `OnPaintBackground` -- deliberately left untouched by the
+sixteenth round's fix, since `--patch-notification-suppress-self-paint` (which disables it
+entirely) was already a confirmed dead end -- still independently draws a redundant copy of
+background+title+content directly onto `this`'s own device context. Per this whole investigation's
+central finding, `this`'s own paint only succeeds while real ticks are actively running, which is
+exactly what's happening right at the `Disappearing` fade-out burst -- so it transiently succeeds
+right at that moment, producing a second, duplicate text render. The ~9px offset comes from the
+`ShadowVisible` `TranslateTransform(9, 9)` applied when building the padded `backgroundBitmap` (to
+leave room for the drop-shadow border) -- `this`'s own unshadowed draw doesn't replicate that
+offset, so its copy lands slightly up-and-left of `layeredWindow`'s.
+
+Retried `--patch-notification-suppress-self-paint` once more, this time combined with
+`periodic-reblit` (not present during the fourteenth round's attempt), on the theory that a
+constantly-refreshed `layeredWindow` surface might avoid the earlier "broken image" regression --
+it didn't: the same red-X glyph reappeared, now spanning a larger area. **Confirmed for the second
+time that disabling `this`'s paint entirely does not produce a clean transparent pass-through under
+Wine, regardless of what else is combined with it.**
+
+**Fix -- `--patch-notification-suppress-self-text-only`:** narrower than full suppression. Leaves
+`this`'s own background/avatar `DrawImage` call fully intact (so `this`'s own surface is still
+genuinely painted with *something* every frame, avoiding whatever unrealized-surface state causes
+the red-X glyph) and removes only the two `OnPaintTitle(e)`/`OnPaintContent(e)` call sites
+immediately after it -- the first instruction-*removal* patch in this file (every prior patch only
+inserted or flipped an opcode). Straight-line code, no branches into the middle of the removed
+sequence, verified via the same branch-target/handler-boundary checks used for every insertion.
+
+**Live-tested (four patches together: `text-in-bitmap` + `refresh-on-content-change` +
+`periodic-reblit` + `suppress-self-text-only`) via the automated loop and confirmed via extracted
+frames at 10fps through the entire fade-out transition: no ghosting at any frame, text stays clean
+and singular throughout, and no broken-image regression anywhere.** This is now believed to be a
+complete fix for both the original bug and the cosmetic side effect the real-email test surfaced.
+
+**Unrelated environment note:** mid-round, the whole X session's process group (including
+MailClient) was killed by what `dmesg` showed as a `systemd-logind`/`systemd-timesyncd`
+crash-and-restart -- an infrastructure-level hiccup, not an app or patch bug (no `bug.*.txt` crash
+report was written, consistent with the whole session being interrupted rather than the app
+crashing on its own). This is likely related to the resolution changes and screensaver oddity
+documented in the fifteenth round -- worth flagging if this environment continues to be unstable
+across sessions. Triggered the DB-repair-on-next-launch behavior as expected from an unclean
+termination; user re-opened and let it complete before continuing.
+
+**Still not done:** folding the final four-patch chain into `releases/<version>/deploy.sh` as a new
+stage, and producing a clean deploy build without `--patch-diag`'s instrumentation layered on top
+(currently still present for observability -- fine for continued testing, not for normal use).
