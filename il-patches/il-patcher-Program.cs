@@ -68,6 +68,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-click-resubscribe")
     return RunPatchNotificationClickResubscribe(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-timer-kick")
+{
+    return RunPatchNotificationTimerKick(args);
+}
+
 if (args.Length > 0 && args[0] == "--version")
 {
     return RunVersion(args);
@@ -1808,6 +1813,190 @@ static int RunPatchNotificationClickResubscribe(string[] args)
         il.InsertBefore(anchor, Instruction.Create(OpCodes.Callvirt, removeClickRef));
 
         Console.WriteLine($"OK   {fileName}: inserted `layeredWindow.Click -= layeredWindow_Click;` immediately before the existing += in {targetType}::OnShown");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-timer-kick <input-dir> <output-dir>
+//
+// Ninth-round follow-up test (reports/notification-empty-until-fade-findings.md): a
+// wall-clock-synchronized recording confirmed content appears within ~33-67ms of Hide() actually
+// running, after a full ~6s of confirmed-blank display despite the correct bitmap reaching the
+// window within ~30ms of the notification appearing. Hide()'s Visible->Disappearing branch does
+// `timer.Interval = 25; timer.Start();` on an *already-running* Timer -- under the hood, a native
+// SetTimer call even though the timer never stopped. Does that re-arm alone unstick the
+// compositor, independent of everything else Hide() does (state -> Disappearing, alphaIncrement,
+// starting a real opacity fade)?
+//
+// Test: force the Visible-hold auto-hide timer to fire quickly (2s instead of the real
+// timeToStay) via an override write right after OnShown's own `timer.Interval = timeToStay;` in
+// its Appearing/Visible case. The first time timer_OnTimer's Visible-branch would normally call
+// Hide(), it's redirected (by swapping that one call instruction's operand, not by restructuring
+// any control flow) to a new __diagKickOrHide() method instead: the first call just re-arms the
+// timer (Interval = the real timeToStay field, Start()) and returns -- no state change, no
+// Opacity change, nothing else Hide() would do; the second call (the real timeToStay later) calls
+// Hide() as normal, via a new private bool field tracking which call this is. If content appears
+// right around the first (kick-only) tick, the timer re-arm itself is the trigger; if it stays
+// blank until the second tick's real Hide(), the re-arm alone isn't sufficient.
+static int RunPatchNotificationTimerKick(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-timer-kick <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+    const int kickAfterMs = 2000;
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var onShownMethod = type.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody);
+        var timerMethod = type.Methods.FirstOrDefault(m => m.Name == "timer_OnTimer" && m.HasBody);
+        var hideMethod = type.Methods.FirstOrDefault(m => m.Name == "Hide" && m.HasBody && m.Parameters.Count == 0);
+        if (onShownMethod is null) { Console.Error.WriteLine("FAIL: OnShown not found"); return 1; }
+        if (timerMethod is null) { Console.Error.WriteLine("FAIL: timer_OnTimer not found"); return 1; }
+        if (hideMethod is null) { Console.Error.WriteLine("FAIL: Hide() not found"); return 1; }
+
+        var timerField = type.Fields.FirstOrDefault(f => f.Name == "timer");
+        var timeToStayField = type.Fields.FirstOrDefault(f => f.Name == "timeToStay");
+        if (timerField is null) { Console.Error.WriteLine("FAIL: timer field not found"); return 1; }
+        if (timeToStayField is null) { Console.Error.WriteLine("FAIL: timeToStay field not found"); return 1; }
+
+        // Resolve Timer's set_Interval/Start from timerField's own FieldType, not via typeof()
+        // reflection -- System.Windows.Forms is an app-deployed assembly, same version-mismatch
+        // trap as CLAUDE.md's IL-patching lesson 5.
+        var timerType = timerField.FieldType.Resolve();
+        var setIntervalDef = timerType?.Methods.FirstOrDefault(m => m.Name == "set_Interval");
+        var startDef = timerType?.Methods.FirstOrDefault(m => m.Name == "Start" && m.Parameters.Count == 0);
+        if (setIntervalDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Timer.set_Interval from timer field's own FieldType"); return 1; }
+        if (startDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Timer.Start from timer field's own FieldType"); return 1; }
+        var setIntervalRef = module.ImportReference(setIntervalDef);
+        var startRef = module.ImportReference(startDef);
+
+        // --- Step 1: OnShown -- override the Visible-transition's `timer.Interval = timeToStay;`
+        // with a hardcoded short interval, right after the original call (leaving the original
+        // instructions untouched -- just adding a second write that wins).
+        {
+            var body = onShownMethod.Body;
+            body.SimplifyMacros();
+            var instrs = body.Instructions;
+            Instruction? anchor = null;
+            for (int idx = 1; idx < instrs.Count; idx++)
+            {
+                if ((instrs[idx].OpCode == OpCodes.Call || instrs[idx].OpCode == OpCodes.Callvirt) &&
+                    instrs[idx].Operand is MethodReference mr && mr.Name == "set_Interval" &&
+                    idx >= 1 && instrs[idx - 1].OpCode == OpCodes.Ldfld && instrs[idx - 1].Operand is FieldReference fr && fr.Name == "timeToStay")
+                {
+                    if (anchor is not null) { Console.Error.WriteLine("FAIL: more than one `timer.Interval = timeToStay;` found in OnShown -- method shape changed, review needed"); return 1; }
+                    anchor = instrs[idx];
+                }
+            }
+            if (anchor is null) { Console.Error.WriteLine("FAIL: couldn't find `timer.Interval = timeToStay;` in OnShown"); return 1; }
+
+            var il = body.GetILProcessor();
+            // Insert *after* anchor -- reverse order since each InsertAfter(anchor, x) lands
+            // immediately after anchor, so building forward means inserting the last instruction
+            // first (CLAUDE.md lesson 1's mirror image for InsertAfter instead of InsertBefore).
+            var call = Instruction.Create(OpCodes.Call, setIntervalRef);
+            var pushMs = Instruction.Create(OpCodes.Ldc_I4, kickAfterMs);
+            var pushTimer = Instruction.Create(OpCodes.Ldfld, timerField);
+            var pushThis = Instruction.Create(OpCodes.Ldarg_0);
+            il.InsertAfter(anchor, pushThis);
+            il.InsertAfter(pushThis, pushTimer);
+            il.InsertAfter(pushTimer, pushMs);
+            il.InsertAfter(pushMs, call);
+        }
+
+        // --- Step 2: add `private bool __diagTimerKicked;` field.
+        var kickedField = new FieldDefinition("__diagTimerKicked", FieldAttributes.Private, module.TypeSystem.Boolean);
+        type.Fields.Add(kickedField);
+
+        // --- Step 3: add `private void __diagKickOrHide() { if (!__diagTimerKicked) { ...
+        // re-arm ... } else { Hide(); } }`.
+        var kickMethod = new MethodDefinition("__diagKickOrHide", MethodAttributes.Private, module.TypeSystem.Void);
+        type.Methods.Add(kickMethod);
+        var kickBody = kickMethod.Body;
+        var kickIl = kickBody.GetILProcessor();
+        var elseLabel = Instruction.Create(OpCodes.Ldarg_0);
+        var ret = Instruction.Create(OpCodes.Ret);
+
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldfld, kickedField));
+        kickIl.Append(Instruction.Create(OpCodes.Brtrue, elseLabel));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldc_I4_1));
+        kickIl.Append(Instruction.Create(OpCodes.Stfld, kickedField));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldfld, timerField));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldfld, timeToStayField));
+        kickIl.Append(Instruction.Create(OpCodes.Call, setIntervalRef));
+        kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldfld, timerField));
+        kickIl.Append(Instruction.Create(OpCodes.Call, startRef));
+        kickIl.Append(Instruction.Create(OpCodes.Br, ret));
+        kickIl.Append(elseLabel); // Ldarg_0, reused as the else-branch's first instruction
+        kickIl.Append(Instruction.Create(OpCodes.Call, module.ImportReference(hideMethod)));
+        kickIl.Append(ret);
+
+        // --- Step 4: timer_OnTimer -- redirect the single `Hide()` call to `__diagKickOrHide()`
+        // by swapping just its operand (same calling shape: `call instance void
+        // FormGenericNotification::X()`), not restructuring any control flow.
+        {
+            var body = timerMethod.Body;
+            var instrs = body.Instructions;
+            int hideCallCount = 0;
+            foreach (var instr in instrs)
+            {
+                if ((instr.OpCode == OpCodes.Call || instr.OpCode == OpCodes.Callvirt) && instr.Operand is MethodReference mr && mr.Name == "Hide" && mr.Parameters.Count == 0)
+                {
+                    instr.Operand = kickMethod;
+                    hideCallCount++;
+                }
+            }
+            if (hideCallCount != 1) { Console.Error.WriteLine($"FAIL: expected exactly 1 Hide() call in timer_OnTimer, found {hideCallCount} -- method shape changed, review needed"); return 1; }
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- forced Visible-hold timer to {kickAfterMs}ms; {targetType}::timer_OnTimer -- first tick now re-arms via __diagKickOrHide() instead of calling Hide(), second tick calls Hide() as normal");
         patched = true;
 
         module.Write(destPath);
