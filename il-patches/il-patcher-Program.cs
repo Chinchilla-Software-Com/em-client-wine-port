@@ -85,7 +85,12 @@ if (args.Length > 0 && args[0] == "--patch-notification-timer-kick-state-flip")
 
 if (args.Length > 0 && args[0] == "--patch-notification-real-fade-abort")
 {
-    return RunPatchNotificationRealFadeAbort(args);
+    return RunPatchNotificationRealFadeAbort(args, abortOpacity: 1.0);
+}
+
+if (args.Length > 0 && args[0] == "--patch-notification-real-fade-abort-0999")
+{
+    return RunPatchNotificationRealFadeAbort(args, abortOpacity: 0.999);
 }
 
 if (args.Length > 0 && args[0] == "--version")
@@ -2100,11 +2105,19 @@ static int RunPatchNotificationTimerKick(string[] args, bool alsoInvalidate, boo
 // are what's needed, not any single field write in isolation. If it still doesn't, the trigger is
 // something tied to the fade actually completing (reaching Opacity 0 and calling
 // setFormHidden()), not merely being underway.
-static int RunPatchNotificationRealFadeAbort(string[] args)
+// Result: text DID render during the pumped real fade, and reverted to blank within ~35ms of the
+// abort's `Opacity = 1.0`. Wine's winex11.drv takes a genuinely different path depending on
+// whether the resolved alpha is *exactly* 255 (Opacity == 1.0) -- XChangeProperty for any other
+// value, XDeleteProperty specifically at exactly 1.0 (see round 9's reading of
+// X11DRV_SetLayeredWindowAttributes). The `abortOpacity` parameter (wired to
+// --patch-notification-real-fade-abort-0999, landing at 0.999 instead of exactly 1.0, state
+// still returns to Visible as before) tests whether avoiding that exact value keeps text
+// visible -- isolating the opacity-property code path from the state field itself.
+static int RunPatchNotificationRealFadeAbort(string[] args, double abortOpacity)
 {
     if (args.Length < 3)
     {
-        Console.Error.WriteLine("usage: il-patcher --patch-notification-real-fade-abort <input-dir> <output-dir>");
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-real-fade-abort[-0999] <input-dir> <output-dir>");
         return 2;
     }
 
@@ -2284,10 +2297,10 @@ static int RunPatchNotificationRealFadeAbort(string[] args)
             kickIl.Append(Instruction.Create(OpCodes.Call, threadSleepRef));
         }
 
-        // Abort: Opacity = 1.0; state = Visible; alphaIncrement = 0f; updateLayeredBackground(false);
-        // Invalidate(); timer.Interval = timeToStay; timer.Start();
+        // Abort: Opacity = abortOpacity; state = Visible; alphaIncrement = 0f;
+        // updateLayeredBackground(false); Invalidate(); timer.Interval = timeToStay; timer.Start();
         kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
-        kickIl.Append(Instruction.Create(OpCodes.Ldc_R8, 1.0));
+        kickIl.Append(Instruction.Create(OpCodes.Ldc_R8, abortOpacity));
         kickIl.Append(Instruction.Create(OpCodes.Call, setOpacityRef));
         kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
         kickIl.Append(Instruction.Create(OpCodes.Ldc_I4_2));
@@ -2329,7 +2342,7 @@ static int RunPatchNotificationRealFadeAbort(string[] args)
             if (hideCallCount != 1) { Console.Error.WriteLine($"FAIL: expected exactly 1 Hide() call in timer_OnTimer, found {hideCallCount} -- method shape changed, review needed"); return 1; }
         }
 
-        Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- forced Visible-hold timer to {kickAfterMs}ms; {targetType}::timer_OnTimer -- first tick now runs a real ~{pumpSteps * pumpStepMs}ms fade (state=Disappearing, real ticks pumped) then aborts back to Visible/Opacity=1.0, via __diagKickOrHide() instead of calling Hide(); second tick calls Hide() as normal");
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- forced Visible-hold timer to {kickAfterMs}ms; {targetType}::timer_OnTimer -- first tick now runs a real ~{pumpSteps * pumpStepMs}ms fade (state=Disappearing, real ticks pumped) then aborts back to Visible/Opacity={abortOpacity}, via __diagKickOrHide() instead of calling Hide(); second tick calls Hide() as normal");
         patched = true;
 
         module.Write(destPath);
