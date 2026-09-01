@@ -70,12 +70,17 @@ if (args.Length > 0 && args[0] == "--patch-notification-click-resubscribe")
 
 if (args.Length > 0 && args[0] == "--patch-notification-timer-kick")
 {
-    return RunPatchNotificationTimerKick(args, alsoInvalidate: false);
+    return RunPatchNotificationTimerKick(args, alsoInvalidate: false, alsoFlipState: false, kickAfterMs: 2000);
 }
 
 if (args.Length > 0 && args[0] == "--patch-notification-timer-kick-invalidate")
 {
-    return RunPatchNotificationTimerKick(args, alsoInvalidate: true);
+    return RunPatchNotificationTimerKick(args, alsoInvalidate: true, alsoFlipState: false, kickAfterMs: 2000);
+}
+
+if (args.Length > 0 && args[0] == "--patch-notification-timer-kick-state-flip")
+{
+    return RunPatchNotificationTimerKick(args, alsoInvalidate: false, alsoFlipState: true, kickAfterMs: 100);
 }
 
 if (args.Length > 0 && args[0] == "--version")
@@ -1859,12 +1864,23 @@ static int RunPatchNotificationClickResubscribe(string[] args)
 // `alsoInvalidate` variant (--patch-notification-timer-kick-invalidate) additionally calls
 // `this.Invalidate();` in the kick branch, testing whether forcing a genuine WM_PAINT dispatch --
 // something every real Hide()-driven fade tick does on each 25ms step, but the idle Visible-hold
-// and the plain kick never do -- is what specifically unsticks text.
-static int RunPatchNotificationTimerKick(string[] args, bool alsoInvalidate)
+// and the plain kick never do -- is what specifically unsticks text. Result: still no, text stays
+// blank right up to the real Hide().
+//
+// --patch-notification-timer-kick-state-flip (`alsoFlipState`) narrows further: does the `state`
+// field itself actually changing to Disappearing (even transiently, flipped straight back to
+// Visible in the same call, no real fade) unstick text, independent of Invalidate() (already
+// ruled out) and without an actual visible fade? Also uses a much shorter `kickAfterMs` (100ms
+// instead of 2000ms) -- prompted by the user's question about whether the avatar could render
+// close to immediately rather than after an arbitrary delay: since the kick unsticks the avatar
+// in ~70-110ms regardless of when it fires, firing it almost immediately after the notification
+// appears (instead of waiting) should make the avatar appear near-instantly instead of after a
+// multi-second wait, independent of whatever this round finds about text.
+static int RunPatchNotificationTimerKick(string[] args, bool alsoInvalidate, bool alsoFlipState, int kickAfterMs)
 {
     if (args.Length < 3)
     {
-        Console.Error.WriteLine($"usage: il-patcher --patch-notification-timer-kick{(alsoInvalidate ? "-invalidate" : "")} <input-dir> <output-dir>");
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-timer-kick[-invalidate|-state-flip] <input-dir> <output-dir>");
         return 2;
     }
 
@@ -1874,7 +1890,6 @@ static int RunPatchNotificationTimerKick(string[] args, bool alsoInvalidate)
 
     const string targetAssembly = "MailClient.dll";
     const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
-    const int kickAfterMs = 2000;
 
     var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
     bool patched = false;
@@ -1910,8 +1925,10 @@ static int RunPatchNotificationTimerKick(string[] args, bool alsoInvalidate)
 
         var timerField = type.Fields.FirstOrDefault(f => f.Name == "timer");
         var timeToStayField = type.Fields.FirstOrDefault(f => f.Name == "timeToStay");
+        var stateField = type.Fields.FirstOrDefault(f => f.Name == "state");
         if (timerField is null) { Console.Error.WriteLine("FAIL: timer field not found"); return 1; }
         if (timeToStayField is null) { Console.Error.WriteLine("FAIL: timeToStay field not found"); return 1; }
+        if (alsoFlipState && stateField is null) { Console.Error.WriteLine("FAIL: state field not found"); return 1; }
 
         // Resolve Timer's set_Interval/Start from timerField's own FieldType, not via typeof()
         // reflection -- System.Windows.Forms is an app-deployed assembly, same version-mismatch
@@ -2002,6 +2019,19 @@ static int RunPatchNotificationTimerKick(string[] args, bool alsoInvalidate)
         kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
         kickIl.Append(Instruction.Create(OpCodes.Ldfld, timerField));
         kickIl.Append(Instruction.Create(OpCodes.Call, startRef));
+        if (alsoFlipState)
+        {
+            // state = Disappearing; state = Visible; -- transiently flips the field and straight
+            // back, in the same call, with no real fade -- tests whether the field actually
+            // changing (even momentarily) is what unsticks text, independent of Invalidate()
+            // (already ruled out) and without ever letting Opacity move.
+            kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+            kickIl.Append(Instruction.Create(OpCodes.Ldc_I4_3));
+            kickIl.Append(Instruction.Create(OpCodes.Stfld, stateField));
+            kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+            kickIl.Append(Instruction.Create(OpCodes.Ldc_I4_2));
+            kickIl.Append(Instruction.Create(OpCodes.Stfld, stateField));
+        }
         if (alsoInvalidate)
         {
             kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
@@ -2030,7 +2060,7 @@ static int RunPatchNotificationTimerKick(string[] args, bool alsoInvalidate)
             if (hideCallCount != 1) { Console.Error.WriteLine($"FAIL: expected exactly 1 Hide() call in timer_OnTimer, found {hideCallCount} -- method shape changed, review needed"); return 1; }
         }
 
-        Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- forced Visible-hold timer to {kickAfterMs}ms; {targetType}::timer_OnTimer -- first tick now re-arms{(alsoInvalidate ? " + Invalidate()s" : "")} via __diagKickOrHide() instead of calling Hide(), second tick calls Hide() as normal");
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- forced Visible-hold timer to {kickAfterMs}ms; {targetType}::timer_OnTimer -- first tick now re-arms{(alsoFlipState ? " + flips state to Disappearing and back" : "")}{(alsoInvalidate ? " + Invalidate()s" : "")} via __diagKickOrHide() instead of calling Hide(), second tick calls Hide() as normal");
         patched = true;
 
         module.Write(destPath);
