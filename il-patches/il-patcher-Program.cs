@@ -5419,8 +5419,6 @@ static int RunPatchNotificationRefreshOnContentChange(string[] args)
 
         var showNotificationMethod = type.Methods.FirstOrDefault(m => m.Name == "ShowNotification" && m.HasBody && m.Parameters.Count == 1);
         if (showNotificationMethod is null) { Console.Error.WriteLine("FAIL: ShowNotification(Notification) not found"); return 1; }
-        var onDisplayedNotificationChangedMethod = type.Methods.FirstOrDefault(m => m.Name == "OnDisplayedNotificationChanged" && m.HasBody);
-        if (onDisplayedNotificationChangedMethod is null) { Console.Error.WriteLine("FAIL: OnDisplayedNotificationChanged(EventArgs) not found"); return 1; }
 
         var updateLayeredBackgroundMethod = type.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground" && m.HasBody) ??
             type.BaseType?.Resolve()?.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground");
@@ -5432,18 +5430,29 @@ static int RunPatchNotificationRefreshOnContentChange(string[] args)
         var il = body.GetILProcessor();
         var instrs = body.Instructions;
 
+        // Anchor on PerformLayout(), not OnDisplayedNotificationChanged() -- found the hard way via
+        // a real-Windows-screenshot comparison (supporting/notifications-working-example-from-
+        // windows-with-long-subject.png vs a live capture): content text rendered much closer to
+        // the box's left edge than the reference. FormGenericNotification.OnLayout calls
+        // doLayout(), which is what actually (re)computes headerRect/contentRect/imageRect for the
+        // CURRENT title/content/image -- and PerformLayout() is what triggers OnLayout(). The
+        // original anchor (right after OnDisplayedNotificationChanged()) ran BEFORE
+        // ShowNotification's own later PerformLayout() call, so the very first rebuilt bitmap used
+        // stale layout metrics from before the new avatar/content was accounted for. Anchoring
+        // after PerformLayout() instead means doLayout() has already run with the current content
+        // by the time the bitmap gets rebuilt.
         Instruction? anchor = null;
         int matchCount = 0;
         for (int i = 0; i < instrs.Count; i++)
         {
             if ((instrs[i].OpCode == OpCodes.Call || instrs[i].OpCode == OpCodes.Callvirt) &&
-                instrs[i].Operand is MethodReference mr && mr.Name == "OnDisplayedNotificationChanged")
+                instrs[i].Operand is MethodReference mr && mr.Name == "PerformLayout")
             {
                 anchor = instrs[i];
                 matchCount++;
             }
         }
-        if (matchCount != 1) { Console.Error.WriteLine($"FAIL: expected exactly 1 OnDisplayedNotificationChanged(EventArgs) call in ShowNotification, found {matchCount} -- method shape changed, review needed"); return 1; }
+        if (matchCount != 1) { Console.Error.WriteLine($"FAIL: expected exactly 1 PerformLayout() call in ShowNotification, found {matchCount} -- method shape changed, review needed"); return 1; }
 
         foreach (var instr in instrs)
         {
@@ -5470,7 +5479,7 @@ static int RunPatchNotificationRefreshOnContentChange(string[] args)
             Instruction.Create(OpCodes.Call, updateLayeredBackgroundRef)
         );
 
-        Console.WriteLine($"OK   {fileName}: {targetType}::ShowNotification -- now calls updateLayeredBackground(refreshBitmap: true) immediately after OnDisplayedNotificationChanged() sets the real Title/Content/Image, forcing a fresh rebuild-and-blit through the already-reliable layeredWindow path instead of relying on `this` form's own paint cycle to ever pick up the new content");
+        Console.WriteLine($"OK   {fileName}: {targetType}::ShowNotification -- now calls updateLayeredBackground(refreshBitmap: true) immediately after PerformLayout() (so doLayout() has already recomputed headerRect/contentRect/imageRect for the current content), forcing a fresh rebuild-and-blit through the already-reliable layeredWindow path instead of relying on `this` form's own paint cycle to ever pick up the new content");
         patched = true;
 
         module.Write(destPath);
