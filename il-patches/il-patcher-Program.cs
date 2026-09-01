@@ -138,6 +138,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-text-in-bitmap")
     return RunPatchNotificationTextInBitmap(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-suppress-self-paint")
+{
+    return RunPatchNotificationSuppressSelfPaint(args);
+}
+
 if (args.Length > 0 && args[0] == "--version")
 {
     return RunVersion(args);
@@ -4969,6 +4974,131 @@ static int RunPatchNotificationTextInBitmap(string[] args)
         }
 
         Console.WriteLine($"OK   {fileName}: {targetType}::updateBackgroundBitmap -- now also draws title/content text (via the existing OnPaintTitle/OnPaintContent virtual methods, honoring subclass overrides) directly into backgroundBitmap before it's pushed to screen via the layeredWindow companion's own reliable UpdateWindow() blit, instead of relying solely on `this` form's own (bug-affected) live OnPaint");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-suppress-self-paint <input-dir> <output-dir>
+//
+// Immediately follows --patch-notification-text-in-bitmap and was needed because that fix alone,
+// live-tested via the fully automated launch+recording loop, made NO visible difference: text was
+// baked correctly into backgroundBitmap (confirmed via decompile), yet still appeared only right
+// after OnShown and right at Hide(), blank for the whole hold in between -- identical to baseline.
+//
+// Root cause of *that*, found by grepping the raw IL for actual OnPaintTitle/OnPaintContent call
+// sites (there are none inside FormGenericNotification's own class body -- they're only ever
+// invoked from ITS OWN `OnPaintBackground` override, previously misread as design-mode-only
+// because a *different*, base-class OnPaintBackground on LayeredBaseForm genuinely is
+// design-mode-only and was the one actually decompiled and read earlier). FormGenericNotification
+// overrides OnPaintBackground itself and, at real runtime (not design mode), draws its OWN
+// redundant copy of backgroundBitmap directly onto `this` form's own device context via
+// `e.Graphics.DrawImage(backgroundBitmap, ...)`, immediately followed by `OnPaintTitle(e)` and
+// `OnPaintContent(e)` painting text onto that same DC. This means the background/avatar/border are
+// actually painted TWICE per frame -- once via `layeredWindow`'s reliable, forced UpdateWindow()
+// blit (a separate window sitting behind `this`), and again via `this`'s own OnPaintBackground,
+// which (per this whole investigation's central finding) is subject to the
+// SetLayeredWindowAttributes-only-updates-on-a-real-tick compositing bug. The working theory this
+// now points to: `this`'s own copy gets "stuck" showing whatever it last managed to actually
+// composite -- most likely a partially-flushed frame from partway through its own OnPaintBackground
+// (background drawn, text not yet drawn, if the underlying WM_PAINT gets torn/frozen mid-sequence)
+// -- sitting OPAQUE on top of `layeredWindow`'s already-correct (now text-included, thanks to the
+// prior patch) content underneath, blocking it from view for the whole hold, until ticks resume
+// near Hide() and `this` finally gets a fresh, complete paint through.
+//
+// Fix: since `layeredWindow` alone (with the prior patch) already reliably provides background,
+// avatar, border, AND text, `this` form's own duplicate painting in OnPaintBackground is now pure
+// redundant risk -- make it a no-op for the real-runtime (non-DesignMode) case, leaving `this` as
+// a fully transparent (TransparencyKey-keyed) pass-through window over `layeredWindow`'s own
+// reliable content, so there's nothing of `this`'s own left to get stuck mid-composite. Implemented
+// as the smallest possible change: OnPaintBackground already branches on
+// `if (backgroundBitmap != null) { <the whole redundant draw+text block> }` via a single
+// `brfalse(.s) <after-the-block>` instruction right after loading the field; flipping that one
+// instruction's opcode to the unconditional `br(.s)` (same operand/target, so no branch-target or
+// exception-handler-boundary retargeting is needed at all -- lessons 2 and 3 don't apply here)
+// makes the whole block unreachable at runtime while leaving every earlier guard (disposed check,
+// base.OnPaintBackground() call, DesignMode early-return, the updateBitmapPending ->
+// updateBackgroundBitmap() trigger some other code path may still rely on) completely untouched.
+static int RunPatchNotificationSuppressSelfPaint(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-suppress-self-paint <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var onPaintBackgroundMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaintBackground" && m.HasBody);
+        if (onPaintBackgroundMethod is null) { Console.Error.WriteLine("FAIL: OnPaintBackground(PaintEventArgs) not found"); return 1; }
+
+        var layeredBaseFormType = type.BaseType?.Resolve();
+        if (layeredBaseFormType is null || layeredBaseFormType.FullName != "MailClient.UI.Forms.LayeredBaseForm")
+        {
+            Console.Error.WriteLine($"FAIL: expected base type MailClient.UI.Forms.LayeredBaseForm, got {layeredBaseFormType?.FullName}");
+            return 1;
+        }
+        var backgroundBitmapField = layeredBaseFormType.Fields.FirstOrDefault(f => f.Name == "backgroundBitmap");
+        if (backgroundBitmapField is null) { Console.Error.WriteLine("FAIL: LayeredBaseForm missing backgroundBitmap field"); return 1; }
+
+        var instrs = onPaintBackgroundMethod.Body.Instructions;
+        int matchCount = 0;
+        int matchIdx = -1;
+        for (int i = 0; i < instrs.Count - 1; i++)
+        {
+            if (instrs[i].OpCode == OpCodes.Ldfld && instrs[i].Operand is FieldReference fr && fr.Name == "backgroundBitmap" &&
+                (instrs[i + 1].OpCode == OpCodes.Brfalse || instrs[i + 1].OpCode == OpCodes.Brfalse_S))
+            {
+                matchCount++;
+                matchIdx = i + 1;
+            }
+        }
+        if (matchCount != 1) { Console.Error.WriteLine($"FAIL: expected exactly 1 `if (backgroundBitmap != null)` branch in OnPaintBackground, found {matchCount} -- method shape changed, review needed"); return 1; }
+
+        var branchInstr = instrs[matchIdx];
+        branchInstr.OpCode = branchInstr.OpCode == OpCodes.Brfalse_S ? OpCodes.Br_S : OpCodes.Br;
+        // Operand (the branch target) is untouched -- same instruction, now reached unconditionally.
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnPaintBackground -- the `if (backgroundBitmap != null) {{ draw background copy + OnPaintTitle + OnPaintContent onto `this`'s own DC }}` block is now unconditionally skipped at real runtime (DesignMode early-return above it is untouched), since layeredWindow's own blit (see --patch-notification-text-in-bitmap) already reliably provides all of it");
         patched = true;
 
         module.Write(destPath);
