@@ -764,6 +764,51 @@ alternative strategy -- rendering text through a normal, non-layered `WM_PAINT` 
 the cached layered-window bitmap, sidestepping the mystery for text specifically -- is worth
 weighing against continuing to chase the exact native trigger.
 
+**Eleventh round: text DOES render during a genuine active fade -- and reverts the instant the box
+returns to a static Opacity=1.0/Visible state. The clearest, most specific signal yet.**
+`--patch-notification-real-fade-abort` set `state = Disappearing` and `alphaIncrement = -0.05f`
+exactly as `Hide()`'s Visible branch does, re-armed the timer to 25ms, then pumped the message
+loop (`Application.DoEvents()` + `Thread.Sleep(30)`, the same proven-safe technique from the
+third fix attempt's dip-and-recover) for ~120ms so several *genuine* `WM_TIMER`-dispatched ticks
+ran through `timer_OnTimer`'s own **unmodified** Disappearing-branch code (real `Opacity`
+decrement, real `updateLayeredBackground(false)`, real `Invalidate()` on each tick) -- then
+aborted: `Opacity = 1.0; state = Visible; alphaIncrement = 0f;` plus one more
+`updateLayeredBackground(false); Invalidate();` and a normal timer re-arm for the real remaining
+`timeToStay`.
+
+Frame-precise result: **frames 375-377 (wall ~18:42:00.05-00.11, spanning the real pumped ticks
+through the abort) show full text and the action icons, correctly rendered.** Frame 378 (~35ms
+later, right after `Opacity` was forced back to exactly `1.0` and `state` back to `Visible` in
+the same call) is **blank again** -- reverted to the same stuck avatar-only state as before the
+kick ever ran. This is a materially different, sharper signal than every prior isolation attempt:
+text isn't simply "never shown without `Hide()` completing" -- it renders correctly while a real
+fade is actively in progress, and stops the instant the box returns to steady Visible state at
+full opacity.
+
+This reopens a specific mechanism round 9 found in Wine's own source and had set aside:
+`X11DRV_SetLayeredWindowAttributes` (`dlls/winex11.drv/window.c`) takes a genuinely different
+path depending on whether the resolved alpha is *exactly* 255 (`Opacity == 1.0`) --
+`XChangeProperty` for any other value, `XDeleteProperty` specifically at exactly 1.0. Round 9
+ruled this split out as the cause of the *original* blank period (a dip-and-recover sequence that
+deliberately avoided ever landing on exactly 1.0 mid-sequence still produced zero effect back
+then) -- but this round's abort forced Opacity to exactly 1.0 in the very same step as flipping
+`state` back to `Visible`, reproducing that specific delete-the-property transition right at the
+moment blanking occurred. Round 9's ruling-out and this round's finding aren't necessarily in
+conflict -- they tested different transitions (avoiding 1.0 during the *original* appear-and-hold
+sequence, vs. deliberately returning *to* 1.0 after a period of real activity) -- but the overlap
+is suspicious enough to warrant a direct, targeted test.
+
+**Freshest, most actionable lead -- resume here next:** repeat the same real-fade-then-abort
+test, but land the abort's `Opacity` at something visually indistinguishable from 1.0 (e.g.
+`0.99`) instead of exactly `1.0`, keeping `state` set back to `Visible` as before. If text stays
+visible, that pins the mechanism precisely to the `XChangeProperty`-vs-`XDeleteProperty` split
+specifically, independent of `state` -- a real, actionable, narrow fix (never let a notification's
+Opacity actually reach exactly 1.0 while content is meant to stay visible; nudge it to e.g. 0.999
+instead) rather than a Wine bug that has to be worked around structurally. If text still
+disappears even at 0.99, the trigger is `state` itself (or something gated on it) rather than the
+opacity-property code path, redirecting the investigation back to the `state` field's other
+consumers.
+
 Coordination notes for future rounds: (1) a screen-recording test needs the recording started
 *after* the user confirms the test email is sent, not before -- mail delivery can take up to a
 minute, and several attempts this round were wasted on fixed-duration recordings that expired
