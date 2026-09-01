@@ -1143,3 +1143,63 @@ first-ever *measurable* improvement (text visible for ~1s at notification start,
 Hide/click in every prior round) -- but it's a partial fix, not a resolution: the hold period is
 still blank. Given repeated attempts to combine it with other ideas have made things worse rather
 than better, this is a natural point to report back rather than keep stacking speculative patches.
+
+## Sixteenth round: FIXED -- periodic re-blit closes the gap, text visible for the entire lifecycle
+
+Directly answering the user's question of what's actually gating text visibility during the hold,
+after the fifteenth round established that both the bitmap's content and its native blit mechanism
+are independently correct and unchanged throughout: does the compositor need the *same, unchanged*
+content periodically re-asserted via a real `UpdateLayeredWindow` call, or does it not matter?
+
+`--patch-notification-periodic-reblit`: a new, completely independent `Timer` (300ms), started once
+per form instance (guarded by a null check at the top of `OnShown`, since the form is reused across
+notifications), whose only action is `if (state == NotificationFormState.Visible)
+updateLayeredBackground(refreshBitmap: false)` -- no `Opacity` or `state` mutation at all, unlike
+every version in the v1-v6 keep-alive family, which all changed `alphaIncrement`/`Opacity` and
+repeatedly collided with `timer_OnTimer`'s own state machine as a result. This timer does nothing
+but repeat the exact same already-correct, already-proven-reliable native blit, unconditionally,
+every 300ms, for as long as the notification is sitting in its hold.
+
+**Result, deployed as the full chain (`refresh-on-content-change` + `text-in-bitmap` +
+`periodic-reblit`, live-tested via the automated auto-trigger + recording loop and independently
+confirmed via extracted frames): text is visible for the ENTIRE notification lifecycle** -- at
+`OnShown`, throughout the hold (confirmed at multiple points, including ~3.4s and ~6.3s after
+appearing, both clearly readable: "eM Client" / "You have 3 new emails"), and through to `Hide()`.
+This is the first fix in the whole investigation (sixteen rounds, counting from the start of this
+session's work alone) that actually resolves the reported symptom rather than shifting or
+partially mitigating it.
+
+**This directly answers the open question:** the gate is not the bitmap's content (confirmed
+correct throughout, since the fifteenth round), not whether it was ever blitted via a genuine
+native call (also confirmed, since `layeredWindow.UpdateWindow` is unconditionally forced on every
+call) -- it is specifically that the **compositor stops honoring previously-blitted content once
+the native blit calls stop arriving**, regardless of whether the content or opacity value being
+re-asserted has changed at all. A once-per-300ms heartbeat of the *identical* call is sufficient to
+keep it honored. This is consistent with (and sharpens) every finding across this entire
+investigation: real ticking was always the gate, but "real ticking" turns out to mean literally
+"a `UpdateLayeredWindow`-equivalent call happened recently," not "a value changed" -- the whole
+alpha-oscillation machinery of the v1-v6 family was solving the wrong half of the problem (forcing
+a value change) when only the call itself, with any or no value change, was ever necessary.
+
+**Three patches now needed together** for the full fix (a fourth,
+`--patch-notification-suppress-self-paint`, was tried and is a confirmed dead end -- do not
+combine it with these):
+1. `--patch-notification-text-in-bitmap` -- bake title/content into `backgroundBitmap` itself
+   (via the existing `OnPaintTitle`/`OnPaintContent`, honoring subclass overrides), so
+   `layeredWindow`'s blit actually has something to show.
+2. `--patch-notification-refresh-on-content-change` -- force an immediate rebuild-and-blit right
+   after real content is set (`ShowNotification`), so the very first blit already has it, before
+   the `Appearing` tick burst even starts.
+3. `--patch-notification-periodic-reblit` -- keep re-asserting that already-correct blit every
+   300ms for as long as the notification is in its `Visible` hold, since native blits stopping is
+   what causes the compositor to stop honoring previously-shown content.
+
+**Not yet done:** live confirmation against a genuine incoming real email (all testing so far this
+round used the auto-test-notification trigger's synthetic `NewMailsCount` path, which does
+exercise the real `ShowNotification` method but not the full real-mail trigger chain through
+`MailNotificationHandler`/`FormNotificationPresenter`); folding into `releases/<version>/deploy.sh`
+as a new stage; and removing `--patch-diag`'s instrumentation from the final deployed build (it's
+currently layered on top for observability during testing, not meant for normal use). The
+`__periodicReblitTimer` is deliberately never stopped/disposed (it just no-ops once `state !=
+Visible`) -- accepted as negligible overhead (one 300ms timer per app session, since the form
+instance is reused) rather than adding complexity to tear it down on `Hide()`/disposal.
