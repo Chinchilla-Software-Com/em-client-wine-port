@@ -153,6 +153,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-periodic-reblit")
     return RunPatchNotificationPeriodicReblit(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-suppress-self-text-only")
+{
+    return RunPatchNotificationSuppressSelfTextOnly(args);
+}
+
 if (args.Length > 0 && args[0] == "--version")
 {
     return RunVersion(args);
@@ -5481,6 +5486,155 @@ static int RunPatchNotificationPeriodicReblit(string[] args)
         }
 
         Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- now also starts a separate, independent {reblitIntervalMs}ms __periodicReblitTimer (once per form instance) that calls updateLayeredBackground(refreshBitmap: false) while state == Visible -- no Opacity/state change, purely a repeated re-assertion of the already-correct bitmap, to test whether the compositor needs periodic re-blitting independent of any value actually changing");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-suppress-self-text-only <input-dir> <output-dir>
+//
+// Sixteenth round's fix (text-in-bitmap + refresh-on-content-change + periodic-reblit) works --
+// text is now visible for the entire notification lifecycle, confirmed both by the user directly
+// ("I saw text the whole time... YAY") and against a genuine real email. But the user also caught
+// a real, if minor, cosmetic side effect: a single-frame "ghost" of the text -- faint, slightly
+// offset -- flashes behind the correct text right at the fade-out transition ("the formatting was
+// wrong... I think I briefly saw the original text in the background"). Confirmed via frame
+// extraction: one frame at the Hide()-triggered fade-out shows the crisp, correctly-positioned
+// text from layeredWindow's blit *and* a fainter, ~9px-offset duplicate behind it.
+//
+// Root cause: `this` form's own OnPaintBackground -- never touched by this fix, deliberately, since
+// --patch-notification-suppress-self-paint (which disables it entirely) is a confirmed dead end,
+// see below -- still independently draws a redundant copy of the background PLUS title/content
+// text directly onto `this`'s own device context. `this`'s own paint is only reliable while real
+// ticks are actively running (the same Wine bug this whole investigation has chased), which is
+// exactly when it transiently *does* succeed: right during the Disappearing fade-out tick burst.
+// Its text lands ~9px offset from layeredWindow's copy because of the ShadowVisible
+// TranslateTransform(9,9) applied when building backgroundBitmap (padded for the drop-shadow) --
+// `this`'s own paint doesn't apply that same offset, since it isn't drawing into the padded bitmap.
+//
+// --patch-notification-suppress-self-paint was retried in combination with periodic-reblit on the
+// theory that periodic-reblit might avoid the earlier regression (a "broken image" red-X glyph) by
+// keeping layeredWindow's surface constantly refreshed regardless of `this`'s own paint state --
+// it did not: the same red-X regression reappeared, now spanning a much larger area. Disabling
+// `this`'s paint entirely is confirmed, again, to not produce a clean transparent pass-through.
+//
+// This is a narrower, safer alternative: leave `this`'s own background-copy draw (the
+// `e.Graphics.DrawImage(backgroundBitmap, ...)` call) fully intact -- so `this`'s own surface is
+// still genuinely painted with *something* every time, avoiding whatever unrealized-surface state
+// caused the red-X glyph -- and remove ONLY the two `OnPaintTitle(e)`/`OnPaintContent(e)` call
+// sites immediately after it. `this` keeps its own (harmless, redundant, already-invisible-under-
+// Wine-without-real-ticks) background copy, but never draws the duplicate text that causes the
+// ghost, since only layeredWindow's copy (fixed by text-in-bitmap) ever has text at all now.
+//
+// Implementation: this REMOVES instructions from an existing method body -- a new operation for
+// this file (every prior patch only inserted or flipped an opcode). Straight-line code within the
+// `try` block (no other branch enters or exits mid-sequence), so removal is safe provided none of
+// the six target instructions (Ldarg_0/Ldarg_1 pairs plus the two Callvirt calls) is itself a
+// branch target or an exception-handler region boundary -- checked explicitly before removing
+// anything, same defensive pattern as every insertion elsewhere in this file.
+static int RunPatchNotificationSuppressSelfTextOnly(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-suppress-self-text-only <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var onPaintBackgroundMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaintBackground" && m.HasBody);
+        if (onPaintBackgroundMethod is null) { Console.Error.WriteLine("FAIL: OnPaintBackground(PaintEventArgs) not found"); return 1; }
+
+        var body = onPaintBackgroundMethod.Body;
+        var instrs = body.Instructions;
+
+        int titleCallIdx = -1, contentCallIdx = -1;
+        for (int i = 0; i < instrs.Count; i++)
+        {
+            if ((instrs[i].OpCode == OpCodes.Call || instrs[i].OpCode == OpCodes.Callvirt) && instrs[i].Operand is MethodReference mr)
+            {
+                if (mr.Name == "OnPaintTitle") { if (titleCallIdx != -1) { Console.Error.WriteLine("FAIL: more than one OnPaintTitle call in OnPaintBackground"); return 1; } titleCallIdx = i; }
+                if (mr.Name == "OnPaintContent") { if (contentCallIdx != -1) { Console.Error.WriteLine("FAIL: more than one OnPaintContent call in OnPaintBackground"); return 1; } contentCallIdx = i; }
+            }
+        }
+        if (titleCallIdx == -1 || contentCallIdx == -1) { Console.Error.WriteLine($"FAIL: OnPaintTitle/OnPaintContent call(s) not found in OnPaintBackground (title={titleCallIdx}, content={contentCallIdx})"); return 1; }
+        if (contentCallIdx != titleCallIdx + 3) { Console.Error.WriteLine($"FAIL: expected OnPaintContent's call exactly 3 instructions after OnPaintTitle's (Ldarg_0;Ldarg_1;Callvirt each) -- method shape changed, review needed (title={titleCallIdx}, content={contentCallIdx})"); return 1; }
+        if (instrs[titleCallIdx - 2].OpCode != OpCodes.Ldarg_0 || instrs[titleCallIdx - 1].OpCode != OpCodes.Ldarg_1 ||
+            instrs[contentCallIdx - 2].OpCode != OpCodes.Ldarg_0 || instrs[contentCallIdx - 1].OpCode != OpCodes.Ldarg_1)
+        {
+            Console.Error.WriteLine("FAIL: expected Ldarg_0;Ldarg_1 immediately before each of OnPaintTitle/OnPaintContent -- method shape changed, review needed");
+            return 1;
+        }
+
+        var toRemove = new[]
+        {
+            instrs[titleCallIdx - 2], instrs[titleCallIdx - 1], instrs[titleCallIdx],
+            instrs[contentCallIdx - 2], instrs[contentCallIdx - 1], instrs[contentCallIdx]
+        };
+
+        foreach (var target in toRemove)
+        {
+            foreach (var instr in instrs)
+            {
+                if (instr.Operand == target)
+                {
+                    Console.Error.WriteLine("FAIL: one of the instructions to remove is itself a branch target -- review needed");
+                    return 1;
+                }
+            }
+            foreach (var handler in body.ExceptionHandlers)
+            {
+                if (handler.TryStart == target || handler.TryEnd == target || handler.HandlerStart == target || handler.HandlerEnd == target)
+                {
+                    Console.Error.WriteLine("FAIL: one of the instructions to remove is an exception-handler region boundary -- review needed");
+                    return 1;
+                }
+            }
+        }
+
+        var il = body.GetILProcessor();
+        foreach (var target in toRemove) { il.Remove(target); }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnPaintBackground -- removed the OnPaintTitle(e)/OnPaintContent(e) calls (and their argument-loading instructions) that drew a redundant, ghost-prone duplicate of the text directly onto `this` form's own DC; the background/avatar copy draw immediately before them is untouched, so `this`'s own surface is still genuinely painted with something every frame");
         patched = true;
 
         module.Write(destPath);
