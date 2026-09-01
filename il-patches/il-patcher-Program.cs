@@ -98,6 +98,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-state-vs-alpha")
     return RunPatchNotificationStateVsAlpha(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-keep-alive")
+{
+    return RunPatchNotificationKeepAlive(args);
+}
+
 if (args.Length > 0 && args[0] == "--version")
 {
     return RunVersion(args);
@@ -2616,6 +2621,228 @@ static int RunPatchNotificationStateVsAlpha(string[] args)
         }
 
         Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- forced Visible-hold timer to {kickAfterMs}ms; {targetType}::timer_OnTimer -- first tick runs a real fade, then flips state back to Visible while keeping alphaIncrement non-zero for a second pumped window, then does real cleanup, via __diagKickOrHide() instead of calling Hide(); second tick calls Hide() as normal");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-keep-alive <input-dir> <output-dir>
+//
+// First real fix attempt (not a diagnostic probe) for the empty-box-until-fade bug, built on
+// round twelve's finding: `alphaIncrement` remaining non-zero (i.e. real 25ms ticks actively
+// running) is what keeps notification text visible -- `state` itself is not the gate. The
+// current design holds the Visible state with `alphaIncrement = 0f` and a single long
+// `timer.Interval = timeToStay` wait -- an inert, non-ticking hold, which is exactly the
+// condition round twelve showed goes blank.
+//
+// Fix: override two of OnShown's own writes in its Appearing/Visible case (both via the same
+// insert-an-override-right-after-the-original technique used throughout this investigation, not
+// replacing the original instructions):
+//   - `alphaIncrement = 0f;` -> `alphaIncrement = 0.0001f;` (tiny positive, not zero)
+//   - `timer.Interval = timeToStay;` -> `timer.Interval = 25;` (real ticks, not one long wait)
+// With alphaIncrement slightly positive, `Opacity + alphaIncrement` is always >= 1.0, so every
+// 25ms tick re-enters timer_OnTimer's *existing, unmodified* first branch, which clamps `Opacity`
+// back to exactly 1.0 and calls `updateLayeredBackground(refreshBitmap: false)` unconditionally --
+// keeping real ticks flowing (and Opacity visibly pinned at 1.0, no drift) for the whole display
+// hold, instead of the current single inert wait.
+//
+// That same branch is also where the existing Visible-state Hide() call lives, which would now
+// fire on almost every tick rather than once after timeToStay -- so its call site (the same one
+// every prior kick test in this investigation redirected) is pointed at a new
+// __keepAliveMaybeHide() method instead: it tracks real elapsed time via Environment.TickCount
+// (recorded in a new field `__keepAliveStartTick`, set at the same point as the two overrides
+// above) and only calls the real, unmodified `Hide()` once `timeToStay` has genuinely elapsed --
+// otherwise it's a no-op, leaving Opacity already correctly clamped to 1.0 by the surrounding
+// code that ran just before this call on every tick. This preserves the real auto-hide timing
+// exactly, decoupled from the tick interval. No existing method's control flow is altered --
+// only field-write overrides and one call-site operand swap, the same safe techniques already
+// verified throughout this investigation.
+static int RunPatchNotificationKeepAlive(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-keep-alive <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+    const float keepAliveAlpha = 0.0001f;
+    const int keepAliveIntervalMs = 25;
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var onShownMethod = type.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody);
+        var timerMethod = type.Methods.FirstOrDefault(m => m.Name == "timer_OnTimer" && m.HasBody);
+        var hideMethod = type.Methods.FirstOrDefault(m => m.Name == "Hide" && m.HasBody && m.Parameters.Count == 0);
+        if (onShownMethod is null) { Console.Error.WriteLine("FAIL: OnShown not found"); return 1; }
+        if (timerMethod is null) { Console.Error.WriteLine("FAIL: timer_OnTimer not found"); return 1; }
+        if (hideMethod is null) { Console.Error.WriteLine("FAIL: Hide() not found"); return 1; }
+
+        var timerField = type.Fields.FirstOrDefault(f => f.Name == "timer");
+        var timeToStayField = type.Fields.FirstOrDefault(f => f.Name == "timeToStay");
+        var alphaIncrementField = type.Fields.FirstOrDefault(f => f.Name == "alphaIncrement");
+        if (timerField is null) { Console.Error.WriteLine("FAIL: timer field not found"); return 1; }
+        if (timeToStayField is null) { Console.Error.WriteLine("FAIL: timeToStay field not found"); return 1; }
+        if (alphaIncrementField is null) { Console.Error.WriteLine("FAIL: alphaIncrement field not found"); return 1; }
+
+        var timerType = timerField.FieldType.Resolve();
+        var setIntervalDef = timerType?.Methods.FirstOrDefault(m => m.Name == "set_Interval");
+        if (setIntervalDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Timer.set_Interval from timer field's own FieldType"); return 1; }
+        var setIntervalRef = module.ImportReference(setIntervalDef);
+
+        var tickCountGetterDef = typeof(Environment).GetProperty("TickCount")!.GetGetMethod()!;
+        var tickCountGetterRef = module.ImportReference(tickCountGetterDef);
+
+        // --- Step 1: OnShown -- find the Visible case's `alphaIncrement = 0f;` (the simple
+        // constant-zero assignment; the Hidden/Disappearing cases assign `25f / timeToShow`
+        // instead, a different instruction shape, so this uniquely identifies the right site) and
+        // override it right after with the tiny keep-alive value; then find the same case's
+        // `timer.Interval = timeToStay;` (same anchor-finding code used by every kick test this
+        // session) and override it right after with the short real-tick interval.
+        Instruction? afterOverridePoint;
+        {
+            var body = onShownMethod.Body;
+            body.SimplifyMacros();
+            var instrs = body.Instructions;
+
+            Instruction? alphaZeroAnchor = null;
+            for (int idx = 1; idx < instrs.Count; idx++)
+            {
+                if (instrs[idx].OpCode == OpCodes.Stfld && instrs[idx].Operand is FieldReference afr && afr.Name == "alphaIncrement" &&
+                    instrs[idx - 1].OpCode == OpCodes.Ldc_R4 && instrs[idx - 1].Operand is float fv && fv == 0f)
+                {
+                    if (alphaZeroAnchor is not null) { Console.Error.WriteLine("FAIL: more than one `alphaIncrement = 0f;` found in OnShown -- method shape changed, review needed"); return 1; }
+                    alphaZeroAnchor = instrs[idx];
+                }
+            }
+            if (alphaZeroAnchor is null) { Console.Error.WriteLine("FAIL: couldn't find `alphaIncrement = 0f;` in OnShown"); return 1; }
+
+            Instruction? intervalAnchor = null;
+            for (int idx = 1; idx < instrs.Count; idx++)
+            {
+                if ((instrs[idx].OpCode == OpCodes.Call || instrs[idx].OpCode == OpCodes.Callvirt) &&
+                    instrs[idx].Operand is MethodReference mr && mr.Name == "set_Interval" &&
+                    instrs[idx - 1].OpCode == OpCodes.Ldfld && instrs[idx - 1].Operand is FieldReference ifr && ifr.Name == "timeToStay")
+                {
+                    if (intervalAnchor is not null) { Console.Error.WriteLine("FAIL: more than one `timer.Interval = timeToStay;` found in OnShown -- method shape changed, review needed"); return 1; }
+                    intervalAnchor = instrs[idx];
+                }
+            }
+            if (intervalAnchor is null) { Console.Error.WriteLine("FAIL: couldn't find `timer.Interval = timeToStay;` in OnShown"); return 1; }
+
+            var il = body.GetILProcessor();
+
+            // Override alphaIncrement right after its original write.
+            var alphaCall = Instruction.Create(OpCodes.Stfld, alphaIncrementField);
+            var alphaPush = Instruction.Create(OpCodes.Ldc_R4, keepAliveAlpha);
+            var alphaThis = Instruction.Create(OpCodes.Ldarg_0);
+            il.InsertAfter(alphaZeroAnchor, alphaThis);
+            il.InsertAfter(alphaThis, alphaPush);
+            il.InsertAfter(alphaPush, alphaCall);
+
+            // Override timer.Interval right after its original write, and capture
+            // Environment.TickCount into the new field right after that (see Step 2).
+            var intervalCall = Instruction.Create(OpCodes.Call, setIntervalRef);
+            var intervalPush = Instruction.Create(OpCodes.Ldc_I4, keepAliveIntervalMs);
+            var intervalTimer = Instruction.Create(OpCodes.Ldfld, timerField);
+            var intervalThis = Instruction.Create(OpCodes.Ldarg_0);
+            il.InsertAfter(intervalAnchor, intervalThis);
+            il.InsertAfter(intervalThis, intervalTimer);
+            il.InsertAfter(intervalTimer, intervalPush);
+            il.InsertAfter(intervalPush, intervalCall);
+            afterOverridePoint = intervalCall;
+        }
+
+        // --- Step 2: add `private int __keepAliveStartTick;` field, and record
+        // Environment.TickCount into it right after the timer.Interval override above.
+        var startTickField = new FieldDefinition("__keepAliveStartTick", FieldAttributes.Private, module.TypeSystem.Int32);
+        type.Fields.Add(startTickField);
+        {
+            var body = onShownMethod.Body;
+            var il = body.GetILProcessor();
+            var stfldStart = Instruction.Create(OpCodes.Stfld, startTickField);
+            var callTick = Instruction.Create(OpCodes.Call, tickCountGetterRef);
+            var ldThis = Instruction.Create(OpCodes.Ldarg_0);
+            il.InsertAfter(afterOverridePoint, ldThis);
+            il.InsertAfter(ldThis, callTick);
+            il.InsertAfter(callTick, stfldStart);
+        }
+
+        // --- Step 3: add `private void __keepAliveMaybeHide() { if (Environment.TickCount -
+        // __keepAliveStartTick < timeToStay) return; Hide(); }`.
+        var keepAliveMethod = new MethodDefinition("__keepAliveMaybeHide", MethodAttributes.Private, module.TypeSystem.Void);
+        type.Methods.Add(keepAliveMethod);
+        var kaBody = keepAliveMethod.Body;
+        var kaIl = kaBody.GetILProcessor();
+        var ret = Instruction.Create(OpCodes.Ret);
+        var doHide = Instruction.Create(OpCodes.Ldarg_0);
+
+        kaIl.Append(Instruction.Create(OpCodes.Call, tickCountGetterRef));
+        kaIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kaIl.Append(Instruction.Create(OpCodes.Ldfld, startTickField));
+        kaIl.Append(Instruction.Create(OpCodes.Sub));
+        kaIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        kaIl.Append(Instruction.Create(OpCodes.Ldfld, timeToStayField));
+        kaIl.Append(Instruction.Create(OpCodes.Blt, ret));
+        kaIl.Append(doHide); // Ldarg_0, reused as the call's target-push
+        kaIl.Append(Instruction.Create(OpCodes.Call, module.ImportReference(hideMethod)));
+        kaIl.Append(ret);
+
+        // --- Step 4: timer_OnTimer -- redirect the single `Hide()` call to
+        // `__keepAliveMaybeHide()` by swapping just its operand.
+        {
+            var body = timerMethod.Body;
+            var instrs = body.Instructions;
+            int hideCallCount = 0;
+            foreach (var instr in instrs)
+            {
+                if ((instr.OpCode == OpCodes.Call || instr.OpCode == OpCodes.Callvirt) && instr.Operand is MethodReference mr && mr.Name == "Hide" && mr.Parameters.Count == 0)
+                {
+                    instr.Operand = keepAliveMethod;
+                    hideCallCount++;
+                }
+            }
+            if (hideCallCount != 1) { Console.Error.WriteLine($"FAIL: expected exactly 1 Hide() call in timer_OnTimer, found {hideCallCount} -- method shape changed, review needed"); return 1; }
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- Visible case now uses alphaIncrement={keepAliveAlpha}/timer.Interval={keepAliveIntervalMs}ms instead of 0/timeToStay, tracking real elapsed time in __keepAliveStartTick; {targetType}::timer_OnTimer -- Hide() call redirected to __keepAliveMaybeHide() which only calls the real Hide() once timeToStay has genuinely elapsed");
         patched = true;
 
         module.Write(destPath);
