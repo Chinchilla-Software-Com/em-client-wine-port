@@ -1184,13 +1184,18 @@ static int RunPatchAutoTestNotification(string[] args)
         tmIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
         tmIl.Append(Instruction.Create(OpCodes.Ldstr, "Test Subject Line " + DateTime.Now.ToString("HH:mm:ss")));
         tmIl.Append(Instruction.Create(OpCodes.Callvirt, setContentRef));
-        // Location = new Point(1360, 1000) -- matches where real notifications appear on this
-        // 1680x1188 test screen (bottom-right, with margin for the 310x125 notification size);
-        // real notifications get this from FormNotificationPresenter, which this synthetic
-        // trigger bypasses entirely, so it must be set explicitly here.
+        // Location = new Point(100, 100) -- deliberately top-LEFT, not the real bottom-right spot
+        // real notifications use. Moved here after discovering the bottom-right corner of this
+        // 1680x1188 test screen also happens to be where the terminal's own inline image-preview
+        // widget renders (it displays whatever screenshot was last viewed via the Read tool) --
+        // several rounds of recording analysis were contaminated by reading that widget's content
+        // instead of the actual notification, since both occupy the same corner. Top-left is clear
+        // of both the terminal panel and that widget. Real notifications get their real position
+        // from FormNotificationPresenter, which this synthetic trigger bypasses entirely, so
+        // Location must be set explicitly here regardless of which corner is chosen.
         tmIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
-        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4, 1360));
-        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4, 1000));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4, 100));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4, 100));
         tmIl.Append(Instruction.Create(OpCodes.Newobj, pointCtorRef));
         tmIl.Append(Instruction.Create(OpCodes.Callvirt, setLocationRef));
         // Show(null) -- FormGenericNotification's own override (topmost SetWindowPos/ShowWindow),
