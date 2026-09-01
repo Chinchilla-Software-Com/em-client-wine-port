@@ -798,16 +798,49 @@ conflict -- they tested different transitions (avoiding 1.0 during the *original
 sequence, vs. deliberately returning *to* 1.0 after a period of real activity) -- but the overlap
 is suspicious enough to warrant a direct, targeted test.
 
-**Freshest, most actionable lead -- resume here next:** repeat the same real-fade-then-abort
-test, but land the abort's `Opacity` at something visually indistinguishable from 1.0 (e.g.
-`0.99`) instead of exactly `1.0`, keeping `state` set back to `Visible` as before. If text stays
-visible, that pins the mechanism precisely to the `XChangeProperty`-vs-`XDeleteProperty` split
-specifically, independent of `state` -- a real, actionable, narrow fix (never let a notification's
-Opacity actually reach exactly 1.0 while content is meant to stay visible; nudge it to e.g. 0.999
-instead) rather than a Wine bug that has to be worked around structurally. If text still
-disappears even at 0.99, the trigger is `state` itself (or something gated on it) rather than the
-opacity-property code path, redirecting the investigation back to the `state` field's other
-consumers.
+**Follow-up test, same session: landing at 0.999 instead of exactly 1.0 does not keep text
+visible either -- the `XChangeProperty`/`XDeleteProperty` split is ruled out, `state` itself (or
+something gated on it) is the better remaining candidate.** `--patch-notification-real-fade-abort-0999`
+ran the identical real-pumped-fade-then-abort sequence, landing `Opacity` at `0.999` (still on
+Wine's `XChangeProperty` path per its source, never triggering `XDeleteProperty`) while still
+flipping `state` back to `Visible`. User-confirmed live result: **the same pattern as the exact-
+1.0 test** -- text appeared during the pumped real fade, then disappeared again. This rules out
+the specific `XChangeProperty`-vs-`XDeleteProperty` transition as the cause: text reverted
+regardless of which Wine code path the final opacity write took, so `state` returning to
+`Visible` (or something else common to both tests, e.g. `alphaIncrement` returning to exactly
+`0`) is the better remaining explanation, not the opacity-property mechanism specifically.
+
+**A real, separate bug surfaced during this test, worth fixing regardless of the fade
+investigation:** landing at `Opacity = 0.999` with `alphaIncrement` reset to `0` breaks
+`timer_OnTimer`'s own state machine. Its first branch is `if (Opacity + alphaIncrement >= 1.0)`;
+with `Opacity = 0.999` and `alphaIncrement = 0`, this evaluates to `false` forever (`0.999 >=
+1.0` is false, and `Opacity += alphaIncrement` never changes it since `alphaIncrement == 0`), so
+every subsequent ~6s timer tick falls into the harmless-looking `else if (IsHandleCreated) {
+Opacity += alphaIncrement; updateLayeredBackground(refreshBitmap: false); Invalidate(); }` branch
+forever -- the notification never reaches `Hide()` again and sits, fully visible, looping
+indefinitely (confirmed via the diag log: `state=2` repeating every ~6000ms with no further
+`Hide()` line, matching the user's live report of the notification "still visible" and appearing
+stuck). Not a Wine bug -- an artifact of this test patch choosing an abort opacity that doesn't
+satisfy the real code's own `>= 1.0` re-entry condition. The user resolved it by terminating and
+restarting eM Client (accepting the expected DB-repair-dialog consequence of a non-graceful
+termination, per this project's established behavior). Any future variant of this test should
+land the abort opacity at exactly `1.0` (satisfies `>= 1.0` cleanly) if avoiding this loop matters,
+or explicitly research the `>= 1.0` condition's edge behavior first.
+
+**Where this leaves the investigation:** the avatar's trigger is solved and directly exploitable
+(fire the timer re-arm immediately instead of waiting). The text's trigger has now survived four
+isolation attempts (plain re-arm, +`Invalidate()`, +transient state-flip, +real pumped fade
+landing at two different opacity values) -- it reliably renders *during* an active real fade and
+reliably reverts once `state` returns to `Visible`, but no single mechanism tried explains why.
+Remaining candidates: `state` itself gating something not yet found in the code (worth a direct
+search for any other code path that reads `state == Visible` specifically, beyond the ones
+already read in this investigation); or `alphaIncrement` needing to remain non-zero, not just
+`state` needing to stay `Disappearing`, which the transient state-flip test (round ten) didn't
+distinguish from this round's (`alphaIncrement` was also reset to `0` in every abort tried so
+far, including the state-flip-only one which set it to `0` as its "no-op" default rather than
+leaving it at whatever the initial construction value was). A test that flips `state` back to
+`Visible` while leaving `alphaIncrement` at its small non-zero fade value would separate these
+two remaining candidates cleanly.
 
 Coordination notes for future rounds: (1) a screen-recording test needs the recording started
 *after* the user confirms the test email is sent, not before -- mail delivery can take up to a
