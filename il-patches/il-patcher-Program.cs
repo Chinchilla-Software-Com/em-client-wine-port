@@ -148,6 +148,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-refresh-on-content-chang
     return RunPatchNotificationRefreshOnContentChange(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-periodic-reblit")
+{
+    return RunPatchNotificationPeriodicReblit(args);
+}
+
 if (args.Length > 0 && args[0] == "--version")
 {
     return RunVersion(args);
@@ -5296,6 +5301,186 @@ static int RunPatchNotificationRefreshOnContentChange(string[] args)
         );
 
         Console.WriteLine($"OK   {fileName}: {targetType}::ShowNotification -- now calls updateLayeredBackground(refreshBitmap: true) immediately after OnDisplayedNotificationChanged() sets the real Title/Content/Image, forcing a fresh rebuild-and-blit through the already-reliable layeredWindow path instead of relying on `this` form's own paint cycle to ever pick up the new content");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-periodic-reblit <input-dir> <output-dir>
+//
+// Directly tests the narrowest remaining question from the fifteenth round (see
+// reports/notification-empty-until-fade-findings.md): with --patch-notification-refresh-on-content-change
+// and --patch-notification-text-in-bitmap both applied (content correct in backgroundBitmap from
+// before the Appearing tick burst even starts, confirmed visible on screen throughout that burst),
+// text still goes blank the moment ticking stops for the ~6s hold, while the icon -- baked into the
+// exact same static Bitmap object -- keeps showing fine. Every value (Opacity, the bitmap's own
+// pixel data) is confirmed unchanged and correct at that point; only whether the compositor
+// re-asserts it is in question. This is a clean, narrow test of that: does merely RE-CALLING the
+// already-proven-reliable layeredWindow.UpdateWindow() blit periodically during the hold -- with
+// the *identical* bitmap and *identical* opacity, no value changing at all -- keep text visible, or
+// does it not matter?
+//
+// Structurally much simpler and safer than the v1-v6 keep-alive family: those all mutated
+// alphaIncrement/Opacity/state to force genuine per-tick value changes, which repeatedly collided
+// with timer_OnTimer's own state machine (the Hide()-reachability bug, the sign-flip-during-
+// fade-out bug, the interval-reversion-after-unlock-pump bug). This patch touches NONE of that --
+// it adds a completely separate, independent Timer that does nothing but call the existing
+// updateLayeredBackground(refreshBitmap: false) once every 300ms while state == Visible, changing
+// nothing else. If it works, it also has a real shot at being closer to a final fix than any
+// prior attempt; if it doesn't, that's strong, clean evidence the gate is something other than
+// "the compositor needs periodic re-assertion" (e.g. a per-pixel alpha problem specific to how
+// GDI's TextRenderer/ExtTextOut writes into a 32bppArgb bitmap destined for UpdateLayeredWindow's
+// per-pixel blend, which would need a completely different kind of fix).
+//
+// Implementation: add `private Timer __periodicReblitTimer;` and
+// `private void __periodicReblitTick(object, EventArgs)` to FormGenericNotification, and insert a
+// null-guarded one-time creation/start of that timer at the very top of OnShown (same safe
+// insertion point --patch-diag/--patch-auto-test-notification already use throughout this
+// investigation -- a method's own first instruction is never a branch target, and there's no
+// exception-handler region there to accidentally grow). Guarding on the field being null makes
+// this correctly "once per form instance" even though OnShown fires once per notification shown
+// and the form instance is reused across notifications (confirmed by the full decompile pass --
+// MailNotificationHandler.ChooseForm() only constructs a new form if none exists yet).
+static int RunPatchNotificationPeriodicReblit(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-periodic-reblit <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+    const int reblitIntervalMs = 300;
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var onShownMethod = type.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody);
+        if (onShownMethod is null) { Console.Error.WriteLine("FAIL: OnShown not found"); return 1; }
+        var stateField = type.Fields.FirstOrDefault(f => f.Name == "state");
+        if (stateField is null) { Console.Error.WriteLine("FAIL: state field not found"); return 1; }
+        var updateLayeredBackgroundMethod = type.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground" && m.HasBody) ??
+            type.BaseType?.Resolve()?.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground");
+        if (updateLayeredBackgroundMethod is null) { Console.Error.WriteLine("FAIL: updateLayeredBackground(bool) not found on type or base type"); return 1; }
+        var updateLayeredBackgroundRef = module.ImportReference(updateLayeredBackgroundMethod);
+
+        // Timer -- resolve from the existing `timer` field's own FieldType, not typeof()
+        // reflection (System.Windows.Forms is app-deployed -- IL-patching lesson 5).
+        var existingTimerField = type.Fields.FirstOrDefault(f => f.Name == "timer");
+        if (existingTimerField is null) { Console.Error.WriteLine("FAIL: timer field not found"); return 1; }
+        var timerTypeDef = existingTimerField.FieldType.Resolve();
+        if (timerTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Timer from the existing timer field's own FieldType"); return 1; }
+        var timerCtorDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0);
+        var timerSetIntervalDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "set_Interval");
+        var timerAddTickDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "add_Tick");
+        var timerStartDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "Start" && m.Parameters.Count == 0);
+        if (timerCtorDef is null || timerSetIntervalDef is null || timerAddTickDef is null || timerStartDef is null)
+        {
+            Console.Error.WriteLine("FAIL: Timer missing one of .ctor()/set_Interval/add_Tick/Start()");
+            return 1;
+        }
+        var timerCtorRef = module.ImportReference(timerCtorDef);
+        var timerSetIntervalRef = module.ImportReference(timerSetIntervalDef);
+        var timerAddTickRef = module.ImportReference(timerAddTickDef);
+        var timerStartRef = module.ImportReference(timerStartDef);
+        var timerFieldTypeRef = module.ImportReference(existingTimerField.FieldType);
+
+        var eventHandlerCtorRef = module.ImportReference(typeof(EventHandler).GetConstructor(new[] { typeof(object), typeof(IntPtr) })!);
+
+        // --- New field + tick method.
+        var reblitTimerField = new FieldDefinition("__periodicReblitTimer", FieldAttributes.Private, timerFieldTypeRef);
+        type.Fields.Add(reblitTimerField);
+
+        var tickMethod = new MethodDefinition("__periodicReblitTick", MethodAttributes.Private, module.TypeSystem.Void);
+        tickMethod.Parameters.Add(new ParameterDefinition("sender", ParameterAttributes.None, module.TypeSystem.Object));
+        tickMethod.Parameters.Add(new ParameterDefinition("e", ParameterAttributes.None, module.ImportReference(typeof(EventArgs))));
+        type.Methods.Add(tickMethod);
+        var tmIl = tickMethod.Body.GetILProcessor();
+        var tmRet = Instruction.Create(OpCodes.Ret);
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Ldfld, stateField));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4_2)); // NotificationFormState.Visible == 2
+        tmIl.Append(Instruction.Create(OpCodes.Bne_Un, tmRet));
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+        tmIl.Append(Instruction.Create(OpCodes.Call, updateLayeredBackgroundRef));
+        tmIl.Append(tmRet);
+
+        // --- Prepend to OnShown: if (__periodicReblitTimer == null) { create, configure, start }.
+        // Guard means this runs exactly once per form instance, regardless of how many times
+        // OnShown fires afterward (the form is reused across notifications).
+        {
+            var body = onShownMethod.Body;
+            var il = body.GetILProcessor();
+            var originalFirst = body.Instructions[0];
+
+            var createBlock = new List<Instruction>
+            {
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Newobj, timerCtorRef),
+                Instruction.Create(OpCodes.Stfld, reblitTimerField),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, reblitTimerField),
+                Instruction.Create(OpCodes.Ldc_I4, reblitIntervalMs),
+                Instruction.Create(OpCodes.Callvirt, timerSetIntervalRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, reblitTimerField),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldftn, tickMethod),
+                Instruction.Create(OpCodes.Newobj, eventHandlerCtorRef),
+                Instruction.Create(OpCodes.Callvirt, timerAddTickRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, reblitTimerField),
+                Instruction.Create(OpCodes.Callvirt, timerStartRef)
+            };
+
+            var guardCheck = new List<Instruction>
+            {
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, reblitTimerField),
+                Instruction.Create(OpCodes.Brtrue, originalFirst)
+            };
+            foreach (var i in guardCheck) { il.InsertBefore(originalFirst, i); }
+            foreach (var i in createBlock) { il.InsertBefore(originalFirst, i); }
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- now also starts a separate, independent {reblitIntervalMs}ms __periodicReblitTimer (once per form instance) that calls updateLayeredBackground(refreshBitmap: false) while state == Visible -- no Opacity/state change, purely a repeated re-assertion of the already-correct bitmap, to test whether the compositor needs periodic re-blitting independent of any value actually changing");
         patched = true;
 
         module.Write(destPath);
