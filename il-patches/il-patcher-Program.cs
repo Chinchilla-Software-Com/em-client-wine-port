@@ -133,6 +133,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-keep-alive-v6")
     return RunPatchNotificationKeepAliveV6(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-text-in-bitmap")
+{
+    return RunPatchNotificationTextInBitmap(args);
+}
+
 if (args.Length > 0 && args[0] == "--version")
 {
     return RunVersion(args);
@@ -4668,6 +4673,302 @@ static int RunPatchNotificationKeepAliveV6(string[] args)
         }
 
         Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- Visible case now pulses a brief real Disappearing-state fade ({unlockPumpSteps} pumped ticks) to unlock text, then switches to sustained Visible-state ticking with a plain monotonic alphaIncrement={monotonicStep} (stops once Opacity reaches {opacityFloor}) for the rest of the hold; {targetType}::timer_OnTimer -- both updateLayeredBackground(bool) call sites redirected to __keepAliveTick(bool) and the original Hide() call site redirected to __keepAliveMaybeHide()");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-text-in-bitmap <input-dir> <output-dir>
+//
+// The "tune the Timer-driven sustain tick" family (v1-v6, six iterations -- see
+// reports/notification-empty-until-fade-findings.md's thirteenth round) is a dead end: every
+// version that got real per-tick alpha changes running did keep text visible for as long as those
+// ticks were genuinely occurring, but none has managed to keep the timer itself reliably ticking
+// for the *entire* ~6s hold without either freezing the UI (a full synchronous DoEvents() pump)
+// or silently reverting to the original broken timeToStay-interval wait (v6, confirmed via a
+// diag-log tick trace showing a 6.003s silent gap almost exactly equal to timeToStay, right after
+// its brief unlock pump ended).
+//
+// This is a structurally different fix, prompted by re-reading LayeredBaseForm's own decompiled
+// source (from a clean Stage 8 build): FormGenericNotification ("this") and its `layeredWindow`
+// companion (a separate LayeredForm instance, field declared on LayeredBaseForm) are TWO SEPARATE
+// WINDOWS. `layeredWindow` receives `backgroundBitmap` -- built by updateBackgroundBitmap(),
+// confirmed by reading its full decompiled body to contain ONLY the background gradient, border,
+// drop shadow, and avatar/image, never title or content text -- via
+// `layeredWindow.UpdateWindow(backgroundBitmap, opacity, ...)`, a genuine per-pixel-alpha native
+// blit forced fresh on every call. That's why the box/border/avatar are reliably visible from the
+// very first frame in every recording this investigation has made. Title and content text, by
+// contrast, are drawn live by OnPaintTitle()/OnPaintContent() from `this` form's own OnPaint,
+// directly onto `this`'s own device context -- and `this` is ALSO independently a layered window
+// (LayeredBaseForm's constructor sets `base.AllowTransparency = true` plus a TransparencyKey, and
+// drives `this.Opacity`, which under Wine's winex11.drv goes through the exact
+// SetLayeredWindowAttributes-only-updates-on-a-real-tick mechanism this whole investigation has
+// been chasing). So `this`'s own client-area painting (the text) is subject to the bug;
+// `layeredWindow`'s forced bitmap blit is not.
+//
+// Fix: draw title/content text directly into `backgroundBitmap` itself, inside
+// updateBackgroundBitmap() (which already runs on every real content refresh and gets pushed to
+// screen via the same reliable UpdateWindow() blit as the background/avatar), by calling the
+// EXISTING OnPaintTitle(PaintEventArgs)/OnPaintContent(PaintEventArgs) virtual methods against a
+// fresh Graphics created on backgroundBitmap -- reusing their real bounds/ellipsis/image-offset/
+// color logic exactly (and honoring any subclass override -- FormIMMessageNotification overrides
+// OnPaintContent -- via Callvirt) rather than re-deriving any of it by hand. Implemented as a new
+// private helper, __drawNotificationTextIntoBitmap(), called once at the very end of
+// updateBackgroundBitmap() (after all existing background/avatar/border drawing, right before its
+// final `ret` -- the method's earlier `if (...) return;` guard for the no-bitmap-yet case is
+// untouched, so the new call is skipped exactly when there's nothing to draw into, same as the
+// rest of the method). Does not touch OnPaintTitle/OnPaintContent's own call site on `this`'s
+// OnPaint at all -- if `this`'s own painting is still just as delayed, it now draws an invisible,
+// harmless duplicate on top of the already-visible copy baked into backgroundBitmap; the new copy
+// doesn't depend on `this`'s own painting working at all.
+static int RunPatchNotificationTextInBitmap(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-text-in-bitmap <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var updateBackgroundBitmapMethod = type.Methods.FirstOrDefault(m => m.Name == "updateBackgroundBitmap" && m.HasBody);
+        var onPaintTitleMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaintTitle" && m.HasBody);
+        var onPaintContentMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaintContent" && m.HasBody);
+        if (updateBackgroundBitmapMethod is null) { Console.Error.WriteLine("FAIL: updateBackgroundBitmap not found"); return 1; }
+        if (onPaintTitleMethod is null) { Console.Error.WriteLine("FAIL: OnPaintTitle(PaintEventArgs) not found"); return 1; }
+        if (onPaintContentMethod is null) { Console.Error.WriteLine("FAIL: OnPaintContent(PaintEventArgs) not found"); return 1; }
+
+        var layeredBaseFormType = type.BaseType?.Resolve();
+        if (layeredBaseFormType is null || layeredBaseFormType.FullName != "MailClient.UI.Forms.LayeredBaseForm")
+        {
+            Console.Error.WriteLine($"FAIL: expected base type MailClient.UI.Forms.LayeredBaseForm, got {layeredBaseFormType?.FullName}");
+            return 1;
+        }
+        var backgroundBitmapField = layeredBaseFormType.Fields.FirstOrDefault(f => f.Name == "backgroundBitmap");
+        if (backgroundBitmapField is null) { Console.Error.WriteLine("FAIL: LayeredBaseForm missing backgroundBitmap field"); return 1; }
+        var shadowVisibleGetterDef = layeredBaseFormType.Methods.FirstOrDefault(m => m.Name == "get_ShadowVisible");
+        if (shadowVisibleGetterDef is null) { Console.Error.WriteLine("FAIL: LayeredBaseForm missing get_ShadowVisible"); return 1; }
+        var shadowVisibleGetterRef = module.ImportReference(shadowVisibleGetterDef);
+
+        // PaintEventArgs/Graphics/Rectangle -- resolve from OnPaintTitle's own parameter type and
+        // its friends' own signatures, not typeof() reflection: System.Windows.Forms and
+        // System.Drawing.Primitives are app-deployed assemblies the patching tool's own .NET 10
+        // runtime doesn't share a version with (IL-patching lesson 5 in CLAUDE.md).
+        var paintEventArgsTypeRef = onPaintTitleMethod.Parameters[0].ParameterType;
+        var paintEventArgsTypeDef = paintEventArgsTypeRef.Resolve();
+        if (paintEventArgsTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve PaintEventArgs from OnPaintTitle's own parameter type"); return 1; }
+        var graphicsPropGetterDef = paintEventArgsTypeDef.Methods.FirstOrDefault(m => m.Name == "get_Graphics");
+        if (graphicsPropGetterDef is null) { Console.Error.WriteLine("FAIL: PaintEventArgs missing get_Graphics"); return 1; }
+        // graphicsPropGetterDef was resolved from a foreign (System.Windows.Forms) module's own
+        // PaintEventArgs TypeDefinition, so its ReturnType is scoped to that foreign module --
+        // must go through module.ImportReference before use as a bare type reference (e.g. for a
+        // VariableDefinition) in *this* module, unlike a MethodReference/FieldReference used as a
+        // whole (ImportReference on those recursively imports their signature types already).
+        var graphicsTypeRef = module.ImportReference(graphicsPropGetterDef.ReturnType);
+        var graphicsTypeDef = graphicsTypeRef.Resolve();
+        if (graphicsTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Graphics from PaintEventArgs.get_Graphics's own return type"); return 1; }
+
+        var paintEventArgsCtorDef = paintEventArgsTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 2);
+        if (paintEventArgsCtorDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve PaintEventArgs(Graphics, Rectangle) constructor"); return 1; }
+        var paintEventArgsCtorRef = module.ImportReference(paintEventArgsCtorDef);
+        var rectangleTypeRef = paintEventArgsCtorDef.Parameters[1].ParameterType;
+        var rectangleTypeDef = rectangleTypeRef.Resolve();
+        if (rectangleTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Rectangle from PaintEventArgs ctor's own parameter type"); return 1; }
+        var rectangleCtorDef = rectangleTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 4);
+        if (rectangleCtorDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Rectangle(int,int,int,int) constructor"); return 1; }
+        var rectangleCtorRef = module.ImportReference(rectangleCtorDef);
+
+        var graphicsFromImageDef = graphicsTypeDef.Methods.FirstOrDefault(m => m.Name == "FromImage" && m.Parameters.Count == 1);
+        if (graphicsFromImageDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Graphics.FromImage(Image)"); return 1; }
+        var graphicsFromImageRef = module.ImportReference(graphicsFromImageDef);
+        var graphicsTranslateTransformDef = graphicsTypeDef.Methods.FirstOrDefault(m => m.Name == "TranslateTransform" && m.Parameters.Count == 2);
+        if (graphicsTranslateTransformDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Graphics.TranslateTransform(float,float)"); return 1; }
+        var graphicsTranslateTransformRef = module.ImportReference(graphicsTranslateTransformDef);
+        var graphicsDisposeDef = graphicsTypeDef.Methods.FirstOrDefault(m => m.Name == "Dispose" && m.Parameters.Count == 0);
+        if (graphicsDisposeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Graphics.Dispose()"); return 1; }
+        var graphicsDisposeRef = module.ImportReference(graphicsDisposeDef);
+
+        // Bitmap (backgroundBitmapField's own FieldType) -- Width/Height are declared on Image,
+        // Bitmap's base type; walk the chain rather than assume they're on Bitmap directly.
+        var bitmapTypeDef = backgroundBitmapField.FieldType.Resolve();
+        if (bitmapTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Bitmap from backgroundBitmap's own FieldType"); return 1; }
+        TypeDefinition? imageLikeType = bitmapTypeDef;
+        MethodDefinition? getWidthDef = null;
+        MethodDefinition? getHeightDef = null;
+        while (imageLikeType is not null && (getWidthDef is null || getHeightDef is null))
+        {
+            getWidthDef ??= imageLikeType.Methods.FirstOrDefault(m => m.Name == "get_Width");
+            getHeightDef ??= imageLikeType.Methods.FirstOrDefault(m => m.Name == "get_Height");
+            imageLikeType = imageLikeType.BaseType?.Resolve();
+        }
+        if (getWidthDef is null || getHeightDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Bitmap/Image get_Width/get_Height"); return 1; }
+        var getWidthRef = module.ImportReference(getWidthDef);
+        var getHeightRef = module.ImportReference(getHeightDef);
+        var onPaintTitleRef = module.ImportReference(onPaintTitleMethod);
+        var onPaintContentRef = module.ImportReference(onPaintContentMethod);
+
+        // --- Build __drawNotificationTextIntoBitmap():
+        //   if (backgroundBitmap == null) return;
+        //   Graphics g = Graphics.FromImage(backgroundBitmap);
+        //   if (ShadowVisible) g.TranslateTransform(9f, 9f);   // match updateBackgroundBitmap's own shadow offset
+        //   PaintEventArgs pe = new PaintEventArgs(g, new Rectangle(0, 0, backgroundBitmap.Width, backgroundBitmap.Height));
+        //   OnPaintTitle(pe);      // Callvirt -- FormIMMessageNotification overrides OnPaintContent, honor overrides
+        //   OnPaintContent(pe);
+        //   g.Dispose();
+        var helper = new MethodDefinition("__drawNotificationTextIntoBitmap", MethodAttributes.Private, module.TypeSystem.Void);
+        type.Methods.Add(helper);
+        var hIl = helper.Body.GetILProcessor();
+        var hRet = Instruction.Create(OpCodes.Ret);
+        var gLocal = new VariableDefinition(graphicsTypeRef);
+        var peLocal = new VariableDefinition(paintEventArgsTypeRef);
+        helper.Body.Variables.Add(gLocal);
+        helper.Body.Variables.Add(peLocal);
+
+        var startOfG = Instruction.Create(OpCodes.Ldarg_0);
+        hIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        hIl.Append(Instruction.Create(OpCodes.Ldfld, backgroundBitmapField));
+        hIl.Append(Instruction.Create(OpCodes.Brtrue, startOfG));
+        hIl.Append(Instruction.Create(OpCodes.Ret)); // early return, a separate Ret instruction from hRet below -- Cecil instructions can't be reused
+
+        hIl.Append(startOfG); // Ldarg_0, reused as the branch target
+        hIl.Append(Instruction.Create(OpCodes.Ldfld, backgroundBitmapField));
+        hIl.Append(Instruction.Create(OpCodes.Call, graphicsFromImageRef));
+        hIl.Append(Instruction.Create(OpCodes.Stloc, gLocal));
+
+        var afterTransform = Instruction.Create(OpCodes.Ldloc, gLocal); // first instr of the continuation, and the branch target for the ShadowVisible==false case
+        hIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        hIl.Append(Instruction.Create(OpCodes.Callvirt, shadowVisibleGetterRef));
+        hIl.Append(Instruction.Create(OpCodes.Brfalse, afterTransform));
+        hIl.Append(Instruction.Create(OpCodes.Ldloc, gLocal));
+        hIl.Append(Instruction.Create(OpCodes.Ldc_R4, 9f));
+        hIl.Append(Instruction.Create(OpCodes.Ldc_R4, 9f));
+        hIl.Append(Instruction.Create(OpCodes.Callvirt, graphicsTranslateTransformRef));
+
+        hIl.Append(afterTransform); // Ldloc gLocal, reused as the branch target -- pushes g for the PaintEventArgs ctor below
+        hIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+        hIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+        hIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        hIl.Append(Instruction.Create(OpCodes.Ldfld, backgroundBitmapField));
+        hIl.Append(Instruction.Create(OpCodes.Callvirt, getWidthRef));
+        hIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        hIl.Append(Instruction.Create(OpCodes.Ldfld, backgroundBitmapField));
+        hIl.Append(Instruction.Create(OpCodes.Callvirt, getHeightRef));
+        hIl.Append(Instruction.Create(OpCodes.Newobj, rectangleCtorRef));
+        hIl.Append(Instruction.Create(OpCodes.Newobj, paintEventArgsCtorRef));
+        hIl.Append(Instruction.Create(OpCodes.Stloc, peLocal));
+
+        hIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        hIl.Append(Instruction.Create(OpCodes.Ldloc, peLocal));
+        hIl.Append(Instruction.Create(OpCodes.Callvirt, onPaintTitleRef));
+        hIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        hIl.Append(Instruction.Create(OpCodes.Ldloc, peLocal));
+        hIl.Append(Instruction.Create(OpCodes.Callvirt, onPaintContentRef));
+
+        hIl.Append(Instruction.Create(OpCodes.Ldloc, gLocal));
+        hIl.Append(Instruction.Create(OpCodes.Callvirt, graphicsDisposeRef));
+        hIl.Append(hRet);
+
+        // --- Insert a call to the new helper at the very end of updateBackgroundBitmap(), right
+        // before its final `ret` (the method's own early `if (...) return;` guard is untouched --
+        // that path never reaches our new call, same as it never reaches the rest of the method).
+        //
+        // The final `ret` here IS a branch target -- for entirely ordinary reasons. The whole
+        // method body (after the early-return guard) is one big `using (Graphics graphics = ...)`,
+        // itself containing two more nested `using (Pen ...)` blocks for the border strokes. Each
+        // nested try's normal exit is a `leave` instruction that names the ULTIMATE target
+        // (skipping past the textually-intervening finally blocks in the CIL stream -- the CLR
+        // automatically cascades through every enclosing finally between a leave's origin and its
+        // target), and the innermost try's leave happens to target this exact final `ret`
+        // directly. Per IL-patching lesson 2, inserting new code immediately before a branch
+        // target does NOT make that branch fall through the new code -- it would jump straight
+        // over it to the original `ret`, skipping our new call entirely. And per lesson 3,
+        // separately, the outermost `using`'s own `finally` (which disposes `graphics`) has its
+        // `HandlerEnd` set to this same final `ret` instruction (the standard "one past the
+        // handler's last instruction" exclusive marker) -- inserting new code physically before it
+        // without reassigning `HandlerEnd` would silently grow that handler's own region to
+        // swallow the new code, placing it *after* the handler's `endfinally` but still nominally
+        // inside the region, where it would never actually execute (endfinally unconditionally
+        // transfers control past the whole region, not into trailing code within it).
+        //
+        // Fix (both a consequence of the same insertion): retarget every instruction whose operand
+        // is this exact `ret` (the `leave` described above) to point at our new first inserted
+        // instruction instead, and retarget any exception-handler boundary field
+        // (TryStart/TryEnd/HandlerStart/HandlerEnd) that equals it the same way. Both cases reduce
+        // to "anything that currently points at the old final instruction should point at the new
+        // first instruction instead" -- there's exactly one such branch and one such handler
+        // boundary here, but the loop below handles however many there turn out to be.
+        {
+            var body = updateBackgroundBitmapMethod.Body;
+            body.SimplifyMacros();
+            var il = body.GetILProcessor();
+            var instrs = body.Instructions;
+            var lastInstr = instrs[instrs.Count - 1];
+            if (lastInstr.OpCode != OpCodes.Ret) { Console.Error.WriteLine($"FAIL: updateBackgroundBitmap's last instruction isn't Ret (got {lastInstr.OpCode}) -- method shape changed, review needed"); return 1; }
+
+            var newFirst = Instruction.Create(OpCodes.Ldarg_0);
+            il.InsertBefore(lastInstr, newFirst);
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, helper));
+
+            int retargetedBranches = 0;
+            foreach (var instr in instrs)
+            {
+                if (instr != newFirst && instr.Operand == lastInstr)
+                {
+                    instr.Operand = newFirst;
+                    retargetedBranches++;
+                }
+            }
+            int retargetedHandlerBounds = 0;
+            foreach (var handler in body.ExceptionHandlers)
+            {
+                if (handler.TryStart == lastInstr) { handler.TryStart = newFirst; retargetedHandlerBounds++; }
+                if (handler.TryEnd == lastInstr) { handler.TryEnd = newFirst; retargetedHandlerBounds++; }
+                if (handler.HandlerStart == lastInstr) { handler.HandlerStart = newFirst; retargetedHandlerBounds++; }
+                if (handler.HandlerEnd == lastInstr) { handler.HandlerEnd = newFirst; retargetedHandlerBounds++; }
+            }
+            Console.WriteLine($"     ({retargetedBranches} branch operand(s), {retargetedHandlerBounds} handler boundary field(s) retargeted from the old final ret to the new pre-ret call)");
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::updateBackgroundBitmap -- now also draws title/content text (via the existing OnPaintTitle/OnPaintContent virtual methods, honoring subclass overrides) directly into backgroundBitmap before it's pushed to screen via the layeredWindow companion's own reliable UpdateWindow() blit, instead of relying solely on `this` form's own (bug-affected) live OnPaint");
         patched = true;
 
         module.Write(destPath);
