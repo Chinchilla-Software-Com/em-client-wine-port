@@ -70,7 +70,12 @@ if (args.Length > 0 && args[0] == "--patch-notification-click-resubscribe")
 
 if (args.Length > 0 && args[0] == "--patch-notification-timer-kick")
 {
-    return RunPatchNotificationTimerKick(args);
+    return RunPatchNotificationTimerKick(args, alsoInvalidate: false);
+}
+
+if (args.Length > 0 && args[0] == "--patch-notification-timer-kick-invalidate")
+{
+    return RunPatchNotificationTimerKick(args, alsoInvalidate: true);
 }
 
 if (args.Length > 0 && args[0] == "--version")
@@ -1848,11 +1853,18 @@ static int RunPatchNotificationClickResubscribe(string[] args)
 // Hide() as normal, via a new private bool field tracking which call this is. If content appears
 // right around the first (kick-only) tick, the timer re-arm itself is the trigger; if it stays
 // blank until the second tick's real Hide(), the re-arm alone isn't sufficient.
-static int RunPatchNotificationTimerKick(string[] args)
+//
+// Tenth round found the timer re-arm alone unsticks the avatar/icon (~70-110ms after the kick)
+// but NOT the text, which stayed invisible for at least 4.5 more seconds of recording. The
+// `alsoInvalidate` variant (--patch-notification-timer-kick-invalidate) additionally calls
+// `this.Invalidate();` in the kick branch, testing whether forcing a genuine WM_PAINT dispatch --
+// something every real Hide()-driven fade tick does on each 25ms step, but the idle Visible-hold
+// and the plain kick never do -- is what specifically unsticks text.
+static int RunPatchNotificationTimerKick(string[] args, bool alsoInvalidate)
 {
     if (args.Length < 3)
     {
-        Console.Error.WriteLine("usage: il-patcher --patch-notification-timer-kick <input-dir> <output-dir>");
+        Console.Error.WriteLine($"usage: il-patcher --patch-notification-timer-kick{(alsoInvalidate ? "-invalidate" : "")} <input-dir> <output-dir>");
         return 2;
     }
 
@@ -1911,6 +1923,23 @@ static int RunPatchNotificationTimerKick(string[] args)
         if (startDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Timer.Start from timer field's own FieldType"); return 1; }
         var setIntervalRef = module.ImportReference(setIntervalDef);
         var startRef = module.ImportReference(startDef);
+
+        MethodReference? invalidateRef = null;
+        if (alsoInvalidate)
+        {
+            // Invalidate() is inherited from System.Windows.Forms.Control -- walk the base-type
+            // chain to resolve it (same technique as RunPatchDiag's getHandle/getWidth/getHeight),
+            // not typeof() reflection (CLAUDE.md's IL-patching lesson 5).
+            TypeDefinition? controlType = type;
+            while (controlType is not null && controlType.FullName != "System.Windows.Forms.Control")
+            {
+                controlType = controlType.BaseType?.Resolve();
+            }
+            if (controlType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control in base-type chain"); return 1; }
+            var invalidateDef = controlType.Methods.FirstOrDefault(m => m.Name == "Invalidate" && m.Parameters.Count == 0);
+            if (invalidateDef is null) { Console.Error.WriteLine("FAIL: Control missing parameterless Invalidate()"); return 1; }
+            invalidateRef = module.ImportReference(invalidateDef);
+        }
 
         // --- Step 1: OnShown -- override the Visible-transition's `timer.Interval = timeToStay;`
         // with a hardcoded short interval, right after the original call (leaving the original
@@ -1973,6 +2002,11 @@ static int RunPatchNotificationTimerKick(string[] args)
         kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
         kickIl.Append(Instruction.Create(OpCodes.Ldfld, timerField));
         kickIl.Append(Instruction.Create(OpCodes.Call, startRef));
+        if (alsoInvalidate)
+        {
+            kickIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+            kickIl.Append(Instruction.Create(OpCodes.Callvirt, invalidateRef));
+        }
         kickIl.Append(Instruction.Create(OpCodes.Br, ret));
         kickIl.Append(elseLabel); // Ldarg_0, reused as the else-branch's first instruction
         kickIl.Append(Instruction.Create(OpCodes.Call, module.ImportReference(hideMethod)));
@@ -1996,7 +2030,7 @@ static int RunPatchNotificationTimerKick(string[] args)
             if (hideCallCount != 1) { Console.Error.WriteLine($"FAIL: expected exactly 1 Hide() call in timer_OnTimer, found {hideCallCount} -- method shape changed, review needed"); return 1; }
         }
 
-        Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- forced Visible-hold timer to {kickAfterMs}ms; {targetType}::timer_OnTimer -- first tick now re-arms via __diagKickOrHide() instead of calling Hide(), second tick calls Hide() as normal");
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- forced Visible-hold timer to {kickAfterMs}ms; {targetType}::timer_OnTimer -- first tick now re-arms{(alsoInvalidate ? " + Invalidate()s" : "")} via __diagKickOrHide() instead of calling Hide(), second tick calls Hide() as normal");
         patched = true;
 
         module.Write(destPath);
