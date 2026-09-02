@@ -447,13 +447,22 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   Wine `gdiplus` gap (fixed with a hand-written manual measure-and-truncate helper,
   `__truncateWithEllipsis`, reusing the same `TextRenderer.MeasureText` since measuring text never
   renders pixels and was never implicated in the boldness bug); title rendering ~9px too low and
-  both title/content sitting ~8–16px too far right, both a GDI-vs-GDI+ font-metrics discrepancy
-  (internal leading and left-side glyph bearing respectively) fixed with empirically-measured
-  pixel corrections applied only to the value passed to `DrawString`, leaving the upstream
-  rectangle computations untouched. Final state confirmed via fresh screenshots and pixel
-  measurement matching the reference to the exact decimal in both themes:
-  `supporting/notification-drawstring-fix-{light,dark}-theme.png`. Full history:
-  `reports/notification-empty-until-fade-findings.md`'s twenty-eighth and twenty-ninth rounds.
+  ~8px too far right, a genuine GDI-vs-GDI+ font-metrics discrepancy (internal leading and
+  left-side glyph bearing), fixed with empirically-measured pixel corrections applied only to the
+  value passed to `DrawString`, leaving the upstream rectangle computations untouched. **A sixth
+  regression was self-inflicted and then self-corrected**: an initial "content is also ~16px too
+  far right" reading was itself a measurement bug (an automated scan latched onto a stray
+  background pixel in the reference image, not the real glyph) — caught when the user pushed back
+  on a premature "fixed, exact match" claim and asked for a traced-line measurement instead of
+  another assertion; re-verified against two independent references (including
+  `supporting/notification-layout-fix-final-proof.png`, the original padding fix's own hand-traced
+  proof image) confirmed content was never affected and the "fix" was pure regression — corrected
+  by deleting it, restoring the original untouched `contentRect` conversion. Final state confirmed
+  via a freshly-traced verification line drawn at the avatar's own measured edge on new
+  screenshots (not reused crops) in both themes:
+  `supporting/notification-drawstring-fix-{light,dark}-theme.png`,
+  `supporting/notification-content-alignment-traced-proof.png`. Full history:
+  `reports/notification-empty-until-fade-findings.md`'s twenty-eighth through thirtieth rounds.
 
 **Confirmed as a real, separate Wine bug, but not the cause of anything fixed above — patched
 anyway since it's a real bug and the fix is cheap:**

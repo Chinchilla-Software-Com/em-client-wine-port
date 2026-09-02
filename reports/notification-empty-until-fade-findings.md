@@ -2300,3 +2300,67 @@ to reflect this final, fully-corrected state.
 Only remaining open item from this round's original two bugs: hover-pause-timer (Bug 2), not
 touched this round -- still open, see the twenty-eighth round's own writeup for the root-caused
 mechanism.
+
+## Thirtieth round: the content "-16" X correction above was itself wrong -- self-inflicted
+regression from a flawed measurement, caught by the user pushing back on a premature "exact
+match" claim, fixed by REMOVING the bad correction rather than adjusting it
+
+Immediately after the twenty-ninth round's fixes, this session displayed the two fix screenshots
+and asserted the alignment was proven correct. The user pushed back hard, specifically naming the
+earlier padding-fix work this project spent real effort calibrating, and asked for a proper traced
+measurement instead of another assertion -- exactly the standing "measure, don't eyeball" rule
+this project has needed reinforced before. Right to push: the claim was wrong.
+
+**Root cause of the false claim: the reference measurement itself was bad.** The twenty-ninth
+round's content-X measurement compared against `notification-dark-theme-normal-text-comparison.png`
+using an automated first-non-background-pixel scan that, for that specific image, latched onto a
+stray pixel bleeding in from UI behind the notification (visible in the crop, outside the
+notification's own left border) rather than the real "R" of "Re:" -- producing a spurious "-20"
+offset-from-avatar reading that was then treated as ground truth and used to derive a "-16"
+correction. That correction was applied confidently, decompiled clean, deployed, and re-measured
+using the SAME flawed methodology, which of course agreed with itself -- a measurement bug that
+validated its own output, the specific failure mode "measure, don't eyeball" exists to catch, and
+in this case a second layer of rigor (re-deriving the SAME wrong number a second time) wasn't
+enough on its own.
+
+**Corrected via two independent, more careful re-measurements:**
+1. `supporting/notification-layout-fix-final-proof.png` -- a genuinely authoritative reference
+   from the ORIGINAL content-padding fix work, with an actual hand-traced cyan vertical line
+   already drawn through the avatar's own left edge. Read directly off a pixel-gridded overlay
+   (not automated scanning) -- content's "R" sits essentially at/just right of that line, not
+   -20px left of it.
+2. Re-scanning `notification-dark-theme-normal-text-comparison.png` itself with a corrected,
+   bounded, median-filtered scan (restricted to x >= 60 to exclude the stray background pixel,
+   sampling many rows and taking the median instead of the first row's answer) -- content's real
+   offset from the avatar's left edge is `+5` (3x-scale), not `-20`. Both independent
+   re-measurements agree: content sits modestly RIGHT of the avatar's edge, matching
+   `doLayout()`'s own `contentRect.X = scaledPadding.Left + 9` formula (`imageRect.X` is
+   `scaledPadding.Left` with no `+9`) almost exactly -- confirming content was **never actually
+   affected by a GDI+ left-bearing shift the way title was**; the plain, uncorrected
+   `contentRect` conversion was already correct, and the "-16" fix was pure regression.
+
+Fixed by deleting the erroneous correction entirely -- content's `RectangleF` is back to a
+straight `op_Implicit(contentRect)` conversion, no adjustment, matching what it was before the
+twenty-ninth round's content-X change was ever introduced. Re-verified with the same traced-line
+technique applied fresh to the corrected build: a cyan/magenta line drawn programmatically at the
+avatar's own measured left edge on the ACTUAL new screenshot (not reusing any old crop), content's
+"Re:" now falls clearly to the right of that line in both themes, and the bounded/median-filtered
+measurement reads `+8.7px` native offset from the avatar's left edge -- matching the `+9` formula
+almost exactly. `supporting/notification-content-alignment-traced-proof.png` is this round's own
+traced-line evidence, kept alongside the original `notification-layout-fix-final-proof.png` it was
+checked against. `supporting/notification-drawstring-fix-{light,dark}-theme.png` were re-captured
+again (third time) to reflect the actually-correct final state. `il-patches/output-drawstring6/`
+is the current fully-verified, deployed checkpoint, superseding `output-drawstring5/`.
+
+Title's own `-8`/`-9` X/Y corrections were NOT touched this round -- those were verified against
+the same two independent references and are not implicated in this specific bug (title's shift
+really was real, confirmed two rounds running now).
+
+**Lesson for this file's own future readers, not just il-patcher's IL-patching lessons:** an
+automated pixel-measurement script is not automatically more trustworthy than eyeballing just
+because it produces a number -- if the script's own scan window or background-detection logic is
+wrong, it will confidently reproduce the same wrong number every time it's re-run, including
+during a supposedly independent re-check. Prefer a second, genuinely different measurement
+technique (here: reading a gridded overlay directly, and consulting a DIFFERENT pre-existing
+reference image with its own hand-verified trace line) over re-running the same script again as
+"confirmation."

@@ -3358,22 +3358,24 @@ static int RunPatchNotificationTextDrawString(string[] args)
                 pushText: new List<Instruction> { Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldfld, contentField) },
                 pushFont: new List<Instruction> { Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Callvirt, controlGetFontRef) },
                 pushColor: new List<Instruction> { Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Callvirt, controlGetForeColorRef) },
-                // Built from contentRect's own parts (not a plain op_Implicit conversion) so the
-                // X can be corrected the same way as title's -- measured the same way: content's
-                // first line ("Re: ...") left edge sat 28px right of the avatar's own left edge
-                // in the new DrawString capture vs -20px in the old TextRenderer reference (i.e.
-                // to the LEFT of the avatar's own edge, since content is indented less than the
-                // avatar sits from the notification's own left border), a 48px-at-3x-scale =
-                // 16px-native difference -- about double title's shift, plausibly because
-                // content's font is a different size (side-bearing scales with font size) rather
-                // than a shared fixed DrawString quirk. Same GDI+-left-bearing-vs-GDI root cause.
+                // NO X correction for content -- a "-16" correction was applied here in an earlier
+                // draft based on a flawed measurement (the automated pixel-scan caught a stray
+                // background pixel bleeding in from UI behind the notification crop, not the real
+                // "R" glyph, in the reference image it was compared against). Re-measured properly
+                // (grid-overlaid images, read directly, plus a bounded/median-filtered rescan) using
+                // TWO independent known-correct references
+                // (supporting/notification-layout-fix-final-proof.png, which has an actual hand-
+                // traced vertical line at the avatar's own left edge from the original padding fix,
+                // and supporting/notification-dark-theme-normal-text-comparison.png): content's
+                // first line sits modestly to the RIGHT of the avatar's left edge (a few px, at
+                // native scale), matching doLayout()'s own `contentRect.X = scaledPadding.Left + 9`
+                // formula (avatar/imageRect.X is `scaledPadding.Left`, no +9) almost exactly -- i.e.
+                // content was NEVER actually affected by title's GDI+-left-bearing shift in a way
+                // that needed correcting; the plain op_Implicit conversion (unchanged rect, exactly
+                // as doLayout computed it) is already correct.
                 pushRectF: new List<Instruction> {
-                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldflda, contentRectField), Instruction.Create(OpCodes.Call, rectGetXRef),
-                    Instruction.Create(OpCodes.Ldc_I4, 16), Instruction.Create(OpCodes.Sub), Instruction.Create(OpCodes.Conv_R4),
-                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldflda, contentRectField), Instruction.Create(OpCodes.Call, rectGetYRef), Instruction.Create(OpCodes.Conv_R4),
-                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldflda, contentRectField), Instruction.Create(OpCodes.Call, rectGetWidthRef), Instruction.Create(OpCodes.Conv_R4),
-                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldflda, contentRectField), Instruction.Create(OpCodes.Call, rectGetHeightRef), Instruction.Create(OpCodes.Conv_R4),
-                    Instruction.Create(OpCodes.Newobj, rectangleFCtor4Ref)
+                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldfld, contentRectField),
+                    Instruction.Create(OpCodes.Call, rectToRectFOpRef)
                 },
                 formatFlags: stringFormatFlagsLineLimit);
         }
