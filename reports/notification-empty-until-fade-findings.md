@@ -1338,3 +1338,84 @@ by a polled marker file at `Z:\tmp\claude-close-signal`) without needing to ask 
 it by hand before every redeploy. Confirmed via a live close+relaunch cycle to produce no DB-repair
 prompt, unlike killing the process. See `feedback_close_listener_tool` in this session's memory for
 reuse in future rounds; must be stripped before any release build.
+
+## Nineteenth round: direct font/AA pixel comparison against the real-Windows reference (no new patch)
+
+User directly challenged this whole line of investigation: several rounds had chased font
+*registration* hypotheses (headerFont null, OnLoad never firing) without ever doing the cheapest
+possible check first -- put the working-Windows screenshot and the Wine screenshot side by side and
+look at the actual pixels. Also flagged two process problems, both fixed before this round's actual
+comparison could even happen:
+
+1. **The dev/testing rule allowing this session to start and close eM Client itself
+   ([[feedback_close_listener_tool]]) was being under-used** -- this session had been asking the
+   user to launch/watch the app each cycle instead of just doing it. Corrected; see that memory's
+   own note.
+2. **`--patch-test-monogram-avatar`'s fixed one-shot delay timer lost its race against a real
+   capture attempt** -- a delay-timed screenshot found the notification window already
+   `Map State: IsUnMapped` (auto-hidden) by the time it ran, producing nothing useful. Per the
+   user's own suggestion, converted it to the same file-trigger polling idiom already used by
+   `--patch-close-listener`: it now polls every 150ms for `Z:\tmp\claude-trigger-notification`
+   instead of firing after a guessed delay, so a screen recording can start first (with no time
+   pressure at all) and the notification fires on this side's own schedule by touching the trigger
+   file once ready. Confirmed via decompile: the new `__monogramTestTick` reads exactly like
+   `__closeListenerTick`'s own `if (File.Exists(...)) { File.Delete(...); ... }` shape. No branch/
+   handler-region concerns (a plain `Brfalse` to the method's own final `ret`, verified by
+   decompile).
+
+**Method:** started an `ffmpeg -f x11grab` recording of the notification's screen region *first*,
+waited 1.5s for it to actually start, then `touch`ed the trigger file, and let the recording run
+8s (long enough to cover the trigger, the still-open empty-box-until-fade gap, and the fade-out
+transition). Extracted frames with `ffmpeg -vf fps=...` and compared against
+`supporting/notifications-working-example-from-windows-with-long-subject.png` at matched, upscaled
+(nearest-neighbor, to avoid the resampling blur that caused the eighteenth round's own padding
+false alarm) crops.
+
+**Confirms the still-open empty-box bug reproduces exactly as documented:** the test notification's
+content area was genuinely blank for the entire ~6.5s hold, and both title and content text only
+became visible once the fade-out transition began -- not a new finding, but a live, direct
+re-confirmation with the file-trigger method now in hand for any future round of that
+investigation.
+
+**Font family/size: no mismatch found.** At matched zoom, the Wine-rendered title ("Jaguar Workshop
+Auto Resto...") and the Windows-rendered title ("Test Sender Full Name") show the same letterform
+style -- proportions, x-height, and two-story lowercase 'a' all consistent with the same font
+family (Segoe UI or a close match), not a fallback/substituted typeface. Sizing relative to the
+avatar circle is in the same ballpark on both sides. No font-substitution bug.
+
+**Initial false lead, caught and ruled out before being reported as a bug: apparent "blue content
+text" on Windows.** Pixel-sampling the Windows reference's content line at first turned up
+strongly blue-skewed pixels (e.g. RGB (86,158,224), (158,224,255)) against a near-neutral Wine
+sample (e.g. (152,159,143), (110,120,114)) -- looked exactly like a real, distinct
+content-vs-title color bug. Checked the app's own code before reporting it as one (per this
+project's standing "decompile and verify before concluding" discipline): grepped every
+`IColorTheme` implementation in `MailClient.Common.UI.dll` (all 20 -- Aqua, Arctic, BlueLight,
+Bordeaux, Classic, Custom, Dark, Default, Green, IceWarp, Industry, Mystic, Pink, RedEffect, Rose,
+System, TurkCellDark, TurkCellLight, Viola, YellowJacket) for `NotificationWindowForeground`
+(content color, used by `OnPaintContent`'s `ForeColor`) vs `NotificationWindowHeaderForeground`
+(title color) -- **every single theme sets both to the identical value**, with no exception. There
+is no theme, built-in or otherwise, in which this app's own design would show title and content in
+different colors, let alone make content specifically blue. So a theme-selection mismatch (the
+eighteenth round's `CornerRadius` false-alarm shape) couldn't be the explanation either.
+
+Re-examined the Windows reference at higher zoom (4x, nearest-neighbor) with this in mind, and the
+answer became visually obvious: the "blue" pixels are **ClearType/subpixel anti-aliasing fringing**
+-- a thin orange/red fringe on one side of each glyph stroke and a blue/cyan fringe on the other
+(classic LCD-subpixel AA signature on a dark background), not a solid blue fill. The underlying
+text is the same white/gray as the title; ClearType's per-subpixel rendering just colors its AA
+transition pixels. The same zoom level on the Wine-rendered title showed pure grayscale AA
+gradients at glyph edges -- no color fringing at all, confirmed by sampling (R≈G≈B throughout,
+e.g. (84,89,89), (78,77,82) -- no orange/blue split at any edge pixel).
+
+**Conclusion: the real, confirmed rendering difference is anti-aliasing method, not font
+substitution or color.** Windows renders notification text with ClearType (subpixel/LCD-aware AA,
+producing colored edge fringing); Wine's GDI+ text rendering uses plain grayscale AA (no
+subpixel/LCD awareness). This is a rendering-*engine* characteristic of Wine's `gdiplus`/font
+stack as a whole (consistent with this project's very first finding --
+`gdiplus-interpolation-findings.md` -- that Wine's GDI+ implements only a subset of GDI+'s
+rendering features) rather than anything specific to this notification code or fixable via an
+app-level IL patch: ClearType requires knowing the physical subpixel layout of the actual display
+and rendering per-subpixel, which is a font-rasterizer/compositor capability, not something
+`MailClient.dll` or `MailClient.Common.UI.dll` control at all. No patch applied or planned for
+this -- flagging it here so a future round doesn't re-open the same "font looks wrong" question
+without first re-reading this comparison.

@@ -1801,7 +1801,7 @@ static int RunPatchNotificationForceOnLoad(string[] args)
     return 0;
 }
 
-// --patch-test-monogram-avatar <input-dir> <output-dir> [delayMs]
+// --patch-test-monogram-avatar <input-dir> <output-dir> [pollIntervalMs]
 //
 // Dev/testing-only tool (not a real fix, not for release builds), requested to verify the "no
 // avatar image" case: when a sender has no photo, `AvatarHelper.GetAvatarWithFallback` falls back
@@ -1813,6 +1813,14 @@ static int RunPatchNotificationForceOnLoad(string[] args)
 // --patch-auto-test-notification's synthetic NewMailsCount path (which always uses the app icon,
 // never a monogram) -- this patch exercises `UIAvatar.FromMonogram` directly instead, independent
 // of both.
+//
+// Originally fired from a fixed one-shot delay timer (guess how long startup takes, then race a
+// screenshot/recording against it) -- lost that race for real: a delay-timed capture attempt found
+// the notification window already `IsUnMapped` (auto-hidden) by the time it ran. Switched to the
+// same file-trigger polling idiom as --patch-close-listener instead: start the capture (recording
+// or screenshot) FIRST, with nothing time-pressured about it, then `touch
+// /tmp/claude-trigger-notification` once ready -- the notification fires on this side's own
+// schedule instead of a guessed delay, so there's no capture race to lose.
 //
 // Adds a new PUBLIC method `__showTestMonogramNotification(string, string, string, string)` to
 // FormGenericNotification (public, not protected, specifically so formMain -- a different class,
@@ -1827,14 +1835,21 @@ static int RunPatchTestMonogramAvatar(string[] args)
 {
     if (args.Length < 3)
     {
-        Console.Error.WriteLine("usage: il-patcher --patch-test-monogram-avatar <input-dir> <output-dir> [delayMs]");
+        Console.Error.WriteLine("usage: il-patcher --patch-test-monogram-avatar <input-dir> <output-dir> [pollIntervalMs]");
         return 2;
     }
 
     string inDir = args[1];
     string outDir = args[2];
     Directory.CreateDirectory(outDir);
-    int delayMs = args.Length > 3 && int.TryParse(args[3], out var d) ? d : 3000;
+    // A fixed delay meant guessing how long app startup takes, then racing a screen
+    // recording/screenshot against it -- lost that race for real (see this project's own
+    // findings: notification was already IsUnMapped by the time a delay-timed capture ran).
+    // File-trigger instead, same polling idiom as --patch-close-listener: start the capture
+    // FIRST, then touch the trigger file once ready, so the notification fires at a moment this
+    // side controls exactly instead of guessing.
+    int pollIntervalMs = args.Length > 3 && int.TryParse(args[3], out var d) ? d : 150;
+    const string triggerPath = @"Z:\tmp\claude-trigger-notification";
 
     const string targetAssembly = "MailClient.dll";
     const string mainFormType = "MailClient.UI.Forms.formMain";
@@ -1960,6 +1975,11 @@ static int RunPatchTestMonogramAvatar(string[] args)
         var timerStopRef = module.ImportReference(timerStopDef);
         var timerTypeRef = module.ImportReference(timerTypeDef);
         var eventHandlerCtorRef = module.ImportReference(typeof(EventHandler).GetConstructor(new[] { typeof(object), typeof(IntPtr) })!);
+        // File.Exists/Delete are CoreLib -- safe via typeof() reflection (IL-patching lesson 5
+        // only bites app-deployed assemblies like System.Drawing.Primitives, not CoreLib/its
+        // forwarding facades), same as --patch-close-listener's own use of these two methods.
+        var fileExistsRef = module.ImportReference(typeof(File).GetMethod("Exists", new[] { typeof(string) })!);
+        var fileDeleteRef = module.ImportReference(typeof(File).GetMethod("Delete", new[] { typeof(string) })!);
 
         // --- New public method on FormGenericNotification:
         //   public void __showTestMonogramNotification(string title, string content, string monogram, string hashSeed)
@@ -2025,6 +2045,13 @@ static int RunPatchTestMonogramAvatar(string[] args)
         var notifLocal = new VariableDefinition(module.ImportReference(notifType));
         ttBody.Variables.Add(notifLocal);
         var ttIl = ttBody.GetILProcessor();
+        // if (!File.Exists(triggerPath)) return;  -- keep polling, don't fire yet.
+        var ttRet = Instruction.Create(OpCodes.Ret);
+        ttIl.Append(Instruction.Create(OpCodes.Ldstr, triggerPath));
+        ttIl.Append(Instruction.Create(OpCodes.Call, fileExistsRef));
+        ttIl.Append(Instruction.Create(OpCodes.Brfalse, ttRet));
+        ttIl.Append(Instruction.Create(OpCodes.Ldstr, triggerPath));
+        ttIl.Append(Instruction.Create(OpCodes.Call, fileDeleteRef));
         ttIl.Append(Instruction.Create(OpCodes.Ldarg_0));
         ttIl.Append(Instruction.Create(OpCodes.Ldfld, timerField));
         ttIl.Append(Instruction.Create(OpCodes.Callvirt, timerStopRef));
@@ -2044,7 +2071,7 @@ static int RunPatchTestMonogramAvatar(string[] args)
         ttIl.Append(Instruction.Create(OpCodes.Ldstr, "JW"));
         ttIl.Append(Instruction.Create(OpCodes.Ldstr, "Jaguar Workshop Auto Restoration Specialists Ltd"));
         ttIl.Append(Instruction.Create(OpCodes.Callvirt, testMethodRef));
-        ttIl.Append(Instruction.Create(OpCodes.Ret));
+        ttIl.Append(ttRet);
 
         // --- Prepend to formMain.OnShown: create/configure/start __monogramTestTimer.
         {
@@ -2059,7 +2086,7 @@ static int RunPatchTestMonogramAvatar(string[] args)
                 Instruction.Create(OpCodes.Stfld, timerField),
                 Instruction.Create(OpCodes.Ldarg_0),
                 Instruction.Create(OpCodes.Ldfld, timerField),
-                Instruction.Create(OpCodes.Ldc_I4, delayMs),
+                Instruction.Create(OpCodes.Ldc_I4, pollIntervalMs),
                 Instruction.Create(OpCodes.Callvirt, timerSetIntervalRef),
                 Instruction.Create(OpCodes.Ldarg_0),
                 Instruction.Create(OpCodes.Ldfld, timerField),
@@ -2073,7 +2100,7 @@ static int RunPatchTestMonogramAvatar(string[] args)
             );
         }
 
-        Console.WriteLine($"OK   {fileName}: added FormGenericNotification::__showTestMonogramNotification and {mainFormType}::OnShown -- fires a one-shot {delayMs}ms timer showing a test FormMailNotification with a UIAvatar.FromMonogram(\"JW\", \"Jaguar Workshop\") avatar, matching supporting/email-with-no-image.png");
+        Console.WriteLine($"OK   {fileName}: added FormGenericNotification::__showTestMonogramNotification and {mainFormType}::OnShown -- polls every {pollIntervalMs}ms for {triggerPath}; when present, deletes it and shows a test FormMailNotification with a UIAvatar.FromMonogram(\"JW\", \"Jaguar Workshop\") avatar, matching supporting/email-with-no-image.png");
         patched = true;
 
         module.Write(destPath);
