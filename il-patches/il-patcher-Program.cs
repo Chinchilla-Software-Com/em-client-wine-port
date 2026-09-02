@@ -38,6 +38,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-force-onload")
     return RunPatchNotificationForceOnLoad(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-test-monogram-avatar")
+{
+    return RunPatchTestMonogramAvatar(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-settings-refresh")
 {
     return RunPatchSettingsRefresh(args);
@@ -1774,6 +1779,293 @@ static int RunPatchNotificationForceOnLoad(string[] args)
         );
 
         Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- now calls OnLoad(EventArgs.Empty) directly (guarded by the existing `loaded` field, so exactly once per form instance) if it hasn't already run, since OnLoad appears to never fire on its own under Wine -- this is what sets headerFont/Font to the intended UI font instead of leaving headerFont permanently null");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-test-monogram-avatar <input-dir> <output-dir> [delayMs]
+//
+// Dev/testing-only tool (not a real fix, not for release builds), requested to verify the "no
+// avatar image" case: when a sender has no photo, `AvatarHelper.GetAvatarWithFallback` falls back
+// to `UIAvatar.FromMonogram(monogram, hashString)` -- a colored-circle-plus-initials avatar,
+// confirmed by decompile to be generated via plain GDI+ vector drawing (`Graphics.FillEllipse` +
+// `Graphics.DrawString`, no `InterpolationMode` involved at all), then fed into the exact same
+// `Image` property and `updateBackgroundBitmap()` rendering path as any other avatar. Cannot be
+// exercised via the real-mail test path (the test account's contacts all have photos) or via
+// --patch-auto-test-notification's synthetic NewMailsCount path (which always uses the app icon,
+// never a monogram) -- this patch exercises `UIAvatar.FromMonogram` directly instead, independent
+// of both.
+//
+// Adds a new PUBLIC method `__showTestMonogramNotification(string, string, string, string)` to
+// FormGenericNotification (public, not protected, specifically so formMain -- a different class,
+// not a subclass -- can call it directly without needing to route through Notification/
+// ShowNotification's virtual-dispatch machinery the way --patch-auto-test-notification does), and
+// a new one-shot timer in formMain.OnShown (same safe top-of-method insertion pattern used
+// throughout this file) that constructs a FormMailNotification, positions and shows it, then
+// calls that new method with fixed test values matching supporting/email-with-no-image.png
+// ("Jaguar Workshop" / "JW"). Standalone -- not combined with --patch-auto-test-notification's own
+// timer in this version, to keep this one-off verification simple.
+static int RunPatchTestMonogramAvatar(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-test-monogram-avatar <input-dir> <output-dir> [delayMs]");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+    int delayMs = args.Length > 3 && int.TryParse(args[3], out var d) ? d : 3000;
+
+    const string targetAssembly = "MailClient.dll";
+    const string mainFormType = "MailClient.UI.Forms.formMain";
+    const string notifFormType = "MailClient.UI.Forms.NotificationForms.FormMailNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var mainType = module.GetType(mainFormType);
+        if (mainType is null) { Console.Error.WriteLine($"FAIL: type not found: {mainFormType}"); return 1; }
+        var onShownMethod = mainType.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody && m.Parameters.Count == 1);
+        if (onShownMethod is null) { Console.Error.WriteLine($"FAIL: OnShown not found on {mainFormType}"); return 1; }
+
+        var notifType = module.GetType(notifFormType);
+        if (notifType is null) { Console.Error.WriteLine($"FAIL: type not found: {notifFormType}"); return 1; }
+        var notifCtorDef = notifType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0);
+        if (notifCtorDef is null) { Console.Error.WriteLine($"FAIL: {notifFormType} missing parameterless constructor"); return 1; }
+        var notifCtorRef = module.ImportReference(notifCtorDef);
+
+        var genericNotifType = notifType.BaseType?.Resolve();
+        if (genericNotifType is null || genericNotifType.FullName != "MailClient.UI.Forms.NotificationForms.FormGenericNotification")
+        {
+            Console.Error.WriteLine($"FAIL: expected {notifFormType}'s base type to be FormGenericNotification, got {genericNotifType?.FullName}");
+            return 1;
+        }
+
+        var setTitleDef = genericNotifType.Methods.FirstOrDefault(m => m.Name == "set_Title");
+        var setContentDef = genericNotifType.Methods.FirstOrDefault(m => m.Name == "set_Content");
+        var setImageDef = genericNotifType.Methods.FirstOrDefault(m => m.Name == "set_Image");
+        if (setTitleDef is null || setContentDef is null || setImageDef is null) { Console.Error.WriteLine("FAIL: FormGenericNotification missing set_Title/set_Content/set_Image"); return 1; }
+        var setTitleRef = module.ImportReference(setTitleDef);
+        var setContentRef = module.ImportReference(setContentDef);
+        var setImageRef = module.ImportReference(setImageDef);
+
+        var updateLayeredBackgroundMethod = genericNotifType.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground" && m.HasBody) ??
+            genericNotifType.BaseType?.Resolve()?.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground");
+        if (updateLayeredBackgroundMethod is null) { Console.Error.WriteLine("FAIL: updateLayeredBackground(bool) not found"); return 1; }
+        var updateLayeredBackgroundRef = module.ImportReference(updateLayeredBackgroundMethod);
+
+        var notifShowDef = genericNotifType.Methods.FirstOrDefault(m => m.Name == "Show" && m.Parameters.Count == 1);
+        if (notifShowDef is null) { Console.Error.WriteLine("FAIL: FormGenericNotification missing Show(IWin32Window)"); return 1; }
+        var notifShowRef = module.ImportReference(notifShowDef);
+
+        TypeDefinition? formType = genericNotifType;
+        while (formType is not null && formType.FullName != "System.Windows.Forms.Control")
+        {
+            formType = formType.BaseType?.Resolve();
+        }
+        if (formType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control in base-type chain"); return 1; }
+        var setLocationDef = formType.Methods.FirstOrDefault(m => m.Name == "set_Location");
+        var performLayoutDef = formType.Methods.FirstOrDefault(m => m.Name == "PerformLayout" && m.Parameters.Count == 0);
+        var invalidateDef = formType.Methods.FirstOrDefault(m => m.Name == "Invalidate" && m.Parameters.Count == 0);
+        if (setLocationDef is null || performLayoutDef is null || invalidateDef is null) { Console.Error.WriteLine("FAIL: Control missing set_Location/PerformLayout()/Invalidate()"); return 1; }
+        var setLocationRef = module.ImportReference(setLocationDef);
+        var performLayoutRef = module.ImportReference(performLayoutDef);
+        var invalidateRef = module.ImportReference(invalidateDef);
+
+        var pointTypeRef = setLocationDef.Parameters[0].ParameterType;
+        var pointTypeDef = pointTypeRef.Resolve();
+        if (pointTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Point from set_Location's parameter type"); return 1; }
+        var pointCtorDef = pointTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 2);
+        if (pointCtorDef is null) { Console.Error.WriteLine("FAIL: Point missing (int, int) constructor"); return 1; }
+        var pointCtorRef = module.ImportReference(pointCtorDef);
+
+        const string avatarTypeName = "MailClient.UI.UIAvatar";
+        var avatarType = module.GetType(avatarTypeName);
+        if (avatarType is null) { Console.Error.WriteLine($"FAIL: type not found: {avatarTypeName}"); return 1; }
+        var fromMonogramDef = avatarType.Methods.FirstOrDefault(m => m.Name == "FromMonogram" && m.Parameters.Count == 2);
+        if (fromMonogramDef is null) { Console.Error.WriteLine("FAIL: UIAvatar.FromMonogram(string,string) not found"); return 1; }
+        var fromMonogramRef = module.ImportReference(fromMonogramDef);
+        var getRoundImageDef = avatarType.Methods.FirstOrDefault(m => m.Name == "GetRoundImage");
+        if (getRoundImageDef is null) { Console.Error.WriteLine("FAIL: UIAvatar.GetRoundImage(Size) not found"); return 1; }
+        var getRoundImageRef = module.ImportReference(getRoundImageDef);
+        var avatarDisposeDef = avatarType.Methods.FirstOrDefault(m => m.Name == "Dispose" && m.Parameters.Count == 0);
+        if (avatarDisposeDef is null) { Console.Error.WriteLine("FAIL: UIAvatar.Dispose() not found"); return 1; }
+        var avatarDisposeRef = module.ImportReference(avatarDisposeDef);
+
+        // Size -- resolve from GetRoundImage's own parameter type, not typeof() reflection
+        // (System.Drawing.Primitives is app-deployed -- IL-patching lesson 5).
+        var sizeTypeRef = getRoundImageDef.Parameters[0].ParameterType;
+        var sizeTypeDef = sizeTypeRef.Resolve();
+        if (sizeTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Size from GetRoundImage's own parameter type"); return 1; }
+        var sizeCtorDef = sizeTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 2);
+        if (sizeCtorDef is null) { Console.Error.WriteLine("FAIL: Size missing (int, int) constructor"); return 1; }
+        var sizeCtorRef = module.ImportReference(sizeCtorDef);
+
+        // Timer -- resolve from formType's own module, same pattern as --patch-close-listener.
+        var timerTypeDef = formType.Module.GetType("System.Windows.Forms.Timer");
+        if (timerTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Timer"); return 1; }
+        var timerCtorDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0);
+        var timerSetIntervalDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "set_Interval");
+        var timerAddTickDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "add_Tick");
+        var timerStartDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "Start" && m.Parameters.Count == 0);
+        var timerStopDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "Stop" && m.Parameters.Count == 0);
+        if (timerCtorDef is null || timerSetIntervalDef is null || timerAddTickDef is null || timerStartDef is null || timerStopDef is null)
+        {
+            Console.Error.WriteLine("FAIL: Timer missing one of .ctor()/set_Interval/add_Tick/Start()/Stop()");
+            return 1;
+        }
+        var timerCtorRef = module.ImportReference(timerCtorDef);
+        var timerSetIntervalRef = module.ImportReference(timerSetIntervalDef);
+        var timerAddTickRef = module.ImportReference(timerAddTickDef);
+        var timerStartRef = module.ImportReference(timerStartDef);
+        var timerStopRef = module.ImportReference(timerStopDef);
+        var timerTypeRef = module.ImportReference(timerTypeDef);
+        var eventHandlerCtorRef = module.ImportReference(typeof(EventHandler).GetConstructor(new[] { typeof(object), typeof(IntPtr) })!);
+
+        // --- New public method on FormGenericNotification:
+        //   public void __showTestMonogramNotification(string title, string content, string monogram, string hashSeed)
+        //   {
+        //       Title = title; Content = content;
+        //       UIAvatar avatar = UIAvatar.FromMonogram(monogram, hashSeed);
+        //       Image = avatar.GetRoundImage(new Size(32, 32));
+        //       avatar.Dispose();
+        //       PerformLayout();
+        //       updateLayeredBackground(refreshBitmap: true);
+        //       Invalidate();
+        //   }
+        var testMethod = new MethodDefinition("__showTestMonogramNotification", MethodAttributes.Public, module.TypeSystem.Void);
+        testMethod.Parameters.Add(new ParameterDefinition("title", ParameterAttributes.None, module.TypeSystem.String));
+        testMethod.Parameters.Add(new ParameterDefinition("content", ParameterAttributes.None, module.TypeSystem.String));
+        testMethod.Parameters.Add(new ParameterDefinition("monogram", ParameterAttributes.None, module.TypeSystem.String));
+        testMethod.Parameters.Add(new ParameterDefinition("hashSeed", ParameterAttributes.None, module.TypeSystem.String));
+        genericNotifType.Methods.Add(testMethod);
+        var tmBody = testMethod.Body;
+        tmBody.InitLocals = true;
+        var avatarLocal = new VariableDefinition(module.ImportReference(avatarType));
+        tmBody.Variables.Add(avatarLocal);
+        var tmIl = tmBody.GetILProcessor();
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_1));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, setTitleRef));
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_2));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, setContentRef));
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_3));
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg, testMethod.Parameters[3]));
+        tmIl.Append(Instruction.Create(OpCodes.Call, fromMonogramRef));
+        tmIl.Append(Instruction.Create(OpCodes.Stloc, avatarLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Ldloc, avatarLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4, 32));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4, 32));
+        tmIl.Append(Instruction.Create(OpCodes.Newobj, sizeCtorRef));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, getRoundImageRef));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, setImageRef));
+        tmIl.Append(Instruction.Create(OpCodes.Ldloc, avatarLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, avatarDisposeRef));
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Call, performLayoutRef));
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4_1));
+        tmIl.Append(Instruction.Create(OpCodes.Call, updateLayeredBackgroundRef));
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Call, invalidateRef));
+        tmIl.Append(Instruction.Create(OpCodes.Ret));
+        var testMethodRef = module.ImportReference(testMethod);
+
+        // --- Timer field + tick method on formMain, calling the new public method.
+        var timerField = new FieldDefinition("__monogramTestTimer", FieldAttributes.Private, timerTypeRef);
+        mainType.Fields.Add(timerField);
+
+        var tickMethod = new MethodDefinition("__monogramTestTick", MethodAttributes.Private, module.TypeSystem.Void);
+        tickMethod.Parameters.Add(new ParameterDefinition("sender", ParameterAttributes.None, module.TypeSystem.Object));
+        tickMethod.Parameters.Add(new ParameterDefinition("e", ParameterAttributes.None, module.ImportReference(typeof(EventArgs))));
+        mainType.Methods.Add(tickMethod);
+        var ttBody = tickMethod.Body;
+        ttBody.InitLocals = true;
+        var notifLocal = new VariableDefinition(module.ImportReference(notifType));
+        ttBody.Variables.Add(notifLocal);
+        var ttIl = ttBody.GetILProcessor();
+        ttIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        ttIl.Append(Instruction.Create(OpCodes.Ldfld, timerField));
+        ttIl.Append(Instruction.Create(OpCodes.Callvirt, timerStopRef));
+        ttIl.Append(Instruction.Create(OpCodes.Newobj, notifCtorRef));
+        ttIl.Append(Instruction.Create(OpCodes.Stloc, notifLocal));
+        ttIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
+        ttIl.Append(Instruction.Create(OpCodes.Ldc_I4, 100));
+        ttIl.Append(Instruction.Create(OpCodes.Ldc_I4, 100));
+        ttIl.Append(Instruction.Create(OpCodes.Newobj, pointCtorRef));
+        ttIl.Append(Instruction.Create(OpCodes.Callvirt, setLocationRef));
+        ttIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
+        ttIl.Append(Instruction.Create(OpCodes.Ldnull));
+        ttIl.Append(Instruction.Create(OpCodes.Callvirt, notifShowRef));
+        ttIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
+        ttIl.Append(Instruction.Create(OpCodes.Ldstr, "Jaguar Workshop"));
+        ttIl.Append(Instruction.Create(OpCodes.Ldstr, "Jaguar MK2"));
+        ttIl.Append(Instruction.Create(OpCodes.Ldstr, "JW"));
+        ttIl.Append(Instruction.Create(OpCodes.Ldstr, "Jaguar Workshop"));
+        ttIl.Append(Instruction.Create(OpCodes.Callvirt, testMethodRef));
+        ttIl.Append(Instruction.Create(OpCodes.Ret));
+
+        // --- Prepend to formMain.OnShown: create/configure/start __monogramTestTimer.
+        {
+            var body = onShownMethod.Body;
+            var il = body.GetILProcessor();
+            var first = body.Instructions[0];
+            void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(first, i); }
+
+            Emit(
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Newobj, timerCtorRef),
+                Instruction.Create(OpCodes.Stfld, timerField),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, timerField),
+                Instruction.Create(OpCodes.Ldc_I4, delayMs),
+                Instruction.Create(OpCodes.Callvirt, timerSetIntervalRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, timerField),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldftn, tickMethod),
+                Instruction.Create(OpCodes.Newobj, eventHandlerCtorRef),
+                Instruction.Create(OpCodes.Callvirt, timerAddTickRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, timerField),
+                Instruction.Create(OpCodes.Callvirt, timerStartRef)
+            );
+        }
+
+        Console.WriteLine($"OK   {fileName}: added FormGenericNotification::__showTestMonogramNotification and {mainFormType}::OnShown -- fires a one-shot {delayMs}ms timer showing a test FormMailNotification with a UIAvatar.FromMonogram(\"JW\", \"Jaguar Workshop\") avatar, matching supporting/email-with-no-image.png");
         patched = true;
 
         module.Write(destPath);
