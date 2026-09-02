@@ -1668,3 +1668,43 @@ these numbers, not instead of them.
   started *before* the trigger and left running for several seconds afterward, then frame-extracted
   after the fact, was far more reliable than any single-shot live screenshot attempt for this
   short-lived a target, even one triggered by "the window just appeared."
+
+## Twenty-third round: two more directly-measured corrections, using the user's own worked method
+
+Twenty-second round's re-verification (title 3px residual, content-Y bias-corrected) was itself
+still not quite right by the user's own live-eyes check against the deployed build. Two further,
+smaller corrections, both derived the same directly-measured way rather than re-guessed:
+
+**Title still sat slightly high.** The twenty-second round's own re-measurement had used the whole
+title string's ink band (all-caps-and-lowercase mixed) to compute a center, which skews high
+relative to what a human eye reads as "the text," because ascender letters ('J', 'W', 'A', 'R')
+pull a whole-band center up above where the more numerous x-height letters actually sit. Remeasured
+using only the x-height letters specifically -- the round 'o' in "Workshop" (a consistent 8-column-
+wide flat top/bottom span, frame-relative Y 30-37, easily distinguished from the taller ascender
+columns around it) -- centered at Y 33.5 against the header's true center at Y 35, needing 1.5-2px
+more. Bumped the existing empirical Y-correction from `+6` to `+8`.
+
+**Content text's left inset had the sign backwards in effect, not just magnitude.** Despite the
+field correctly reading `contentRect.X = 12` in the geometry-diag log (a `+4` insert on top of
+`scaledPadding.Left`), live pixel measurement found the *rendered* ink starting at frame-relative
+X ~21-22 -- to the **left** of the avatar's own left edge (X=24), not the small inset to its right
+that the value implied. The same rendering bias --patch-notification-title-vcenter-fix's Y-fix
+and the twenty-second round's content-Y-fix both already found, this time showing up on the X axis
+too: content text renders ~5-6px left of its own coded X, not just high of its coded Y. Corrected
+using the user's own directly-specified method (rather than assuming the vertical bias's magnitude
+transfers unchanged to the horizontal case): measured D, the distance the ink currently sits left
+of the avatar's edge (~2.5px), and added `2*D` (~5) to the existing `+4` insert -- once to reach
+the avatar's edge, once more to land the same D as a genuine inset past it. `+4` became `+9`.
+
+**Re-verified from scratch, genuinely fresh app launch (confirmed via the twenty-second round's own
+lesson -- timed the "main window loaded" poll at 7s, not the ~1s that would mean a stale reused
+instance), `ffmpeg` recording, same per-column/per-row pixel-profile method:**
+- Title x-height center (the 'o' in "Workshop"): frame Y 33-39, center ~35.5, against the true
+  center at Y 35 -- effectively exact.
+- Content ink onset: frame X ~26.5, exactly matching the predicted `avatar_edge(24) + D(2.5)` from
+  the correction's own math -- confirms the bias model, not a coincidence.
+
+Annotated proof frame (green = true header center through the 'o's, yellow = avatar's left edge,
+cyan = measured content ink onset ~2.5px right of it) sent to the user directly rather than only
+reported as numbers, per the standing instruction from this whole investigation not to claim a fix
+without a fresh, precise, re-shown measurement every time.

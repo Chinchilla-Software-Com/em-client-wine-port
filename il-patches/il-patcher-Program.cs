@@ -413,16 +413,30 @@ static int RunPatchNotificationContentPadding(string[] args)
         ySite!.Operand = 16;
         heightSite!.Operand = 21;
 
-        // X: insert `+ 4` right after get_Left(); Width: insert `- 4` right after the existing sub,
+        // X: insert `+ 9` right after get_Left(); Width: insert `- 9` right after the existing sub,
         // to keep the right edge where it was. Neither insertion point is a branch target or
         // handler boundary (contentRect's construction is straight-line code within doLayout, per
         // the raw --dump-il read this patch was designed against).
+        //
+        // First landed on `+4` from measuring the real-Windows reference directly. Live-measured
+        // against the real deployed build afterward (per-column pixel scan, cross-checked against
+        // the avatar's own logged left edge) and found the same rendering bias
+        // --patch-notification-title-vcenter-fix and this patch's own Y-offset correction both hit:
+        // content text's ink rendered ~5-6px LEFT of the coded contentRect.X, landing at frame-
+        // relative X ~21-22 -- actually left of the avatar's own left edge (X=24), not right of it
+        // as intended, despite the field itself correctly reading X=12 in the geometry-diag log.
+        // Corrected using the user's own directly-verified method rather than re-deriving a bias
+        // constant blind: measured D = how far left of the avatar's edge the ink currently sits
+        // (~2.5px), then added 2*D (~5) to the existing `+4` insert -- once to reach the avatar's
+        // edge, once more to land the same D as a real inset past it, same idea as the Y-offset
+        // correction above but derived from the user's own worked example instead of assumed to
+        // transfer from the vertical case unchanged.
         il.InsertAfter(xSite!, Instruction.Create(OpCodes.Add));
-        il.InsertAfter(xSite!, Instruction.Create(OpCodes.Ldc_I4, 4));
+        il.InsertAfter(xSite!, Instruction.Create(OpCodes.Ldc_I4, 9));
         il.InsertAfter(widthSubSite!, Instruction.Create(OpCodes.Sub));
-        il.InsertAfter(widthSubSite!, Instruction.Create(OpCodes.Ldc_I4, 4));
+        il.InsertAfter(widthSubSite!, Instruction.Create(OpCodes.Ldc_I4, 9));
 
-        Console.WriteLine($"OK   {fileName}: {targetType}::doLayout -- contentRect.X += 4 (left inset past the avatar's own edge, matching the real-Windows reference), contentRect.Y offset +5 -> +16 (top padding, includes an empirically-measured +5 correction for the same Wine text-positioning bias --patch-notification-title-vcenter-fix found), Width/Height trimmed to match so the right/bottom edges don't move");
+        Console.WriteLine($"OK   {fileName}: {targetType}::doLayout -- contentRect.X += 9 (left inset past the avatar's own edge; includes a live-measured correction for content text rendering ~5-6px left of its own coded X), contentRect.Y offset +5 -> +16 (top padding, includes an empirically-measured +5 correction for the same Wine text-positioning bias --patch-notification-title-vcenter-fix found), Width/Height trimmed to match so the right/bottom edges don't move");
         patched = true;
 
         module.Write(destPath);
@@ -696,9 +710,9 @@ static int RunPatchNotificationTitleVCenterFix(string[] args)
             Instruction.Create(OpCodes.Ldc_I4, measureFlags),
             Instruction.Create(OpCodes.Call, measureTextRefImported),
             Instruction.Create(OpCodes.Stloc, sizeLocal),
-            // bounds.Y = (bounds.Height - measured.Height) / 2 + 6;
+            // bounds.Y = (bounds.Height - measured.Height) / 2 + 8;
             //
-            // The `+ 6` is an empirically-measured correction, not part of the original plan --
+            // The `+ 8` is an empirically-measured correction, not part of the original plan --
             // live-measured (per-column pixel scan, not eyeballed) after deploying the plain
             // mathematically-centered version: with just the /2 centering, the title's visible ink
             // spanned frame-relative Y 24-34 (window-relative 9-19, center ~14) against the header's
@@ -715,7 +729,12 @@ static int RunPatchNotificationTitleVCenterFix(string[] args)
             // FontFamily.GetCellAscent/GetCellDescent design-unit metrics) instead of its full
             // line-height, which risks the exact same Wine-font-metric-reporting gap that caused
             // this in the first place. Simpler and directly verified instead: shift down by the
-            // measured gap (target ink-center Y=20 minus observed ink-center Y=14 = 6).
+            // measured gap (target ink-center Y=20 minus observed ink-center Y=14 = 6). A second
+            // round measured the x-height letters specifically (the 'o' in "Workshop", not the
+            // whole string's ink band, since ascenders like 'J'/'W' skew a whole-band-center measure
+            // high relative to what actually reads as "the text" to a human eye) at frame-relative Y
+            // 30-37, center ~33.5, against the same true center at frame Y=35 -- needed 1.5-2px
+            // more; bumped 6 -> 8 rather than re-deriving from scratch.
             Instruction.Create(OpCodes.Ldloca_S, boundsLocal),
             Instruction.Create(OpCodes.Dup),
             Instruction.Create(OpCodes.Call, rectGetHeightRef),
@@ -724,7 +743,7 @@ static int RunPatchNotificationTitleVCenterFix(string[] args)
             Instruction.Create(OpCodes.Sub),
             Instruction.Create(OpCodes.Ldc_I4_2),
             Instruction.Create(OpCodes.Div),
-            Instruction.Create(OpCodes.Ldc_I4_6),
+            Instruction.Create(OpCodes.Ldc_I4_8),
             Instruction.Create(OpCodes.Add),
             Instruction.Create(OpCodes.Call, rectSetYRef),
             // bounds.Height = measured.Height;
