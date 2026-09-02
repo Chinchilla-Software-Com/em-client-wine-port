@@ -1981,3 +1981,57 @@ rounds) remain in the repo, untouched, as historical/fallback reference -- not w
 build. `--patch-notification-icon-bitmap` is not yet folded into `releases/<version>/deploy.sh`'s
 main pipeline (still applied as a manual extra stage on top of `output-final2-final`) pending the
 reply/flag/delete second pass and a live hover-swap check.
+
+## Twenty-seventh round: title text overlapping the now-always-visible icons, fixed; dev trigger made repeatable
+
+Two small follow-ups requested immediately after the twenty-sixth round's close/settings fix went
+live, both confirmed and deployed together.
+
+**Title overlapping the icons.** Making the icons always-visible (twenty-sixth round) exposed a
+gap the app already half-anticipated but didn't fully cover: `OnPaintTitle`'s own IL already
+narrows the title's clip/ellipsis width to `settingsRect.Left - Padding.Horizontal` -- but only
+inside `if (mouseOver) { ... }`, matching the icons' *old* hover-only visibility. With the icons now
+unconditionally drawn into `backgroundBitmap` regardless of `mouseOver`, the non-hover width branch
+(full header width, no icon allowance) let `EndEllipsis`-truncated text run under the icons
+whenever the mouse wasn't over the notification -- which, since the icons are now always visible,
+is most of the time. New patch, `--patch-notification-title-icon-clip`: found the `Ldfld
+mouseOver; Brfalse <else>` pair in `OnPaintTitle`'s raw IL and replaced the `Brfalse` with a `Pop`
+(identical stack effect -- pop 1, push 0 -- so no other instruction needs touching), forcing the
+`if`'s then-branch (narrow to `settingsRect.Left`) to always execute. The else-branch's own
+instructions are left in place as harmless dead code (confirmed nothing else targets them before
+making the change, so no retargeting per IL-patching lesson 2 was needed). Decompile confirms the
+intended shape exactly (`_ = mouseOver; bounds.Width = settingsRect.Left - Padding.Horizontal;`
+unconditionally). Live-confirmed via fresh launch + video capture: title now reads "Jaguar Workshop
+Auto Re…" (properly ellipsized) with a clean gap before the gear/X icons, both immediately after
+the notification appears and later in its hold period -- `supporting/notification-title-clips-
+before-icons-fixed.png`.
+
+**Dev trigger firing only once per app session.** `--patch-test-monogram-avatar`'s
+`__monogramTestTick` called `__monogramTestTimer.Stop()` the moment it fired -- the
+`File.Exists`+`File.Delete` guard already makes a single `touch` fire exactly once on its own, so
+this `Stop()` was never load-bearing for correctness, just an accidental one-shot limitation (this
+project's own earlier finding: "the dev-test notification timer only fires once per app session,"
+flagged by the user as a likely source of false "crash" readings in an earlier round). First
+attempt at the fix edited `RunPatchTestMonogramAvatar`'s generator to drop the `Stop()` call from
+the instructions it emits -- correct in isolation, but re-running that generator against a base
+that had *already* been through an earlier application of the same patch (this project's
+`output-final2-final` checkpoint, confirmed via decompile to already carry `__monogramTestTick`)
+doesn't update the existing wiring, it duplicates it: two `__monogramTestTick` methods, two
+`__monogramTestTimer` fields, `OnShown` prepended twice -- caught via decompile before deploying,
+not live. Fixed properly with a second, narrower patch instead, `--patch-test-monogram-repeat`:
+locates the *existing*, already-baked-in `__monogramTestTick` method and removes just its
+`Ldarg_0; Ldfld __monogramTestTimer; Callvirt Stop()` instruction triple (three straight-line
+instructions, confirmed no branch/handler references any of them before removing). Decompile
+confirms exactly one tick method remains, with no `Stop()` call. Live-confirmed: triggered the test
+notification twice in the same app session (`touch` the trigger file, wait for it to fully show and
+fade, `touch` again) without any app restart -- diag log's `OnPaint` line count roughly doubled
+(402 -> 804) and the second notification rendered identically to the first, title clip included.
+
+Both changes are additive, narrow IL edits on top of the twenty-sixth round's build (`--patch-
+notification-title-icon-clip` and `--patch-test-monogram-repeat`, applied in that order after
+`--patch-notification-icon-bitmap`, before `--patch-notification-geometry-diag`/`--patch-close-
+listener`/`--patch-diag`) -- `il-patches/output-final4/` is the current fully-verified, deployed
+checkpoint. `--patch-test-monogram-repeat` is dev-only (same category as `--patch-test-monogram-
+avatar` itself and `--patch-close-listener` -- strip before any release build); `--patch-
+notification-title-icon-clip` is a real user-facing fix and belongs in the eventual release
+pipeline alongside `--patch-notification-icon-bitmap`.

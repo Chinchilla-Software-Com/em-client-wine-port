@@ -93,6 +93,16 @@ if (args.Length > 0 && args[0] == "--patch-notification-icon-bitmap")
     return RunPatchNotificationIconBitmap(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-title-icon-clip")
+{
+    return RunPatchNotificationTitleIconClip(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-test-monogram-repeat")
+{
+    return RunPatchTestMonogramRepeat(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-license-icon")
 {
     return RunPatchLicenseIcon(args);
@@ -2997,9 +3007,11 @@ static int RunPatchTestMonogramAvatar(string[] args)
         ttIl.Append(Instruction.Create(OpCodes.Brfalse, ttRet));
         ttIl.Append(Instruction.Create(OpCodes.Ldstr, triggerPath));
         ttIl.Append(Instruction.Create(OpCodes.Call, fileDeleteRef));
-        ttIl.Append(Instruction.Create(OpCodes.Ldarg_0));
-        ttIl.Append(Instruction.Create(OpCodes.Ldfld, timerField));
-        ttIl.Append(Instruction.Create(OpCodes.Callvirt, timerStopRef));
+        // Deliberately does NOT Stop() the timer here -- it used to, which meant this dev trigger
+        // only ever fired once per app session (the timer was never restarted afterward). Since
+        // File.Exists+File.Delete above already makes a single touch fire exactly once, leaving
+        // the timer running costs nothing and lets `touch` be used again for a second/third/etc.
+        // notification in the same session without a full app restart.
         ttIl.Append(Instruction.Create(OpCodes.Newobj, notifCtorRef));
         ttIl.Append(Instruction.Create(OpCodes.Stloc, notifLocal));
         ttIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
@@ -7974,6 +7986,247 @@ static int RunPatchDefaultClientNotImpl(string[] args)
         patched = true;
 
         module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-test-monogram-repeat <input-dir> <output-dir>
+//
+// Removes the `__monogramTestTimer.Stop()` call from an ALREADY-BAKED-IN `__monogramTestTick`
+// method (i.e. run against a build whose base already went through --patch-test-monogram-avatar
+// at some earlier pipeline stage -- output-final2-final's own ancestry, in this project's case).
+// A standalone patch rather than just re-running --patch-test-monogram-avatar itself, because
+// that generator unconditionally ADDS a new field/method/timer-setup block every time it runs --
+// running it twice on an already-patched base doesn't update the existing wiring, it duplicates
+// it (two `__monogramTestTick` methods, two `__monogramTestTimer` fields, OnShown prepended
+// twice), confirmed via decompile the first time this was tried this way. If a base build has
+// never had --patch-test-monogram-avatar applied at all, use that instead of this one.
+//
+// User request: "can we make the notification trigger support being called more than once per
+// session" -- `__monogramTestTick` used to Stop() the timer the moment it fired once, so
+// `touch`ing the trigger file a second time in the same app session did nothing (the poll loop
+// itself had stopped). The File.Exists+File.Delete guard already makes a single touch fire
+// exactly once on its own, so Stop()ing the timer afterward was never needed for correctness --
+// removing it just lets the same session be re-triggered by touching the file again.
+static int RunPatchTestMonogramRepeat(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-test-monogram-repeat <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.formMain";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var tickMethods = type.Methods.Where(m => m.Name == "__monogramTestTick" && m.HasBody).ToList();
+        if (tickMethods.Count != 1)
+        {
+            Console.Error.WriteLine($"FAIL: expected exactly 1 __monogramTestTick method on {targetType}, found {tickMethods.Count} -- already deduplicated, or --patch-test-monogram-avatar was never applied to this base");
+            return 1;
+        }
+        var tickMethod = tickMethods[0];
+
+        var body = tickMethod.Body;
+        var il = body.GetILProcessor();
+        var instrs = body.Instructions;
+
+        // Find Ldarg_0; Ldfld <Timer field>; Callvirt Stop() -- three straight-line instructions,
+        // no branch/handler target lands on any of them (this method is a simple linear
+        // if-return/else-proceed shape, confirmed via --dump-il before writing this patch).
+        int matchIdx = -1;
+        for (int i = 0; i < instrs.Count - 2; i++)
+        {
+            if (instrs[i].OpCode == OpCodes.Ldarg_0 &&
+                instrs[i + 1].OpCode == OpCodes.Ldfld &&
+                instrs[i + 2].OpCode == OpCodes.Callvirt &&
+                instrs[i + 2].Operand is MethodReference stopRef && stopRef.Name == "Stop" && stopRef.Parameters.Count == 0)
+            {
+                matchIdx = i;
+            }
+        }
+        if (matchIdx < 0)
+        {
+            Console.Error.WriteLine("FAIL: expected Ldarg_0; Ldfld <timer>; Callvirt Stop() sequence in __monogramTestTick, not found -- method shape changed, review needed");
+            return 1;
+        }
+
+        var toRemove = new[] { instrs[matchIdx], instrs[matchIdx + 1], instrs[matchIdx + 2] };
+        int refs = instrs.Count(i => toRemove.Any(r => ReferenceEquals(i.Operand, r)));
+        if (refs != 0)
+        {
+            Console.Error.WriteLine($"FAIL: {refs} branch/handler reference(s) target the Stop() sequence being removed -- not safe, review needed");
+            return 1;
+        }
+        foreach (var instr in toRemove) il.Remove(instr);
+
+        module.Write(destPath);
+        Console.WriteLine($"OK   {fileName}: {targetType}::__monogramTestTick -- removed the __monogramTestTimer.Stop() call, so the dev test trigger can fire more than once per app session");
+        patched = true;
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-title-icon-clip <input-dir> <output-dir>
+//
+// User caught live, after --patch-notification-icon-bitmap made the close/settings icons always
+// visible (see that patch's own doc comment -- they used to only ever be drawn while
+// `mouseOver`, gated by the same `if (mouseOver)` OnPaint block this project's fix removed):
+// the title/sender text now runs straight underneath the icons instead of stopping before them.
+//
+// `OnPaintTitle`'s own IL (dumped via --dump-il) shows the app ALREADY has logic for exactly
+// this -- it's just conditional on the wrong thing:
+//   Rectangle bounds = headerRect;
+//   bounds.X += Padding.Left;
+//   if (mouseOver) { bounds.Width = settingsRect.Left - Padding.Horizontal; }
+//   else           { bounds.Width -= Padding.Horizontal; }
+// i.e. the app was already designed to narrow the title's clip/ellipsis width to stop before the
+// icons -- but only while actively hovering, matching the icons' old hover-only visibility. Now
+// that the icons are unconditionally visible (drawn into backgroundBitmap regardless of
+// mouseOver -- --patch-notification-icon-bitmap's Part 1), the *width* calculation needs to be
+// unconditional too, or else the non-hover width (full header minus padding, no icon allowance)
+// lets EndEllipsis-truncated text run under the always-visible icons whenever the mouse isn't
+// over the notification.
+//
+// Fix: force the `if (mouseOver)` branch's THEN-path (narrow to settingsRect.Left) to always be
+// taken. The raw IL at the branch point is:
+//   ldarg.0; ldfld mouseOver; brfalse IL_0074   (else: bounds.Width -= Padding.Horizontal)
+// `brfalse` and `pop` have the identical stack effect (pop 1, push 0) -- replacing the `Brfalse`
+// instruction's opcode with `Pop` (and clearing its now-inapplicable branch-target operand) is a
+// literal drop-in swap: `this`/`mouseOver` are still loaded and evaluated (no other instruction
+// needs removing), just no longer branched on, so control always falls straight through into the
+// existing then-block instead. The else-block's own instructions are left in place, physically
+// unreachable now (no remaining predecessor targets it) but syntactically valid IL -- the same
+// "dead but harmless" shape as any other branch-removal in this file; nothing else in the method
+// references IL_0074 (confirmed via the same --dump-il output this patch was planned against, and
+// re-confirmed against body.Instructions live before editing), so no retargeting (IL-patching
+// lesson 2) is needed.
+static int RunPatchNotificationTitleIconClip(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-title-icon-clip <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var onPaintTitleMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaintTitle" && m.HasBody);
+        if (onPaintTitleMethod is null) { Console.Error.WriteLine("FAIL: OnPaintTitle(PaintEventArgs) not found"); return 1; }
+        var mouseOverField = type.Fields.FirstOrDefault(f => f.Name == "mouseOver");
+        if (mouseOverField is null) { Console.Error.WriteLine("FAIL: mouseOver field not found"); return 1; }
+
+        var body = onPaintTitleMethod.Body;
+        var il = body.GetILProcessor();
+        var instrs = body.Instructions;
+
+        // Find the single `Ldfld mouseOver` immediately followed by `Brfalse` -- compare by
+        // field .Name, not reference equality (IL-patching lesson 9).
+        Instruction? branch = null;
+        int matchCount = 0;
+        for (int i = 0; i < instrs.Count - 1; i++)
+        {
+            if (instrs[i].OpCode == OpCodes.Ldfld && instrs[i].Operand is FieldReference fr && fr.Name == mouseOverField.Name &&
+                instrs[i + 1].OpCode == OpCodes.Brfalse)
+            {
+                branch = instrs[i + 1];
+                matchCount++;
+            }
+        }
+        if (matchCount != 1 || branch is null)
+        {
+            Console.Error.WriteLine($"FAIL: expected exactly 1 `Ldfld mouseOver` immediately followed by `Brfalse` in OnPaintTitle, found {matchCount} -- method shape changed, review needed");
+            return 1;
+        }
+
+        // Confirm nothing else in the method (or its exception handlers, though this method has
+        // none) targets the branch's own target instruction -- if something did, leaving it
+        // reachable via that other path would be fine, but it's worth knowing either way.
+        var branchTarget = (Instruction)branch.Operand;
+        int otherRefs = instrs.Count(i => !ReferenceEquals(i, branch) && ReferenceEquals(i.Operand, branchTarget));
+        if (otherRefs != 0)
+        {
+            Console.Error.WriteLine($"FAIL: else-branch target IL offset 0x{branchTarget.Offset:x4} has {otherRefs} other reference(s) besides this branch -- not safe to assume unreachable, review needed");
+            return 1;
+        }
+
+        branch.OpCode = OpCodes.Pop;
+        branch.Operand = null;
+
+        module.Write(destPath);
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnPaintTitle -- title width now always narrows to stop before the close/settings icons (previously only while `mouseOver`, which no longer matches the icons' own always-visible behavior since --patch-notification-icon-bitmap)");
+        patched = true;
     }
 
     if (!patched)

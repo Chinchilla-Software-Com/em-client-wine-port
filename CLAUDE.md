@@ -413,12 +413,17 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   ButtonOverlay/` for reference. User confirmed live via video capture: both icons visible from
   the earliest frame of the static hold period, well before fade, and the crash this patch's first
   attempt introduced (`Graphics.DrawImage` on a not-yet-`OnLoad()`-populated `Image` field) is
-  fixed with null guards. **Reply/flag/delete icons are separately confirmed to have the exact
+  fixed with null guards. Making the icons always-visible exposed a follow-on bug: the title text
+  ran underneath them, since `OnPaintTitle`'s existing icon-width allowance was only applied
+  `if (mouseOver)` (matching the icons' old hover-only visibility). Fixed with
+  `--patch-notification-title-icon-clip`, forcing that allowance to always apply. User confirmed
+  live via video capture: title now properly ellipsizes ("Jaguar Workshop Auto Re…") with a clean
+  gap before the icons. **Reply/flag/delete icons are separately confirmed to have the exact
   same bug but are not yet fixed** — scoped as a harder second pass (real `ControlToolStripButton`
   instances backed by `MultiResImageList` resources, not simple `Image` fields) and not started.
   Hover-state icon swap is decompile-verified but not live-tested (no mouse-automation tooling
   available in this environment). Full history: `reports/notification-empty-until-fade-
-  findings.md`'s twenty-third through twenty-sixth rounds.
+  findings.md`'s twenty-third through twenty-seventh rounds.
 
 **Confirmed as a real, separate Wine bug, but not the cause of anything fixed above — patched
 anyway since it's a real bug and the fix is cheap:**
