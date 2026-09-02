@@ -1545,6 +1545,9 @@ static int RunPatchNotificationLayoutDiag(string[] args)
         var cornerRadiusGetterDef = type.Methods.FirstOrDefault(m => m.Name == "get_CornerRadius");
         if (cornerRadiusGetterDef is null) { Console.Error.WriteLine("FAIL: get_CornerRadius not found"); return 1; }
         var cornerRadiusGetterRef = module.ImportReference(cornerRadiusGetterDef);
+        var getScaledPaddingDef = type.Methods.FirstOrDefault(m => m.Name == "getScaledPadding");
+        if (getScaledPaddingDef is null) { Console.Error.WriteLine("FAIL: getScaledPadding not found"); return 1; }
+        var getScaledPaddingRef = module.ImportReference(getScaledPaddingDef);
 
         var paddingTypeDef = defaultPaddingField.FieldType.Resolve();
         if (paddingTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Padding from defaultPadding's own FieldType"); return 1; }
@@ -1573,8 +1576,10 @@ static int RunPatchNotificationLayoutDiag(string[] args)
         body.InitLocals = true;
         var tmpInt = new VariableDefinition(module.TypeSystem.Int32);
         var tmpMsg = new VariableDefinition(module.TypeSystem.String);
+        var tmpScaledPadding = new VariableDefinition(module.ImportReference(defaultPaddingField.FieldType));
         body.Variables.Add(tmpInt);
         body.Variables.Add(tmpMsg);
+        body.Variables.Add(tmpScaledPadding);
         var il = body.GetILProcessor();
         var first = body.Instructions[0];
         void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(first, i); }
@@ -1609,6 +1614,17 @@ static int RunPatchNotificationLayoutDiag(string[] args)
             Instruction.Create(OpCodes.Ldarg_0),
             Instruction.Create(OpCodes.Ldflda, defaultPaddingField),
             Instruction.Create(OpCodes.Call, paddingGetTopRef),
+            Instruction.Create(OpCodes.Stloc, tmpInt),
+            Instruction.Create(OpCodes.Ldloca, tmpInt),
+            Instruction.Create(OpCodes.Call, int32ToString),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldstr, " scaledL="),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Call, getScaledPaddingRef),
+            Instruction.Create(OpCodes.Stloc, tmpScaledPadding),
+            Instruction.Create(OpCodes.Ldloca, tmpScaledPadding),
+            Instruction.Create(OpCodes.Call, paddingGetLeftRef),
             Instruction.Create(OpCodes.Stloc, tmpInt),
             Instruction.Create(OpCodes.Ldloca, tmpInt),
             Instruction.Create(OpCodes.Call, int32ToString),
