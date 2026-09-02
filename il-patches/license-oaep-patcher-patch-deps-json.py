@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Add a deps.json entry for MailClient.Licensing.BouncyCastlePatch.dll so the .NET runtime's
-deps.json-based assembly resolution finds it at runtime (MailClient.deps.json lists 247
-libraries -- this is a real deps.json-managed deployment, not one that falls back to bare
+"""Add a deps.json entry for a sibling assembly (default: MailClient.Licensing.BouncyCastlePatch)
+so the .NET runtime's deps.json-based assembly resolution finds it at runtime (MailClient.deps.json
+lists 247 libraries -- this is a real deps.json-managed deployment, not one that falls back to bare
 directory probing, so a new assembly dropped in the folder needs an explicit entry).
 
-Usage: patch-deps-json.py <path-to-MailClient.deps.json>
+Generic since MailClient.Notifications.ButtonOverlay (the icon-overlay fix) needed the exact same
+treatment as MailClient.Licensing.BouncyCastlePatch did -- genericized rather than duplicating this
+file a second time. Name/version default to the original BouncyCastlePatch case so existing callers
+(deploy.sh) don't need updating.
+
+Usage: patch-deps-json.py <path-to-MailClient.deps.json> [assembly-name] [version]
 Idempotent: safe to run again on an already-patched file (checks before adding).
 """
 import json
 import sys
 
-NAME = "MailClient.Licensing.BouncyCastlePatch"
-VERSION = "1.0.0"
+NAME = sys.argv[2] if len(sys.argv) > 2 else "MailClient.Licensing.BouncyCastlePatch"
+VERSION = sys.argv[3] if len(sys.argv) > 3 else "1.0.0"
 KEY = f"{NAME}/{VERSION}"
 
 path = sys.argv[1]

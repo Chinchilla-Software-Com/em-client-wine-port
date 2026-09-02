@@ -1708,3 +1708,108 @@ Annotated proof frame (green = true header center through the 'o's, yellow = ava
 cyan = measured content ink onset ~2.5px right of it) sent to the user directly rather than only
 reported as numbers, per the standing instruction from this whole investigation not to claim a fix
 without a fresh, precise, re-shown measurement every time.
+
+## Twenty-fourth round: reply/flag/delete/close/settings also invisible-until-fade; option 2 (plain overlay windows) hits a real, unresolved Wine z-order/paint blocker
+
+With title/content text now genuinely fixed and confirmed, the user asked to check the reply/
+flag/delete/close/settings icon row for the same bug. Confirmed directly: at a static "hold"
+frame the icons are completely absent (solid background, nothing there); at a fade-transition
+frame from the same recording, the reply/delete icons are clearly visible. Same mechanism as the
+title/content text bug before its fix -- these are real `Control`s (reply/flag/delete) or
+manually-drawn images (close/settings) painted through `this` form's own live `WM_PAINT` path,
+which only actually composites during a real message-loop tick under Wine.
+
+**Two candidate fixes discussed with the user:**
+1. A genuinely layered overlay window using `UpdateLayeredWindow` (the same forced-blit mechanism
+   `layeredWindow` itself already uses reliably) -- correct, but needs its own re-blit-on-every-
+   interaction-state plumbing, more work.
+2. A plain, non-layered, background-color-matched overlay window, positioned over the button
+   area, since normal `WM_PAINT`-driven windows are NOT known to have this project's core bug
+   (only `SetLayeredWindowAttributes`-driven ones are) -- simpler in principle.
+
+Agreed to try option 2 first, with option 1 as the explicit fallback if it failed.
+
+**Built:** `MailClient.Notifications.ButtonOverlay.dll`, a new companion assembly (same pattern as
+`MailClient.Licensing.BouncyCastlePatch` -- see `il-patches/MailClient.Notifications.
+ButtonOverlay/`) exposing a single `ButtonOverlayManager.Sync(...)`/`HideAll(...)` entry point,
+deliberately keeping all the Rectangle math, `Controls.Find("tableLayoutPanel1", true)` lookup
+(finds the reply/flag/delete panel by its designer-assigned `Name`, sidestepping the fact that
+it's a private field FormGenericNotification's own code can't reach), and screen-coordinate
+translation in ordinary C# rather than hand-assembled IL. `Sync` reparents the existing
+`tableLayoutPanel1` (real controls, hover images, click handlers all untouched) onto one overlay,
+and builds two new small `PictureBox`-based buttons replicating close/settings' existing hover-
+image-swap behavior on a second overlay (close/settings were never real `Control`s in the
+original code -- just `closeRect`/`settingsRect.Contains(location)` hit-testing in
+`performMouseClick` -- so there was nothing to reparent for them).
+
+Wired into `MailClient.dll` via a new standalone Cecil tool,
+`notification-button-overlay-patcher` (same rationale as `license-oaep-patcher`: adding calls
+into a newly-added sibling assembly doesn't fit `il-patcher`'s per-fix flag pattern). Deliberately
+kept the actual patched IL a straight-line sequence of field loads, two `EventHandler` delegate
+constructions, and one call -- no branches, no Rectangle/Controls.Find logic in IL at all, to
+minimize the chance of another instance of this file's own hand-assembled-IL bugs. It didn't avoid
+them entirely: two real bugs were caught and fixed before this worked --
+`--dump-il`/decompile-verified before deploying, per this project's own standing discipline:
+- The `ShowNotification` insertion originally used `InsertAfter` twice on the *same* fixed anchor
+  instruction to emit two new instructions -- exactly IL-patching lesson 1's trap (each
+  `InsertAfter(anchor, X)` call lands immediately after the anchor regardless of what's already
+  there, so two calls in source order produce the *reverse* order in the final IL). Fixed by
+  inserting both `Before` the anchor's own `.Next` instruction instead, in normal source order.
+- A separate, more subtle version of the same class of bug nearly shipped in `doLayout`'s content-
+  padding patch during the earlier round: not repeated here, but worth noting `--dump-il` (added
+  this session specifically to make catching this kind of issue easier -- see the twenty-first
+  round) earns its keep again.
+
+**Deliberate simplifications, disclosed up front rather than discovered later:** both overlays are
+always-visible while the notification itself is visible, not hover-gated the way the original
+close/settings code was (mouse anywhere over the notification) -- avoided hooking a second
+layered window's mouse-enter/leave into the real form's own tracking, which also drives an
+unrelated reshow-on-hover behavior. Background color is a flat theme-color sample
+(`NotificationWindowHeaderEnd`/`NotificationWindowBackgroundStart`), not a replicated gradient.
+
+**Confirmed, after real debugging (a live "process silently vanishes with no crash report and no
+diag-log growth" mystery that turned out to be two compounding false leads -- see below, not a
+crash at all):**
+- The overlay windows genuinely get created, correctly sized/positioned (`xwininfo` geometry
+  matched the computed screen bounds exactly), and correctly hidden again when `Hide()` runs
+  (`ButtonOverlayManager.HideAll`'s hook works).
+- **Painting works** for a plain, unmodified `Show(owner)` overlay -- confirmed unambiguously with
+  an intentionally garish debug `BackColor` (`Color.Lime`), which showed up reliably across dozens
+  of consecutive video frames once this configuration was reached.
+- **Z-order does not work.** The overlay paints correctly but sits *behind* the notification
+  window, so in practice nothing is visible (the theme-matched real background color made this
+  indistinguishable from "not rendering at all" until the lime debug test settled it). Every
+  tested fix for this made painting stop working entirely again, every single time: `TopMost`,
+  `Control.BringToFront()` called synchronously right after `Show()`, the same `BringToFront()`
+  deferred to a later message-loop tick via `BeginInvoke` (in case the break was a race with the
+  window's very first paint, not the mechanism itself), and the `ShowWithoutActivation` +
+  `WS_EX_NOACTIVATE` combination (tried because it seemed like the least invasive option). Not "no
+  visible effect" in any of these cases -- genuinely, reproducibly, back to zero lime pixels in
+  the entire recording.
+
+**Two real false leads hit while chasing this, both resolved, both worth recording:**
+- **The user's own separately-reported observation -- a test notification can only be triggered
+  once per app session -- explains several apparent "process crashed" observations that weren't
+  crashes at all.** `--patch-test-monogram-avatar`'s tick handler calls
+  `__monogramTestTimer.Stop()` unconditionally on its one successful fire and never restarts it;
+  touching the trigger file again in the same session does nothing (silently: no diag-log growth,
+  trigger file left unconsumed), which looks identical to "the app died before processing the
+  trigger" unless the process list is checked directly. Confirmed via careful `pgrep` polling that
+  several "crashed" observations during this round were actually this -- the app was alive the
+  whole time, just not listening anymore. Always close (`close-listener` signal) and do a
+  genuinely fresh launch (confirmed via the `~7-9s` startup timing, not the `~1s` that means a
+  reused/reactivated instance -- see the twenty-third round) before re-triggering, or fix the
+  timer to restart itself, before trusting a "trigger didn't fire" observation as a real bug.
+- **A single-shot Python/Xlib screenshot at the exact geometric coordinates of a since-hidden
+  overlay window looks identical to "the overlay never rendered"** -- both show whatever was
+  genuinely behind it. Cross-checked with `xwininfo`'s `Map State` before trusting either result;
+  this is the same class of trap as the twenty-third round's "single-shot capture can miss a
+  short-lived window" lesson, generalized to "and a stale coordinate check after it's already
+  hidden looks exactly like a paint failure."
+
+**Left in a clean, honest, committed checkpoint** (per explicit instruction, so this is a
+step this project can reliably return to, not a dead end to redo from scratch): both overlays
+paint using a bare `Show(owner)` with the *real* theme-matched `BackColor` (debug lime removed),
+Z-order left unaddressed. The icons are, in practice, not visibly usable in this state -- most of
+each overlay's area is genuinely behind the notification window. Option 1 (`UpdateLayeredWindow`,
+the fallback discussed with the user up front) has not been attempted yet.

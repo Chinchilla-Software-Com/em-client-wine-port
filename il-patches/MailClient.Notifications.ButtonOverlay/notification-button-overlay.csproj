@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <!-- This dev environment's dotnet SDK runs on Linux; EnableWindowsTargeting lets it compile
+         (not run) a net8.0-windows/WinForms project by pulling the Windows Desktop reference
+         assemblies instead of requiring an actual Windows toolchain. -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <RootNamespace>MailClient.Notifications.ButtonOverlay</RootNamespace>
+    <AssemblyName>MailClient.Notifications.ButtonOverlay</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
