@@ -1,5 +1,6 @@
 using System.Windows.Forms;
 using System.Drawing;
+using System.Runtime.InteropServices;
 
 namespace MailClient.Notifications.ButtonOverlay;
 
@@ -19,21 +20,56 @@ internal sealed class OverlayWindow : Form
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
-        // KNOWN OPEN ISSUE, confirmed live with a garish debug BackColor before reverting to the
-        // real one below: this window paints reliably with a bare Show(owner) and nothing else --
-        // but every attempt at controlling its Z-order (TopMost, Control.BringToFront() called
-        // synchronously right after Show(), the same BringToFront() deferred to a later tick via
-        // BeginInvoke, and the ShowWithoutActivation/WS_EX_NOACTIVATE combination meant to avoid
-        // stealing focus) silently broke painting entirely under Wine -- not merely losing focus
-        // or z-order, genuinely never composited again, every time, regardless of which one was
-        // tried. Left as bare Show(owner) for now: paints correctly, but sits BEHIND the
-        // notification window's own Z position, so only the portion extending past the
-        // notification's own bounds is actually visible. Real, unresolved limitation -- see
-        // reports/notification-empty-until-fade-findings.md for the full investigation and
-        // CLAUDE.md's option 1 (a genuinely layered overlay using UpdateLayeredWindow, matching
-        // layeredWindow's own proven-reliable mechanism) as the fallback if this doesn't get
-        // resolved.
+        // Z-order history, confirmed live with a garish debug BackColor each time: TopMost,
+        // Control.BringToFront() called synchronously right after Show(), the same
+        // BringToFront() deferred to a later tick via BeginInvoke, and the ShowWithoutActivation/
+        // WS_EX_NOACTIVATE combination all silently broke painting entirely under Wine (not
+        // merely losing focus or z-order -- genuinely never composited again). A raw
+        // SetWindowPos(HWND_TOP, SWP_NOACTIVATE) P/Invoke call after Show() -- RaiseViaSetWindowPos
+        // below -- is the first one that kept painting working AND visibly moved the icon overlay
+        // above the notification in a live test. See reports/notification-empty-until-fade-
+        // findings.md for the full history and CLAUDE.md's option 1 (a genuinely layered overlay
+        // using UpdateLayeredWindow) as the fallback if this turns out not to be fully reliable.
         BackColor = backColor;
+    }
+
+    // Raw P/Invoke instead of Control.BringToFront()/TopMost: those go through WinForms' own
+    // wrappers, which may be doing more than a single SetWindowPos call (e.g. BringToFront() also
+    // calls SetFocus internally; TopMost persistently toggles the WS_EX_TOPMOST extended style).
+    // SWP_NOACTIVATE here is a one-time flag on this single call, not a persistent extended style
+    // like WS_EX_NOACTIVATE was -- narrower scope, worth testing in isolation.
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOACTIVATE = 0x0010;
+    private static readonly IntPtr HWND_TOP = IntPtr.Zero;
+
+    public void RaiseViaSetWindowPos()
+    {
+        SetWindowPos(Handle, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    // Child controls (the icon PictureBoxes, the reparented button panel) still weren't painting
+    // even once the overlay window itself reliably did -- an immediate Refresh() right after
+    // Show()+RaiseViaSetWindowPos() didn't help, matching this project's own established pattern
+    // (see periodic-reblit in reports/notification-empty-until-fade-findings.md) that a paint
+    // forced immediately after a state change can race Wine's compositor before it's caught up.
+    // Re-assert both a short delay later via a one-shot timer, same idiom.
+    private System.Windows.Forms.Timer? _delayedRepaintTimer;
+
+    public void ScheduleDelayedRepaint()
+    {
+        _delayedRepaintTimer = new System.Windows.Forms.Timer { Interval = 250 };
+        _delayedRepaintTimer.Tick += (_, _) =>
+        {
+            _delayedRepaintTimer!.Stop();
+            RaiseViaSetWindowPos();
+            Refresh();
+            foreach (Control child in Controls) child.Refresh();
+        };
+        _delayedRepaintTimer.Start();
     }
 }
 
@@ -150,6 +186,9 @@ public static class ButtonOverlayManager
         panel.Location = Point.Empty;
         overlay.Controls.Add(panel);
         overlay.Show(owner);
+        overlay.RaiseViaSetWindowPos();
+        overlay.Refresh();
+        overlay.ScheduleDelayedRepaint();
         return overlay;
     }
 
@@ -170,6 +209,9 @@ public static class ButtonOverlayManager
         overlay.Controls.Add(MakeIconButton(Offset(closeRectLocal, offset), closeImage, closeImageOver, closeClick));
         overlay.Controls.Add(MakeIconButton(Offset(settingsRectLocal, offset), settingsImage, settingsImageOver, settingsClick));
         overlay.Show(owner);
+        overlay.RaiseViaSetWindowPos();
+        overlay.Refresh();
+        overlay.ScheduleDelayedRepaint();
         return overlay;
     }
 

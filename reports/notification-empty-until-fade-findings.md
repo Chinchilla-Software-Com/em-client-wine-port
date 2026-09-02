@@ -1813,3 +1813,63 @@ paint using a bare `Show(owner)` with the *real* theme-matched `BackColor` (debu
 Z-order left unaddressed. The icons are, in practice, not visibly usable in this state -- most of
 each overlay's area is genuinely behind the notification window. Option 1 (`UpdateLayeredWindow`,
 the fallback discussed with the user up front) has not been attempted yet.
+
+## Twenty-fifth round: Z-order fixed for the overlay window itself via raw SetWindowPos, but child controls still don't paint -- option 2 now considered exhausted
+
+User asked to try more Z-order angles specifically before falling back to option 1. One worked,
+partially:
+
+**`SetWindowPos(HWND_TOP, SWP_NOACTIVATE)` via raw P/Invoke, called once right after `Show(owner)`,
+is the first Z-order fix that did not break painting.** Unlike `TopMost` (persistently toggles the
+`WS_EX_TOPMOST` extended style) and `Control.BringToFront()` (a WinForms wrapper that may do more
+than a single `SetWindowPos` call internally -- e.g. also touching focus), this is the single
+narrowest possible native call: one-time, no persistent style change. Confirmed live with the
+debug `Color.Lime` `BackColor`: the icon overlay window visibly moved to sit above/beside the
+notification instead of behind it, still painting reliably. Real progress on the specific thing
+asked for.
+
+**But a second, distinct problem surfaced once color was switched back to the real theme color:
+the overlay *window* now paints (a faint but visible rectangle, matching the theme color, with a
+detectable edge against its surroundings), but its *child controls* -- the two icon `PictureBox`es,
+and the reparented `tableLayoutPanel1`'s own reply/flag/delete buttons -- do not paint their own
+content at all.** No icon graphics, no button appearance, just the parent's flat background color
+showing through where they should be. This is a new instance of the same underlying class of Wine
+paint gap this whole investigation keeps finding, one layer down: fixing the *parent* window's
+paint+Z-order didn't fix its *children*'s paint.
+
+**Two more attempts, both following the project's own established idioms, neither worked:**
+- `overlay.Refresh()` immediately after `Show()`+`RaiseViaSetWindowPos()` -- no effect.
+- A one-shot 250ms-delayed re-assertion (`RaiseViaSetWindowPos()` + `Refresh()` + explicitly
+  `Refresh()`ing every child) via a `System.Windows.Forms.Timer`, matching this project's own
+  periodic-reblit idiom (a paint forced immediately after a state change can race Wine's
+  compositor before it catches up, per the fourteenth/sixteenth rounds) -- no effect either.
+  (Hit a real, if minor, implementation snag along the way: a blind IDE-style find-and-replace of
+  the bare word `Timer` to disambiguate `System.Windows.Forms.Timer` from `System.Threading.Timer`
+  also mangled the *field name* `_delayedRepaintTimer` into `_delayedRepaintSystem.Windows.Forms.
+  Timer`, since it matched the substring `Timer` too -- caught immediately by the compiler error,
+  fixed by hand rather than blind-replacing again. Worth remembering: a global text substitution
+  is not IL-instruction-level precise the way this file's other tools are -- it can hit substrings
+  inside identifiers just as easily as inside a type-name reference.)
+
+**Option 2 considered exhausted at this point, per the user's own explicit standard set at the
+start of this attempt ("try 2, if that fails we'll look at 1").** Four independent Z-order
+mechanisms tried across two rounds (`TopMost`, `BringToFront()` sync, `BringToFront()` deferred via
+`BeginInvoke`, `WS_EX_NOACTIVATE`) either broke painting outright or (the one exception,
+`SetWindowPos`+`SWP_NOACTIVATE`) fixed the parent's Z-order but left child-control painting broken
+regardless. This isn't "one wrong guess away from working" -- it's the same fundamental gap
+recurring at a new layer every time a different symptom gets fixed, strong evidence that a plain
+`WM_PAINT`-based approach is not going to get all the way to a working, visible, correctly-stacked
+overlay under this Wine/window-manager combination. Option 1 (`UpdateLayeredWindow`, matching
+`layeredWindow`'s own proven-reliable forced-blit mechanism, which sidesteps the whole "does this
+window's paint message get processed under Wine" question by never depending on it) is the
+recommended next step if this is picked back up.
+
+**State left in this checkpoint:** the `SetWindowPos`+`SWP_NOACTIVATE` Z-order fix and the delayed-
+repaint timer are both still in place in `MailClient.Notifications.ButtonOverlay.dll` (real,
+working improvements on the Z-order front specifically, even though the overall feature isn't
+usable yet) -- not reverted, since they're net positive and don't regress anything. `MailClient.dll`
+itself was not rebuilt/redeployed with this round's helper-assembly-only changes (only
+`MailClient.Notifications.ButtonOverlay.dll` was touched and hot-swapped for each test) -- the
+`notification-button-overlay-patcher`-produced `MailClient.dll` from the twenty-fourth round's
+commit is still the current wired-in version and remains valid (the interface between the two
+assemblies -- `ButtonOverlayManager.Sync`/`HideAll`'s signatures -- did not change this round).
