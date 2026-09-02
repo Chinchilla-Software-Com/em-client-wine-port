@@ -1419,3 +1419,71 @@ and rendering per-subpixel, which is a font-rasterizer/compositor capability, no
 `MailClient.dll` or `MailClient.Common.UI.dll` control at all. No patch applied or planned for
 this -- flagging it here so a future round doesn't re-open the same "font looks wrong" question
 without first re-reading this comparison.
+
+## Twentieth round: user directly disputed padding/line-height "not a bug" -- geometry checks out, but a new negative result on the open bug's own mechanism
+
+User pushed back hard on the nineteenth round's scope: two specific things still look wrong to
+them -- left padding, and the two content lines' height/spacing not matching the Windows
+reference -- and asked for those to actually get fixed, not waved off.
+
+**Checked the real geometry, not just pixels this time.** `--patch-notification-geometry-diag`
+(built in the nineteenth round but not yet actually read) had been logging `doLayout()`'s real
+`headerRect`/`contentRect`/`imageRect` all along -- `/tmp/claude-diag.log` (note: `Z:\tmp\...` is
+`/tmp/...` on the Linux side directly, **not** under the bottle's own `drive_c/tmp` -- wasted a
+few minutes checking the wrong path first). Actual values for this test: `header={X=0,Y=0,
+Width=310,Height=40}`, `content={X=8,Y=45,Width=294,Height=75}`, `image={X=8,Y=4,Width=32,
+Height=32}`. Read `doLayout()`'s and `OnPaintTitle()`'s full source alongside this: content text
+and the avatar image intentionally share the same `X = scaledPadding.Left` (8px) -- confirmed by
+code, not inferred -- and title text's bounds separately add `imageRect.Width + 8px` on top of
+that same base padding. Overlaying vertical reference lines at these exact computed X positions
+onto an annotated, nearest-neighbor-zoomed capture confirmed the *rendered* text starts almost
+exactly where the code says it should on both sites of that check.
+
+**Directly compared the same computed relationship against the Windows reference and it matches.**
+Measured the Windows screenshot's own box/avatar/content-text edges the same way (pixel dumps, not
+eyeballing): avatar diameter ~31px there vs Wine's ~30-32px (matches, ruling out a DPI/scale
+mismatch skewing the comparison); content text starts ~3px right of the avatar's own left edge on
+Windows vs exactly flush with it on Wine -- a few-pixel difference, not the kind of gap someone
+would describe as "wrong" padding. **Did not find a left-padding bug** -- the numbers match the
+app's own coded design intent and are close to the Windows reference. Line-spacing (content line1
+peak-row to line2 peak-row): measured ~17-18px on Wine (reproduced twice, across two independent
+recordings) vs ~19px on Windows -- a real but modest (~10%) difference, plausibly just a font-
+metric/hinting difference between Wine's rendering of the font and real Segoe UI rather than
+anything `doLayout()`/`OnPaintContent()` controls (neither sets an explicit line height anywhere;
+both let `TextRenderer.DrawText` use the font's own natural metrics).
+
+**Real methodological gap acknowledged, and a genuine attempt to fix it that produced a useful
+negative result instead.** Every measurement above (this round and the nineteenth's) was taken
+from a screen recording during the *fade* transition, because of the still-open empty-box-until-
+fade bug -- meaning every frame is a partial-opacity blend with whatever's behind, not a clean,
+fully-opaque render, which is real noise on top of true pixel positions. Tried to fix this
+properly rather than keep measuring through it: found `timeToHide`/`timeToShow` (protected `int`
+fields on `FormGenericNotification`, default 500ms, directly driving `alphaIncrement = ±25f /
+timeToHide|timeToShow` per `timer_OnTimer`'s own decompiled code) and added two field-writes
+(`timeToHide = 5000; timeToShow = 5000;`) to the very top of `__showTestMonogramNotification` --
+dev-test-only, 10x slower fade, expecting many more high-opacity ticks to capture from.
+
+**It didn't help, and that's itself useful evidence.** A second recording confirmed via the diag
+log that the notification really did sit in `NotificationFormState.Disappearing` for ~10s of
+ticks (401 ticks at the expected ~25ms cadence) instead of a near-instant fade -- but content only
+became visible in the last ~0.5s before the window fully disappeared, exactly as brief a window as
+in the original, fast-fade capture. **Slowing the fade down does not widen the reveal window --
+the reveal stays pinned to a narrow moment right before the notification fully closes, regardless
+of how long the fade itself takes.** This weakens any theory that more/slower ticks alone would
+fix the open empty-box bug (already suspected from the fourteenth round's periodic-reblit
+experiment, but now confirmed directly against the *unpatched* mechanism too) and points more
+specifically at whatever happens right at the `Hide()`/`setFormHidden()` transition itself as the
+real trigger for a genuine repaint, not sustained ticking at any speed. Kept the
+`timeToHide`/`timeToShow` slowdown in `--patch-test-monogram-avatar` anyway since a longer window
+is still marginally easier to catch on camera even if not meaningfully clearer, and it's harmless
+and dev-only.
+
+**Where this leaves the two complaints:** no code-level bug found for either, and the numbers
+back that up better than the nineteenth round's font/AA comparison did (that one was pixel-
+eyeballing; this one cross-checked against the actual `doLayout()` source and its own logged
+output). Given the measurement is still going through a partial-opacity capture no matter how the
+fade is tuned, treating "no bug found" as final would repeat this project's own standing worry
+about false confidence -- flagging both as unresolved-but-probably-not-bugs rather than closed,
+pending either a genuinely opaque capture (which would need the real empty-box fix first) or the
+user's own direct, live-eyes comparison to point at something more specific than these frames
+show.

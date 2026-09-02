@@ -1912,6 +1912,19 @@ static int RunPatchTestMonogramAvatar(string[] args)
         if (notifShowDef is null) { Console.Error.WriteLine("FAIL: FormGenericNotification missing Show(IWin32Window)"); return 1; }
         var notifShowRef = module.ImportReference(notifShowDef);
 
+        // timeToHide/timeToShow (protected int fields, default 500ms) directly control fade speed
+        // via alphaIncrement = +/-25f / timeToHide|timeToShow (confirmed by decompile of
+        // timer_OnTimer/Hide). The still-open empty-box-until-fade bug only reveals content during
+        // the brief Appearing/Disappearing tick bursts -- a real capture (screen recording or
+        // screenshot) has to land in that narrow, fast-fading window, which produces exactly the
+        // partial-opacity blending that makes precise padding/line-height pixel measurement
+        // unreliable. Slowing both down 10x for this dev-only test method (not touching the real
+        // notification path at all) turns that narrow window into several seconds of near-full
+        // opacity, giving a far more trustworthy capture for that kind of comparison.
+        var timeToHideField = genericNotifType.Fields.FirstOrDefault(f => f.Name == "timeToHide");
+        var timeToShowField = genericNotifType.Fields.FirstOrDefault(f => f.Name == "timeToShow");
+        if (timeToHideField is null || timeToShowField is null) { Console.Error.WriteLine("FAIL: timeToHide/timeToShow field(s) not found"); return 1; }
+
         TypeDefinition? formType = genericNotifType;
         while (formType is not null && formType.FullName != "System.Windows.Forms.Control")
         {
@@ -2003,6 +2016,13 @@ static int RunPatchTestMonogramAvatar(string[] args)
         var avatarLocal = new VariableDefinition(module.ImportReference(avatarType));
         tmBody.Variables.Add(avatarLocal);
         var tmIl = tmBody.GetILProcessor();
+        // this.timeToHide = 5000; this.timeToShow = 5000; -- see the field-lookup comment above.
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4, 5000));
+        tmIl.Append(Instruction.Create(OpCodes.Stfld, timeToHideField));
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4, 5000));
+        tmIl.Append(Instruction.Create(OpCodes.Stfld, timeToShowField));
         tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
         tmIl.Append(Instruction.Create(OpCodes.Ldarg_1));
         tmIl.Append(Instruction.Create(OpCodes.Callvirt, setTitleRef));
