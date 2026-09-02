@@ -2035,3 +2035,149 @@ checkpoint. `--patch-test-monogram-repeat` is dev-only (same category as `--patc
 avatar` itself and `--patch-close-listener` -- strip before any release build); `--patch-
 notification-title-icon-clip` is a real user-facing fix and belongs in the eventual release
 pipeline alongside `--patch-notification-icon-bitmap`.
+
+## Twenty-eighth round: apparent icon-hover/click freeze traced to the synthetic test trigger, not
+real app behavior; icon-bitmap work paused and backed out of the deployed build; two new,
+separate notification bugs confirmed (light-theme bold text, broken hover-pause) with the first
+fix attempt for one of them found to crash the app
+
+User reported hovering over the close/settings icons produced no visible hover-highlight at all,
+and clicking either icon froze the whole app. Investigated at length with the user's live help
+(no mouse automation exists in this environment, so every hover/click test needed the user to
+physically do it while this session watched diagnostic logs and killed/relaunched the app):
+
+**The freeze was real and reproducible, but traced to the synthetic test-notification trigger
+itself, not a genuine app bug.** New diagnostic instrumentation was added to `--patch-diag`
+covering `performMouseClick`/`OnHidden`/`OnFormClosing`/`OnMouseMove` (previously uninstrumented)
+to pin down exactly where execution stopped. Confirmed via a hung process's own thread list
+(`ps -L -o pid,lwp,pcpu,stat,comm`) that the app's combined UI/CEF message-pump thread
+(`CrBrowserMain`) was in a genuine sustained CPU spin (26% -> 42%+, climbing), not a blocked wait
+-- a real hang, confirmed further by the close-listener signal (which had worked reliably in
+every previous round) getting no response at all. `gdb -p <pid>` to get a native stack trace was
+blocked by this environment's `ptrace_scope` restriction with no path to escalate (`sudo -n`
+denied by the permission system) -- diagnosis had to proceed from log evidence and code reading
+alone. Bisected by deploying a build with `--patch-notification-icon-bitmap` alone (no
+`--patch-notification-title-icon-clip`) -- still froze identically, ruling out this round's
+title-clip patch as the cause and pointing at icon-bitmap itself, or something even earlier.
+
+**The actual breakthrough came from testing against a REAL notification (a genuine incoming
+email) instead of the synthetic `--patch-test-monogram-avatar` trigger, at the user's own
+suggestion.** Result: hovering over the icons did NOT freeze anything; clicking close closed the
+notification cleanly; clicking settings did nothing visible (a separate, real, non-fatal bug --
+no context menu appeared) but did not freeze; clicking the notification body opened the real
+mail correctly. **The freeze only ever reproduced against the synthetic test notification's body
+click** (`headerRect`/`contentRect` -> `OnTitleClick`/`OnContentClick`), which very plausibly
+tries to resolve/open a backing `IMail`/`CurrentNotification` object that the test trigger never
+actually constructs (`__showTestMonogramNotification` only sets `Title`/`Content`/`Image`
+directly, bypassing the real `ShowNotification`/`Notification` construction path entirely) --
+consistent with a hang inside whatever "open the associated mail" code does when there is no
+real mail to open, not a defect in the icon-bitmap rendering work at all. **Conclusion: the
+close/settings icon fix (`--patch-notification-icon-bitmap` + `--patch-notification-title-icon-
+clip`) is not implicated in any freeze** -- confirmed working correctly, hover included, against
+a real notification. Not yet re-confirmed for the ICON-hover-freeze bisection specifically against
+a real notification (only the body-click freeze was retested this way) -- worth a final
+real-notification icon-hover-and-click pass before resuming reply/flag/delete work, since the
+bisection that ruled out title-icon-clip was still against the synthetic trigger.
+
+**Per explicit user instruction, this work is paused here and backed out of the currently
+deployed bottle** (not deleted -- `--patch-notification-icon-bitmap` and `--patch-notification-
+title-icon-clip` remain fully committed in git, ready to reapply) so two other, unrelated
+notification bugs the user found in the same session can be investigated on a simpler baseline
+with fewer moving parts. The deployed build was rolled back to `il-patches/output-final2-final`'s
+own lineage (text-in-bitmap fixes, close-listener, and a freshly-`--patch-test-monogram-repeat`'d
+test trigger, plus the new diagnostics -- see `il-patches/output-revert-final/`), with neither
+icon-bitmap patch applied.
+
+**Two new tools added to support the two new bugs, both confirmed working live:**
+- **`--find-member <dll> <substring>`**: searches every type/method/field/property in an
+  assembly for a name match (case-insensitive), printing `kind DeclaringType::Member : Type`.
+  Added because `strings <dll> | grep` can find a member NAME but not its declaring TYPE --
+  needed to locate `ThemeManager`/`DarkColorTheme`/`DefaultColorTheme` (all in
+  `MailClient.Common.UI.dll`, not `MailClient.dll`) without guessing type names one at a time
+  against `ilspycmd -t`.
+- **`--patch-theme-switcher`**: dev/testing-only (same category as `--patch-close-listener`),
+  polls `Z:\tmp\claude-theme-switch` every 500ms; its (trimmed, lowercased) content selects
+  `DarkColorTheme.Instance` (content `"dark"`) or `DefaultColorTheme.Instance` (anything else,
+  including `"light"`) via `ThemeManager.Instance.SetActiveColorTheme(...)` directly -- no UI
+  automation needed, confirmed live (screenshots) to flip the whole app's theme instantly in both
+  directions, `ThemeChanged` already propagating to every open form/control on its own. Combined
+  with the existing `--patch-test-monogram-avatar`/`--patch-test-monogram-repeat` trigger, this
+  lets both new bugs below be tested by this session alone, without the user's screen recordings.
+
+**Bug 1: notification title/content text renders visibly bolder/heavier under the Light theme
+than under Dark, same font/size/weight in both (confirmed via decompile: `headerFont` is
+`ScaleUtils.ScaleFont(this, FontCache.CreateFont(FontManager.UIFont.FontFamily, 11f))`, no
+`FontStyle` argument at all, so always Regular regardless of theme).** Reproduced directly via
+`--patch-theme-switcher` + `--patch-test-monogram-avatar`, screenshotted, cropped and upscaled
+3x for side-by-side comparison -- Light theme (RGB(40,40,40) text on white, near-maximum
+contrast) visibly bold/heavy; Dark theme (white text on mid-dark gray, lower contrast) visibly
+normal weight, same strings, same build. Not yet root-caused. First hypothesis tried and
+**disproven, and dangerous -- do not retry this specific approach without a different mechanism**:
+both `OnPaintTitle`/`OnPaintContent` call `TextRendererEx.DrawText(..., TextFormatFlags)` (no
+backColor argument), which resolves to `Color.Empty` internally and, for our non-emoji text,
+forwards straight to `System.Windows.Forms.TextRenderer.DrawText(g, text, font, bounds, foreColor,
+backColor, flags)` -- per .NET's own implementation, `backColor == Color.Empty` selects a
+different internal code path (a transparent-background render via a memory-DC round-trip) than a
+real backColor (a direct opaque `ExtTextOut` call), and the theory was that Wine's implementation
+of one of these two paths might have a text-rendering-quality gap the other doesn't. New patch
+`--patch-notification-text-backcolor` passed the theme's own already-known actual background
+color (`NotificationWindowHeaderStart`/`NotificationWindowBackgroundStart`) as an explicit
+backColor via the existing `TextRendererEx.DrawText(Graphics, string, Font, Rectangle, Color,
+Color, TextFormatFlags)` 7-arg overload (confirmed present and already used elsewhere in the app,
+no new method needed) -- decompiled clean, verified stack-correct by hand, deployed, and **crashed
+the app on the very first notification paint**: `System.NullReferenceException` inside
+`System.Windows.Forms.FontCache+Data..ctor` / `System.WeakReference<T>..ctor`, deep in WinForms'
+own internal font-caching machinery, not in any of this project's own code -- a genuine Wine/.NET
+WinForms gap in whatever internal code path the backColor-bearing overload of `TextRenderer.
+DrawText` takes that the backColor-less overload doesn't hit. Confirmed via the app's own
+`bug.<timestamp>.txt` crash report (this project's standard first diagnostic step). **Immediately
+reverted** -- redeployed `il-patches/output-theme/` (theme-switcher only, no text-backcolor
+patch) -- do not retry passing a real backColor to `TextRenderer.DrawText`/`TextRendererEx.
+DrawText` from this code without first understanding why FontCache's internal WeakReference
+construction NullRefs under Wine specifically for that path. Next angle to try, not yet
+attempted: `Graphics.TextRenderingHint` (a GDI+-level antialiasing quality setting, independent
+of `TextRenderer`'s own GDI-level ClearType machinery) set explicitly before the DrawText calls,
+or investigating whether Wine's ClearType/font-smoothing registry settings
+(`FontSmoothingType`/`FontSmoothingGamma`, the same class of setting `font-systemlink-writer/`
+already manipulates for a different purpose) affect this specific contrast-dependent boldness.
+
+**Bug 2: hovering over the notification does not pause the auto-hide countdown, and (separately)
+once paused by any means, does not reliably resume it either.** This is a REAL, documented,
+intentional eM Client feature the user identified from direct product knowledge, not something
+either side of this investigation guessed at: `timer_OnTimer`'s own pre-existing (unmodified by
+this project) logic already implements it correctly, gated on the `mouseOver` field --
+```csharp
+else if (state == NotificationFormState.Visible && (!mouseOver || !reShowOnMouseOver) && !SuppressFadeout)
+{
+    Hide();
+}
+```
+-- skipping the auto-hide entirely while `mouseOver == true`. `mouseOver` is set `true` in
+`OnMouseEnter` and `false` in `OnMouseLeave` (which also explicitly resets `timer.Interval =
+timeToStay` and restarts it) -- both pre-existing, unmodified methods. Two distinct symptoms
+observed live against a REAL notification: (a) hovering over the title/content text produced
+exactly ONE `OnMouseMove` log line total across a multi-minute hover, after which the timer kept
+resetting to a fresh `timeToStay` countdown every ~6s indefinitely -- consistent with
+`OnMouseEnter` firing once (correctly pausing) but `OnMouseLeave` never firing at all once the
+mouse actually left, leaving the pause stuck on forever; (b) hovering directly over the close/
+settings icon area (this bug's original context, before the real-notification retest) produced
+*zero* `OnMouseMove`/`OnMouseEnter` evidence and no pause behavior at all. Both symptoms are
+consistent with the same underlying, already-partially-documented root cause this whole
+investigation keeps finding in different forms: `this` (`FormGenericNotification`) does not
+reliably receive its own mouse messages under Wine -- the already-fixed click-routing bug (Stage
+8, `layeredWindow_Click` -> `performMouseClick(PointToClient(Control.MousePosition))`) worked
+around this specifically for *clicks* by forwarding from `layeredWindow` (the drop-shadow
+companion, which this investigation's own earlier rounds established is very likely the window
+actually receiving real input under Wine) -- but no equivalent forwarding exists for
+MouseEnter/MouseMove/MouseLeave, so hover-dependent behavior (icon highlight, pause-on-hover) is
+left exposed to the same gap with no workaround at all. Not yet fixed -- the likely shape of a fix
+is a `layeredWindow`-side hook (does `LayeredForm` expose its own MouseMove/MouseEnter/MouseLeave
+events analogous to its existing `Click` event? not yet checked) forwarding into `this`'s
+`OnMouseEnter`/`OnMouseMove`/`OnMouseLeave` the same way `layeredWindow_Click` already forwards
+clicks into `performMouseClick`.
+
+**State at this checkpoint:** `il-patches/output-theme/` (text-in-bitmap fixes + close-listener +
+test-monogram-repeat + geometry-diag + extended diag + theme-switcher, no icon-bitmap, no
+title-icon-clip, no text-backcolor) is deployed and confirmed stable. Both new bugs are
+reproduced, understood at the mechanism level, and documented above for whoever picks this back
+up; neither is fixed yet.

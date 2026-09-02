@@ -73,6 +73,21 @@ if (args.Length > 0 && args[0] == "--dump-il")
     return RunDumpIL(args);
 }
 
+if (args.Length > 0 && args[0] == "--find-member")
+{
+    return RunFindMember(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-theme-switcher")
+{
+    return RunPatchThemeSwitcher(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-notification-text-backcolor")
+{
+    return RunPatchNotificationTextBackColor(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-notification-content-padding")
 {
     return RunPatchNotificationContentPadding(args);
@@ -1159,6 +1174,60 @@ static int RunDumpIL(string[] args)
     return 0;
 }
 
+// --find-member <dll> <substring> -- searches every type in the assembly for a method, property,
+// or field whose name contains <substring> (case-insensitive), printing "DeclaringType::Member".
+// For locating an unknown declaring type of a known member name (e.g. a static factory property
+// found only via `strings <dll> | grep`, with no type name attached) without guessing type names
+// one at a time against ilspycmd -t.
+static int RunFindMember(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --find-member <dll> <substring>");
+        return 2;
+    }
+    string dllPath = args[1], substring = args[2];
+    var resolver = new DefaultAssemblyResolver();
+    resolver.AddSearchDirectory(Path.GetDirectoryName(Path.GetFullPath(dllPath))!);
+    using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters { AssemblyResolver = resolver });
+
+    int hits = 0;
+    foreach (var type in module.GetTypes())
+    {
+        if (type.Name.Contains(substring, StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"type     {type.FullName}" + (type.BaseType is not null ? $" : {type.BaseType.Name}" : "") + (type.Interfaces.Count > 0 ? " implements " + string.Join(",", type.Interfaces.Select(i => i.InterfaceType.Name)) : ""));
+            hits++;
+        }
+        foreach (var m in type.Methods)
+        {
+            if (m.Name.Contains(substring, StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine($"method   {type.FullName}::{m.Name}({string.Join(",", m.Parameters.Select(p => p.ParameterType.Name))}) -> {m.ReturnType.Name}");
+                hits++;
+            }
+        }
+        foreach (var f in type.Fields)
+        {
+            if (f.Name.Contains(substring, StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine($"field    {type.FullName}::{f.Name} : {f.FieldType.Name}");
+                hits++;
+            }
+        }
+        foreach (var p in type.Properties)
+        {
+            if (p.Name.Contains(substring, StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine($"property {type.FullName}::{p.Name} : {p.PropertyType.Name}");
+                hits++;
+            }
+        }
+    }
+    Console.WriteLine($"-- {hits} match(es) for \"{substring}\" in {Path.GetFileName(dllPath)}");
+    return 0;
+}
+
 static int RunScan(string[] args)
 {
     string dir = args.Length > 0 ? args[0] : "/home/portagent/project/original";
@@ -1570,6 +1639,23 @@ static int RunPatchDiag(string[] args)
         var layeredWindowClickMethod = type.Methods.FirstOrDefault(m => m.Name == "layeredWindow_Click" && m.HasBody);
         var updateBackgroundBitmapMethod = type.Methods.FirstOrDefault(m => m.Name == "updateBackgroundBitmap" && m.HasBody);
         var doLayoutMethod = type.Methods.FirstOrDefault(m => m.Name == "doLayout" && m.HasBody);
+        // Added to chase the user's live report: clicking close/settings leaves the notification
+        // stuck (never disappears, keeps painting indefinitely) and there's no hover effect on
+        // either icon at all. None of performMouseClick/OnHidden/OnFormClosing/OnMouseMove/Close
+        // had any instrumentation before now -- performMouseClick is where the closeRect/
+        // settingsRect hit-test and Close() call actually live, OnFormClosing is where the existing
+        // (pre-existing, unmodified) e.Cancel = state != Hidden guard lives, and OnMouseMove is
+        // where the hover-swap logic added by --patch-notification-icon-bitmap's Part 2 lives --
+        // instrumenting it directly answers whether `this` form's OnMouseMove ever fires at all
+        // under Wine (a real possibility: layeredWindow, not `this`, is the window documented
+        // elsewhere in this project as actually receiving click input, with layeredWindow_Click
+        // manually forwarding to performMouseClick -- there is no equivalent MouseMove-forwarding
+        // wired up anywhere, so if layeredWindow is also what receives real mouse-move messages,
+        // `this.OnMouseMove` may simply never run).
+        var performMouseClickMethod = type.Methods.FirstOrDefault(m => m.Name == "performMouseClick" && m.HasBody);
+        var onHiddenMethod = type.Methods.FirstOrDefault(m => m.Name == "OnHidden" && m.HasBody);
+        var onFormClosingMethod = type.Methods.FirstOrDefault(m => m.Name == "OnFormClosing" && m.HasBody);
+        var onMouseMoveMethod = type.Methods.FirstOrDefault(m => m.Name == "OnMouseMove" && m.HasBody);
         if (onPaintMethod is null) { Console.Error.WriteLine("FAIL: OnPaint(PaintEventArgs) not found"); return 1; }
         if (timerMethod is null) { Console.Error.WriteLine("FAIL: timer_OnTimer not found"); return 1; }
         if (hideMethod is null) { Console.Error.WriteLine("FAIL: Hide() not found"); return 1; }
@@ -1578,6 +1664,13 @@ static int RunPatchDiag(string[] args)
         if (layeredWindowClickMethod is null) { Console.Error.WriteLine("FAIL: layeredWindow_Click not found"); return 1; }
         if (updateBackgroundBitmapMethod is null) { Console.Error.WriteLine("FAIL: updateBackgroundBitmap not found"); return 1; }
         if (doLayoutMethod is null) { Console.Error.WriteLine("FAIL: doLayout not found"); return 1; }
+        if (performMouseClickMethod is null) { Console.Error.WriteLine("FAIL: performMouseClick(Point) not found"); return 1; }
+        if (onHiddenMethod is null) { Console.Error.WriteLine("FAIL: OnHidden not found"); return 1; }
+        if (onFormClosingMethod is null) { Console.Error.WriteLine("FAIL: OnFormClosing not found"); return 1; }
+        if (onMouseMoveMethod is null) { Console.Error.WriteLine("FAIL: OnMouseMove not found"); return 1; }
+        // closeMethod is expected to be null -- Close() is inherited from Form with no override
+        // on this type, nothing to instrument there directly (performMouseClick's own call site
+        // is already covered by instrumenting performMouseClick itself).
 
         var layeredBaseFormType = type.BaseType?.Resolve();
         if (layeredBaseFormType is null || layeredBaseFormType.FullName != "MailClient.UI.Forms.LayeredBaseForm")
@@ -1932,6 +2025,10 @@ static int RunPatchDiag(string[] args)
         Instrument(onMouseClickMethod, "OnMouseClick");
         Instrument(onShownMethod, "OnShown");
         Instrument(layeredWindowClickMethod, "layeredWindow_Click");
+        Instrument(performMouseClickMethod, "performMouseClick");
+        Instrument(onHiddenMethod, "OnHidden");
+        Instrument(onFormClosingMethod, "OnFormClosing");
+        Instrument(onMouseMoveMethod, "OnMouseMove");
         InstrumentMinimal(clickHandlerMethod, "notificationForm_Click");
         InstrumentBitmapDiag(updateBackgroundBitmapMethod, "updateBackgroundBitmap");
 
@@ -1941,6 +2038,10 @@ static int RunPatchDiag(string[] args)
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnMouseClick -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnShown -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::layeredWindow_Click -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::performMouseClick -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnHidden -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnFormClosing -> {logPath}");
+        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnMouseMove -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {handlerTypeName}::notificationForm_Click -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::updateBackgroundBitmap -> {logPath}");
         patched = true;
@@ -2374,6 +2475,405 @@ static int RunPatchCloseListener(string[] args)
         }
 
         Console.WriteLine($"OK   {fileName}: {mainFormType}::OnShown -- now polls every {pollIntervalMs}ms for {signalPath}; when present, deletes it and calls the real menuItem_File_Exit_Click (same as File > Exit) for a graceful shutdown");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-theme-switcher <input-dir> <output-dir>
+//
+// Dev/testing-only tool (same category as --patch-close-listener/--patch-test-monogram-avatar --
+// strip before any release build), added to let theme-dependent rendering bugs (e.g. the light-
+// theme notification-text-boldness regression the user reported) be tested via the existing
+// file-trigger + auto-restart workflow instead of needing a human to click through Settings ->
+// Appearance in the UI every time. Polls every 500ms for `Z:\tmp\claude-theme-switch`; when
+// present, reads its (trimmed, lowercased) text content, deletes the file, and calls
+// `ThemeManager.Instance.SetActiveColorTheme(...)` directly with `DarkColorTheme.Instance` (file
+// content "dark") or `DefaultColorTheme.Instance` (anything else, including "light" -- eM Client's
+// own default/light theme class is named `DefaultColorTheme`, confirmed via `--find-member
+// <dll> ColorTheme` against MailClient.Common.UI.dll: 20 concrete IColorTheme implementations,
+// `DefaultColorTheme`/`DarkColorTheme` are the two the Settings UI's own Light/Dark toggle maps
+// to). `SetActiveColorTheme` already raises the app's own `ThemeChanged` event internally, which
+// every themed form/control already subscribes to re-paint itself with -- no separate refresh
+// call needed, confirmed by decompile (`ThemeManager.SetActiveColorTheme` calls
+// `SetApplicationAppearance(theme)` and `OnThemeChanged(EventArgs.Empty)` itself).
+//
+// `ThemeManager`/`DarkColorTheme`/`DefaultColorTheme` all live in MailClient.Common.UI.dll, a
+// different assembly than the one this patch edits (MailClient.dll, formMain's own assembly) --
+// resolved by loading MailClient.Common.UI.dll as a second module from the same input directory
+// and importing its members into MailClient.dll's module, the same cross-assembly pattern already
+// used elsewhere in this file (see e.g. --patch-notification-icon-bitmap's resolution of
+// Graphics.DrawImage from an existing call site) rather than typeof() reflection (IL-patching
+// lesson 5 -- these are app-deployed assemblies, not CoreLib).
+static int RunPatchThemeSwitcher(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-theme-switcher <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+    const int pollIntervalMs = 500;
+    const string triggerPath = @"Z:\tmp\claude-theme-switch";
+
+    const string targetAssembly = "MailClient.dll";
+    const string commonUiAssembly = "MailClient.Common.UI.dll";
+    const string mainFormType = "MailClient.UI.Forms.formMain";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var commonUiPath = Path.Combine(inDir, commonUiAssembly);
+        if (!File.Exists(commonUiPath)) { Console.Error.WriteLine($"FAIL: {commonUiAssembly} not found in {inDir}"); return 1; }
+        using var commonUiModule = ModuleDefinition.ReadModule(commonUiPath, new ReaderParameters { AssemblyResolver = resolver, ReadWrite = false });
+
+        var mainType = module.GetType(mainFormType);
+        if (mainType is null) { Console.Error.WriteLine($"FAIL: type not found: {mainFormType}"); return 1; }
+        var onShownMethod = mainType.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody && m.Parameters.Count == 1);
+        if (onShownMethod is null) { Console.Error.WriteLine($"FAIL: OnShown not found on {mainFormType}"); return 1; }
+
+        var themeManagerType = commonUiModule.GetType("MailClient.Common.UI.Themes.ThemeManager");
+        var darkThemeType = commonUiModule.GetType("MailClient.Common.UI.Themes.DarkColorTheme");
+        var defaultThemeType = commonUiModule.GetType("MailClient.Common.UI.Themes.DefaultColorTheme");
+        if (themeManagerType is null || darkThemeType is null || defaultThemeType is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't resolve ThemeManager/DarkColorTheme/DefaultColorTheme in " + commonUiAssembly);
+            return 1;
+        }
+        var themeManagerGetInstanceDef = themeManagerType.Methods.FirstOrDefault(m => m.Name == "get_Instance");
+        var setActiveColorThemeDef = themeManagerType.Methods.FirstOrDefault(m => m.Name == "SetActiveColorTheme");
+        var darkGetInstanceDef = darkThemeType.Methods.FirstOrDefault(m => m.Name == "get_Instance");
+        var defaultGetInstanceDef = defaultThemeType.Methods.FirstOrDefault(m => m.Name == "get_Instance");
+        if (themeManagerGetInstanceDef is null || setActiveColorThemeDef is null || darkGetInstanceDef is null || defaultGetInstanceDef is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't resolve get_Instance/SetActiveColorTheme on the theme types");
+            return 1;
+        }
+        var themeManagerGetInstanceRef = module.ImportReference(themeManagerGetInstanceDef);
+        var setActiveColorThemeRef = module.ImportReference(setActiveColorThemeDef);
+        var darkGetInstanceRef = module.ImportReference(darkGetInstanceDef);
+        var defaultGetInstanceRef = module.ImportReference(defaultGetInstanceDef);
+
+        TypeDefinition? formType = mainType;
+        while (formType is not null && formType.FullName != "System.Windows.Forms.Control")
+        {
+            formType = formType.BaseType?.Resolve();
+        }
+        if (formType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control in base-type chain"); return 1; }
+        var timerTypeDef = formType.Module.GetType("System.Windows.Forms.Timer");
+        if (timerTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Timer"); return 1; }
+        var timerCtorDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0);
+        var timerSetIntervalDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "set_Interval");
+        var timerAddTickDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "add_Tick");
+        var timerStartDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "Start" && m.Parameters.Count == 0);
+        if (timerCtorDef is null || timerSetIntervalDef is null || timerAddTickDef is null || timerStartDef is null)
+        {
+            Console.Error.WriteLine("FAIL: Timer missing one of .ctor()/set_Interval/add_Tick/Start()");
+            return 1;
+        }
+        var timerCtorRef = module.ImportReference(timerCtorDef);
+        var timerSetIntervalRef = module.ImportReference(timerSetIntervalDef);
+        var timerAddTickRef = module.ImportReference(timerAddTickDef);
+        var timerStartRef = module.ImportReference(timerStartDef);
+        var timerTypeRef = module.ImportReference(timerTypeDef);
+
+        // File/string members are all CoreLib -- safe via typeof() reflection (IL-patching lesson
+        // 5 only bites app-deployed assemblies like MailClient.Common.UI.dll, handled above).
+        var fileExistsRef = module.ImportReference(typeof(File).GetMethod("Exists", new[] { typeof(string) })!);
+        var fileReadAllTextRef = module.ImportReference(typeof(File).GetMethod("ReadAllText", new[] { typeof(string) })!);
+        var fileDeleteRef = module.ImportReference(typeof(File).GetMethod("Delete", new[] { typeof(string) })!);
+        var stringTrimRef = module.ImportReference(typeof(string).GetMethod("Trim", Type.EmptyTypes)!);
+        var stringToLowerInvariantRef = module.ImportReference(typeof(string).GetMethod("ToLowerInvariant", Type.EmptyTypes)!);
+        var stringEqualsRef = module.ImportReference(typeof(string).GetMethod("Equals", new[] { typeof(string) })!);
+        var eventHandlerCtorRef = module.ImportReference(typeof(EventHandler).GetConstructor(new[] { typeof(object), typeof(IntPtr) })!);
+
+        var timerField = new FieldDefinition("__themeSwitchTimer", FieldAttributes.Private, timerTypeRef);
+        mainType.Fields.Add(timerField);
+
+        // --- __themeSwitchTick(object, EventArgs):
+        //   if (!File.Exists(triggerPath)) return;
+        //   string content = File.ReadAllText(triggerPath).Trim().ToLowerInvariant();
+        //   File.Delete(triggerPath);
+        //   ThemeManager.Instance.SetActiveColorTheme(content.Equals("dark") ? (IColorTheme)DarkColorTheme.Instance : DefaultColorTheme.Instance);
+        var tickMethod = new MethodDefinition("__themeSwitchTick", MethodAttributes.Private, module.TypeSystem.Void);
+        tickMethod.Parameters.Add(new ParameterDefinition("sender", ParameterAttributes.None, module.TypeSystem.Object));
+        tickMethod.Parameters.Add(new ParameterDefinition("e", ParameterAttributes.None, module.ImportReference(typeof(EventArgs))));
+        var tmBody = tickMethod.Body;
+        tmBody.InitLocals = true;
+        var contentLocal = new VariableDefinition(module.TypeSystem.String);
+        tmBody.Variables.Add(contentLocal);
+        mainType.Methods.Add(tickMethod);
+        var tmIl = tickMethod.Body.GetILProcessor();
+        var tmRet = Instruction.Create(OpCodes.Ret);
+        var useDefaultInstr = Instruction.Create(OpCodes.Nop);
+        var callSetInstr = Instruction.Create(OpCodes.Call, themeManagerGetInstanceRef);
+
+        tmIl.Append(Instruction.Create(OpCodes.Ldstr, triggerPath));
+        tmIl.Append(Instruction.Create(OpCodes.Call, fileExistsRef));
+        tmIl.Append(Instruction.Create(OpCodes.Brfalse, tmRet));
+        tmIl.Append(Instruction.Create(OpCodes.Ldstr, triggerPath));
+        tmIl.Append(Instruction.Create(OpCodes.Call, fileReadAllTextRef));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, stringTrimRef));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, stringToLowerInvariantRef));
+        tmIl.Append(Instruction.Create(OpCodes.Stloc, contentLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Ldstr, triggerPath));
+        tmIl.Append(Instruction.Create(OpCodes.Call, fileDeleteRef));
+        // ThemeManager.Instance.SetActiveColorTheme(...) -- push the ThemeManager instance FIRST
+        // (it's the receiver for the later Callvirt), then decide which theme singleton to pass.
+        tmIl.Append(callSetInstr);
+        tmIl.Append(Instruction.Create(OpCodes.Ldloc, contentLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Ldstr, "dark"));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, stringEqualsRef));
+        tmIl.Append(Instruction.Create(OpCodes.Brfalse, useDefaultInstr));
+        tmIl.Append(Instruction.Create(OpCodes.Call, darkGetInstanceRef));
+        tmIl.Append(Instruction.Create(OpCodes.Br, callSetInstr.Next ?? tmRet)); // placeholder, retargeted below
+        tmIl.Append(useDefaultInstr);
+        tmIl.Append(Instruction.Create(OpCodes.Call, defaultGetInstanceRef));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, setActiveColorThemeRef));
+        tmIl.Append(tmRet);
+
+        // The Br above needs to jump to the shared `Callvirt setActiveColorThemeRef` instruction,
+        // which wasn't known yet (not yet appended) at the point the Br was created -- fix its
+        // target up now that the whole method body exists, by capturing the actual instruction
+        // object (IL-patching lesson 7: never rely on a position guess).
+        var setActiveCallInstr = tmBody.Instructions.First(i => i.OpCode == OpCodes.Callvirt && ReferenceEquals(i.Operand, setActiveColorThemeRef));
+        var brToSetCall = tmBody.Instructions.First(i => i.OpCode == OpCodes.Br);
+        brToSetCall.Operand = setActiveCallInstr;
+
+        // --- Prepend to OnShown: __themeSwitchTimer = new Timer(); ...Interval = pollIntervalMs;
+        // ...Tick += __themeSwitchTick; ...Start(); -- same safe top-of-method insertion as the
+        // other dev-only file-trigger patches in this file.
+        {
+            var body = onShownMethod.Body;
+            var il = body.GetILProcessor();
+            var first = body.Instructions[0];
+            void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(first, i); }
+
+            Emit(
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Newobj, timerCtorRef),
+                Instruction.Create(OpCodes.Stfld, timerField),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, timerField),
+                Instruction.Create(OpCodes.Ldc_I4, pollIntervalMs),
+                Instruction.Create(OpCodes.Callvirt, timerSetIntervalRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, timerField),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldftn, tickMethod),
+                Instruction.Create(OpCodes.Newobj, eventHandlerCtorRef),
+                Instruction.Create(OpCodes.Callvirt, timerAddTickRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, timerField),
+                Instruction.Create(OpCodes.Callvirt, timerStartRef)
+            );
+        }
+
+        Console.WriteLine($"OK   {fileName}: {mainFormType}::OnShown -- now polls every {pollIntervalMs}ms for {triggerPath}; when present, reads its content (\"dark\" or anything else) and calls ThemeManager.Instance.SetActiveColorTheme(DarkColorTheme.Instance or DefaultColorTheme.Instance)");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-text-backcolor <input-dir> <output-dir>
+//
+// Experimental fix for the user's live report: with the theme switched to Light, notification
+// title/content text renders visibly heavier/bolder than the same text under Dark theme (same
+// font, same size, confirmed via decompile -- `headerFont`/`Font` selection has no theme
+// dependency at all: `ScaleUtils.ScaleFont(this, FontCache.CreateFont(FontManager.UIFont.
+// FontFamily, 11f))`, no FontStyle argument, so always Regular weight regardless of theme).
+// Live-tested directly (via --patch-theme-switcher + --patch-test-monogram-avatar, no screen
+// recording needed): Light theme's notification foreground/background pairing is RGB(40,40,40)
+// text on white (near-maximum contrast); Dark theme's is white text on a mid-dark gray (lower
+// contrast). Both title and content calls currently go through `TextRendererEx.DrawText(Graphics,
+// string, Font, Rectangle, Color foreColor, TextFormatFlags)` -- the overload that passes
+// `Color.Empty` as backColor internally, which both non-emoji code paths (confirmed by decompile:
+// our test strings contain no emoji) forward straight to `System.Windows.Forms.TextRenderer.
+// DrawText(g, text, font, bounds, foreColor, backColor, flags)`. Per .NET's own TextRenderer
+// implementation, `backColor == Color.Empty` selects a different internal GDI code path (a
+// transparent-background render via a memory-DC round-trip) than a real backColor (a direct,
+// opaque `ExtTextOut` call) -- plausible root cause: Wine's GDI text-rendering quality differs
+// between these two paths, and/or the transparent-background path's own antialiasing blend is
+// more sensitive to extreme (near-black-on-white) contrast than the opaque path is.
+//
+// Fix: pass the ALREADY-KNOWN actual background color explicitly (available on the same
+// `IColorTheme` already fetched for the foreground color: `NotificationWindowHeaderStart` for the
+// title -- confirmed equal to `...HeaderEnd` in both DefaultColorTheme and DarkColorTheme, i.e.
+// effectively solid despite being modeled as a gradient pair -- and `NotificationWindowBackgroundStart`
+// for content, same equal-pair situation), forcing the opaque `ExtTextOut` path instead. Routes
+// through the EXISTING `TextRendererEx.DrawText(Graphics, string, Font, Rectangle, Color, Color,
+// TextFormatFlags)` 7-parameter overload (already present in MailClient.Common.UI.dll, used
+// elsewhere in the app -- no new method needed, just a different existing overload and one extra
+// argument at each of the two call sites).
+//
+// ThemeManager/IColorTheme live in MailClient.Common.UI.dll, a different assembly than the one
+// this patch edits (MailClient.dll) -- resolved via a second module load + import, same
+// cross-assembly pattern as --patch-theme-switcher above (not typeof() reflection -- IL-patching
+// lesson 5, these are app-deployed assemblies).
+static int RunPatchNotificationTextBackColor(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-text-backcolor <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string commonUiAssembly = "MailClient.Common.UI.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var commonUiPath = Path.Combine(inDir, commonUiAssembly);
+        if (!File.Exists(commonUiPath)) { Console.Error.WriteLine($"FAIL: {commonUiAssembly} not found in {inDir}"); return 1; }
+        using var commonUiModule = ModuleDefinition.ReadModule(commonUiPath, new ReaderParameters { AssemblyResolver = resolver, ReadWrite = false });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var onPaintTitleMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaintTitle" && m.HasBody);
+        var onPaintContentMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaintContent" && m.HasBody);
+        if (onPaintTitleMethod is null) { Console.Error.WriteLine("FAIL: OnPaintTitle not found"); return 1; }
+        if (onPaintContentMethod is null) { Console.Error.WriteLine("FAIL: OnPaintContent not found"); return 1; }
+
+        var themeManagerType = commonUiModule.GetType("MailClient.Common.UI.Themes.ThemeManager");
+        var colorThemeType = commonUiModule.GetType("MailClient.Common.UI.Themes.IColorTheme");
+        var textRendererExType = commonUiModule.GetType("MailClient.Common.UI.TextRendererEx");
+        if (themeManagerType is null || colorThemeType is null || textRendererExType is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't resolve ThemeManager/IColorTheme/TextRendererEx in " + commonUiAssembly);
+            return 1;
+        }
+        var themeManagerGetInstanceDef = themeManagerType.Methods.FirstOrDefault(m => m.Name == "get_Instance");
+        var getActiveThemeDef = themeManagerType.Methods.FirstOrDefault(m => m.Name == "GetActiveTheme");
+        var headerStartGetterDef = colorThemeType.Methods.FirstOrDefault(m => m.Name == "get_NotificationWindowHeaderStart");
+        var backgroundStartGetterDef = colorThemeType.Methods.FirstOrDefault(m => m.Name == "get_NotificationWindowBackgroundStart");
+        // The 7-arg overload: (Graphics, string, Font, Rectangle, Color, Color, TextFormatFlags).
+        var drawText7ArgDef = textRendererExType.Methods.FirstOrDefault(m => m.Name == "DrawText" && m.Parameters.Count == 7 &&
+            m.Parameters[1].ParameterType.Name == "String" && m.Parameters[4].ParameterType.Name == "Color" && m.Parameters[5].ParameterType.Name == "Color");
+        if (themeManagerGetInstanceDef is null || getActiveThemeDef is null || headerStartGetterDef is null || backgroundStartGetterDef is null || drawText7ArgDef is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't resolve one of get_Instance/GetActiveTheme/get_NotificationWindowHeaderStart/get_NotificationWindowBackgroundStart/DrawText(7-arg)");
+            return 1;
+        }
+        var themeManagerGetInstanceRef = module.ImportReference(themeManagerGetInstanceDef);
+        var getActiveThemeRef = module.ImportReference(getActiveThemeDef);
+        var headerStartGetterRef = module.ImportReference(headerStartGetterDef);
+        var backgroundStartGetterRef = module.ImportReference(backgroundStartGetterDef);
+        var drawText7ArgRef = module.ImportReference(drawText7ArgDef);
+
+        // Shared logic for both OnPaintTitle and OnPaintContent: find the single `Ldc_I4 <flags>`
+        // immediately followed by `Call DrawText(6-arg)`, insert
+        // `Call ThemeManager.get_Instance(); Ldarg_0; Callvirt GetActiveTheme(object); Callvirt
+        // get_NotificationWindow{Header,Background}Start()` right before the flags constant (so
+        // the new backColor argument lands between foreColor and flags, matching the 7-arg
+        // overload's parameter order), then retarget the Call to the 7-arg overload.
+        void AddBackColorArg(MethodDefinition method, MethodReference backColorGetterRef, string label)
+        {
+            var body = method.Body;
+            var il = body.GetILProcessor();
+            var instrs = body.Instructions;
+
+            Instruction? flagsInstr = null;
+            Instruction? callInstr = null;
+            int matchCount = 0;
+            for (int i = 0; i < instrs.Count - 1; i++)
+            {
+                if (instrs[i].OpCode == OpCodes.Ldc_I4 && instrs[i + 1].OpCode == OpCodes.Call &&
+                    instrs[i + 1].Operand is MethodReference mr && mr.Name == "DrawText" && mr.Parameters.Count == 6)
+                {
+                    flagsInstr = instrs[i];
+                    callInstr = instrs[i + 1];
+                    matchCount++;
+                }
+            }
+            if (matchCount != 1 || flagsInstr is null || callInstr is null)
+            {
+                throw new InvalidOperationException($"expected exactly 1 `Ldc_I4 <flags>` immediately before a DrawText(6-arg) call in {label}, found {matchCount} -- method shape changed, review needed");
+            }
+
+            il.InsertBefore(flagsInstr, Instruction.Create(OpCodes.Call, themeManagerGetInstanceRef));
+            il.InsertBefore(flagsInstr, Instruction.Create(OpCodes.Ldarg_0));
+            il.InsertBefore(flagsInstr, Instruction.Create(OpCodes.Callvirt, getActiveThemeRef));
+            il.InsertBefore(flagsInstr, Instruction.Create(OpCodes.Callvirt, backColorGetterRef));
+            callInstr.Operand = drawText7ArgRef;
+        }
+
+        try
+        {
+            AddBackColorArg(onPaintTitleMethod, headerStartGetterRef, "OnPaintTitle");
+            AddBackColorArg(onPaintContentMethod, backgroundStartGetterRef, "OnPaintContent");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Console.Error.WriteLine("FAIL: " + ex.Message);
+            return 1;
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnPaintTitle/OnPaintContent -- now pass the theme's actual NotificationWindowHeaderStart/BackgroundStart color as TextRendererEx.DrawText's backColor argument (was Color.Empty), forcing the opaque ExtTextOut GDI path instead of the transparent memory-DC blend path");
         patched = true;
 
         module.Write(destPath);

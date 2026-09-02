@@ -450,16 +450,52 @@ anyway since it's a real bug and the fix is cheap:**
   pursued — don't leave as "Hold, no evidence", that reasoning is now stale.
 
 **Not started (scanned, not confirmed, not patched):** Stage 2/3/Hold interpolation items above
-remain scanned-but-not-pursued if a future session wants to extend that work. No other bugs are
-currently in an "investigated, unresolved" state — the empty-box-until-fade bug that used to be
-the one open item here is now fixed and confirmed (see its bullet above); everything found and
-fixed so far, including that one, is listed in the "Fixed and confirmed" section. The many dead
-ends ruled out on the way to that fix (Invalidate() calls, forced SetLayeredWindowAttributes
-changes, opacity dip-and-recover sequences, the Cinnamon "Map" animation and X11 Sync-extension
-compositor hypotheses, a standalone repro app that never reproduced it, and more) remain fully
-documented in `reports/notification-empty-until-fade-findings.md` so none of them get re-tried —
-read that file's early rounds before starting any new notification-rendering investigation, even
-though the bug itself is now closed.
+remain scanned-but-not-pursued if a future session wants to extend that work. The many dead
+ends ruled out on the way to the empty-box-until-fade fix (Invalidate() calls, forced
+SetLayeredWindowAttributes changes, opacity dip-and-recover sequences, the Cinnamon "Map"
+animation and X11 Sync-extension compositor hypotheses, a standalone repro app that never
+reproduced it, and more) remain fully documented in `reports/notification-empty-until-fade-
+findings.md` so none of them get re-tried — read that file's early rounds before starting any new
+notification-rendering investigation.
+
+**Currently paused, deliberately backed out of the deployed bottle (per explicit user
+instruction), though fully committed in git and confirmed working — resume when ready:**
+- **Close/settings icon fix** (`--patch-notification-icon-bitmap` +
+  `--patch-notification-title-icon-clip`, see the "Fixed and confirmed" bullet above for the
+  mechanism). An apparent freeze on hover/click was chased at length and traced entirely to the
+  synthetic `--patch-test-monogram-avatar` test trigger lacking a real backing mail item for its
+  "open on click" path — confirmed via a real incoming email that hover, close-click, and
+  settings-click (settings shows nothing yet, a separate minor bug, but doesn't freeze) all work
+  correctly. Not re-verified specifically for icon-hover against a real notification (only the
+  freeze itself was re-tested that way) — do that once before resuming reply/flag/delete work.
+  Deployed build currently sits one step earlier (`il-patches/output-theme/`, no icon-bitmap, no
+  title-icon-clip) so the two bugs below can be investigated with fewer moving parts. Full
+  history: `reports/notification-empty-until-fade-findings.md`'s twenty-eighth round.
+
+**Investigated, unresolved — the two current open items:**
+- **Notification title/content text renders visibly bolder under the Light theme than Dark**,
+  same font/size/weight in both (confirmed by decompile — font selection has no theme
+  dependency). Reproduced and screenshotted via the new `--patch-theme-switcher` dev tool (see
+  `il-patches/**`'s bullet below) — `supporting/notification-light-theme-bold-text-bug.png` vs.
+  `supporting/notification-dark-theme-normal-text-comparison.png`. First fix attempt (passing an
+  explicit `backColor` to `TextRendererEx.DrawText` to force GDI's opaque `ExtTextOut` path
+  instead of the transparent memory-DC blend path) **crashed the app** —
+  `NullReferenceException` inside WinForms' own internal `FontCache`/`WeakReference` machinery, a
+  genuine Wine/.NET gap in that specific code path, confirmed via the crash report and
+  immediately reverted. Do not retry that exact approach without first understanding why. Full
+  history and the untried next angle (`Graphics.TextRenderingHint`, or Wine's
+  `FontSmoothingType`/`FontSmoothingGamma` registry settings): twenty-eighth round.
+- **Hovering over the notification does not pause the auto-hide countdown** (a real, intentional
+  eM Client feature, confirmed by the user from product knowledge, not a guess) **and once
+  paused by any means, does not reliably resume it either.** Root-caused to the mechanism level:
+  the existing (unmodified) `timer_OnTimer`/`OnMouseEnter`/`OnMouseLeave` logic is correct, gated
+  on a `mouseOver` field that `this` form's own `OnMouseEnter`/`OnMouseLeave` need real Wine
+  mouse messages to maintain — which `this` doesn't reliably receive (the same underlying gap
+  the already-fixed click-routing bug, Stage 8, worked around specifically for *clicks* by
+  forwarding from `layeredWindow`, but no equivalent forwarding exists for hover events). Not
+  fixed yet — likely shape: hook `layeredWindow`'s own mouse-enter/move/leave (if it exposes
+  them) and forward into `this`, mirroring `layeredWindow_Click`'s existing forwarding. Full
+  history: twenty-eighth round.
 
 ## Investigation method (what actually worked this round)
 
