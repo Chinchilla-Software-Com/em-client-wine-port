@@ -1038,7 +1038,6 @@ static int RunPatchDiag(string[] args)
         Instrument(onMouseClickMethod, "OnMouseClick");
         Instrument(onShownMethod, "OnShown");
         Instrument(layeredWindowClickMethod, "layeredWindow_Click");
-        Instrument(doLayoutMethod, "doLayout");
         InstrumentMinimal(clickHandlerMethod, "notificationForm_Click");
         InstrumentBitmapDiag(updateBackgroundBitmapMethod, "updateBackgroundBitmap");
 
@@ -1048,7 +1047,6 @@ static int RunPatchDiag(string[] args)
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnMouseClick -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::OnShown -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::layeredWindow_Click -> {logPath}");
-        Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::doLayout -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {handlerTypeName}::notificationForm_Click -> {logPath}");
         Console.WriteLine($"OK   {fileName}: inserted diagnostic logging at top of {targetType}::updateBackgroundBitmap -> {logPath}");
         patched = true;
