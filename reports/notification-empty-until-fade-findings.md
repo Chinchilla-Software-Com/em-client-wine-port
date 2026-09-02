@@ -2181,3 +2181,122 @@ test-monogram-repeat + geometry-diag + extended diag + theme-switcher, no icon-b
 title-icon-clip, no text-backcolor) is deployed and confirmed stable. Both new bugs are
 reproduced, understood at the mechanism level, and documented above for whoever picks this back
 up; neither is fixed yet.
+
+## Twenty-ninth round: Light-theme bold text fixed via Graphics.DrawString, after a bumpy but
+fully self-caught implementation (three separate wrong constants/overloads, none of which reached
+a live deploy)
+
+User chose "try Graphics.DrawString" (over a pragmatic color tweak or accepting the limitation) to
+properly fix Bug 1 from the twenty-eighth round. New patch, `--patch-notification-text-
+drawstring`, replaces ONLY the final draw call in `OnPaintTitle`/`OnPaintContent` -- all upstream
+layout/measurement (bounds computation, vertical centering, icon-width allowance, still driven by
+`TextRenderer.MeasureText`) is untouched.
+
+**Three real bugs caught and fixed before ever deploying, each via decompile-before-deploy
+discipline catching it before a live test was needed:**
+- First attempt resolved `StringFormat`'s single-parameter constructor via `Parameters.Count == 1`
+  alone -- `System.Drawing.Common.dll` also has an internal single-parameter constructor taking a
+  native `GpStringFormat*` pointer (interop plumbing), and Cecil's `Methods` collection returned
+  that one first. Decompile showed `new StringFormat((GpStringFormat*)16384)` -- Wine or not, this
+  would have crashed instantly. Fixed by matching the parameter type name (`StringFormatFlags`)
+  explicitly rather than just the parameter count.
+- Both `StringFormatFlags.NoWrap` and `StringTrimming.EllipsisCharacter`'s numeric values were
+  wrong from memory: `0x4000` is actually `NoClip` (`NoWrap` is `0x1000`), and `5` is actually
+  `EllipsisPath` (`EllipsisCharacter` is `3`). Caught by decompiling and reading the ACTUAL enum
+  member names ilspy resolved them to (`StringTrimming.EllipsisPath`, not `EllipsisCharacter`),
+  then verifying both enums' real definitions directly against `System.Drawing.Common.dll` via
+  `ilspycmd -t` rather than trusting memory a second time.
+- A messy first draft of the whole patch (written in one long sitting) ended up with genuinely
+  broken/placeholder code in one code path (a `pushColor` callback that literally threw
+  `NotSupportedException`, left over from an aborted approach mid-edit) -- caught immediately on
+  the very next build/decompile pass, before any deploy, and the whole function was rewritten
+  clean from scratch rather than patched over.
+
+**Deployed and live-tested, three real regressions found and fixed in sequence, each confirmed via
+fresh screenshots (not reused from before) and precise pixel measurement (not eyeballed) against
+`supporting/notification-dark-theme-normal-text-comparison.png` (the confirmed-good TextRenderer-
+based capture from the twenty-eighth round):**
+1. **The boldness itself: fixed on the very first deploy.** Confirmed via side-by-side crops --
+   Light theme text now renders the same normal weight as Dark theme, both via `--patch-theme-
+   switcher` + `--patch-test-monogram-avatar`, no screen recording needed.
+2. **Content wrapped to 3 lines and overflowed the notification's intended bounds instead of 2
+   lines with an ellipsis** -- GDI+'s own line-wrap metrics differ slightly from GDI's (a
+   long-documented historical discrepancy), so a wrap point `TextRenderer.MeasureText` never
+   anticipated became reachable under `Graphics.DrawString`'s own wrapping. Fixed by adding
+   `StringFormatFlags.LineLimit` to content's `StringFormat` -- disallows a partially-visible
+   final line, restoring "whole lines only, trimmed to fit the given height."
+3. **Title rendered ~9px lower than it should**, breaking the vertical centering on the avatar
+   this project's own earlier padding/centering work had carefully tuned. Root-caused via *exact*
+   pixel measurement rather than eyeballing: both the buggy and reference captures showed an
+   identical 87px avatar-circle diameter (confirming identical capture scale), letting a direct,
+   scale-independent comparison of title-text-top-offset-from-avatar-center be computed for each
+   (+5.5 buggy vs. -21.5 reference -- a 27px-at-3x-scale = 9px-native difference). Theory: GDI+'s
+   `DrawString` positions a full font line-height box (including its own internal leading above
+   the glyph) starting at the given Y, while GDI's `TextRenderer` computes Y from
+   `TextRenderer.MeasureText`'s own (leading-excluded) metrics -- the same numeric Y means two
+   different things to the two APIs. Fixed with an empirically-measured `-9` correction applied
+   only to the value passed to `DrawString` (the upstream `rectangle.Y` computation itself, and
+   everything else that reads it, is untouched). Re-measured after the fix: text-top/bottom
+   offsets from avatar-center matched the reference to the exact decimal (-21.5/+24.5 both), not
+   just "looked close."
+4. **The title lost its "..." truncation indicator entirely** -- cut off abruptly mid-word
+   ("...Restoration S") with no ellipsis shown, despite `StringFormat.Trimming =
+   EllipsisCharacter` being set and confirmed correct via decompile, and despite generous extra
+   RectangleF height added specifically to rule out a vertical-headroom explanation. Very likely
+   another instance of this whole project's recurring theme -- Wine's `gdiplus` not fully
+   implementing a real GDI+ feature (same shape as the `InterpolationMode.HighQualityBicubic` gaps
+   found much earlier in this project). Rather than chase the Wine gap itself, worked around it by
+   measuring and truncating the string manually: a new private static helper,
+   `__truncateWithEllipsis(string text, Font font, int maxWidth)`, added to
+   `FormGenericNotification`, hand-written in IL as a real loop (entry null/empty-text guard, an
+   initial full-string-fits check, then a linear character-by-character shrink-and-remeasure loop
+   appending "…" each attempt) -- reuses the exact same `TextRenderer.MeasureText` call (and its
+   exact `TextFormatFlags` constant, `2080`, captured directly from the existing instruction
+   rather than re-derived) already used for the unrelated bounds/centering computation elsewhere
+   in `OnPaintTitle`, since *measuring* text doesn't render any pixels and was never implicated in
+   the boldness bug this whole migration exists to avoid. All branches built with explicit
+   long-form opcodes (`Brtrue`/`Ble`/`Bgt`, not the `.s` short forms) to sidestep IL-patching
+   lesson 4's short-branch-range risk entirely rather than needing `SimplifyMacros()` bookkeeping
+   for a method built fresh from scratch. Decompiled back to exactly the intended C# shape on the
+   first attempt (confirmed by reading ilspy's reconstructed loop, which matched the hand-drawn
+   algorithm instruction for instruction) -- confirmed live afterward: title now reads "Jaguar
+   Workshop Auto Restoration…" with a real ellipsis, in both themes.
+
+**Full re-verification after all four fixes landed together:** interpolation regression scan
+(13/13 unchanged), `--dump-handlers` (nesting order correct), fresh live screenshots in both
+Light and Dark theme (`supporting/notification-drawstring-fix-light-theme.png`,
+`supporting/notification-drawstring-fix-dark-theme.png`) -- both themes now show identical normal
+weight, correct ellipsis, correct 2-line content wrap, and pixel-exact-matched vertical alignment.
+`il-patches/output-drawstring4/` is the current fully-verified, deployed checkpoint.
+`--patch-notification-text-backcolor` (the crashed first fix attempt from the twenty-eighth round)
+remains in the tool as a documented dead end -- do not reapply it.
+
+**A fifth regression, caught by the user (not this session) directly comparing fresh screenshots
+against the confirmed-good reference: both title and content text sat further right (more
+indented) than before.** Measured the same rigorous way as the Y-offset (avatar-diameter-
+normalized scale confirmed identical between captures, first-non-background-pixel detection on
+the same glyphs in both): title's left edge sat 149px right of the avatar's own left edge in the
+buggy capture vs 124px in the reference (25px-at-3x-scale = ~8px-native); content's first line sat
+28px right of the avatar's left edge vs -20px in the reference (48px-at-3x-scale = ~16px-native --
+about double title's shift, plausibly because side-bearing scales with font size and content uses
+a different font size than the title). Neither rectangle's underlying X field was touched by this
+patch (title's came from the same `rectangle.X` as always; content's from the same `contentRect.X`
+field), so the entire shift is attributable to GDI+'s `DrawString` including its own left-side
+glyph bearing that GDI's `TextRenderer` compensates for internally by default -- the same root
+cause class as the earlier Y-offset bug, just on the horizontal axis. Fixed the same way: an
+empirically-measured correction (`-8` for title, `-16` for content) applied only to the value
+actually passed to `DrawString`'s `RectangleF`, leaving the upstream `rectangle`/`contentRect`
+computations completely untouched. Content's rect had to switch from a straight `op_Implicit`
+conversion to building a fresh `RectangleF` from its own X/Y/Width/Height parts (mirroring title's
+existing approach) since a plain type conversion can't have one field adjusted afterward. Deployed
+and re-measured fresh (not reusing earlier screenshots): title X now within 1px-at-3x-scale
+(~0.3px native, i.e. exact within rounding) of the reference, content X an exact match, title Y
+still an exact match from the earlier fix -- confirmed via the same measurement script re-run
+against brand new captures, not assumed carried over. `il-patches/output-drawstring5/` is the
+current fully-verified, deployed checkpoint superseding `output-drawstring4/`.
+`supporting/notification-drawstring-fix-{light,dark}-theme.png` were re-captured and overwritten
+to reflect this final, fully-corrected state.
+
+Only remaining open item from this round's original two bugs: hover-pause-timer (Bug 2), not
+touched this round -- still open, see the twenty-eighth round's own writeup for the root-caused
+mechanism.

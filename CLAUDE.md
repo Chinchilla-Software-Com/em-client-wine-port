@@ -424,6 +424,36 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   Hover-state icon swap is decompile-verified but not live-tested (no mouse-automation tooling
   available in this environment). Full history: `reports/notification-empty-until-fade-
   findings.md`'s twenty-third through twenty-seventh rounds.
+- **Notification title/content text rendering visibly bolder under the Light theme than Dark**
+  (same font/size/weight in both — confirmed by decompile that font selection has no theme
+  dependency at all). Root cause: GDI's `TextRenderer.DrawText`'s transparent-background mode
+  needs to read back real destination pixels to blend anti-aliased edges correctly — works fine
+  against a live on-screen window (confirmed: the main mail list, also near-black-on-white,
+  renders with completely normal weight) but Wine's GDI apparently falls back to assuming a
+  *black* background when drawing into the OFFSCREEN bitmap this project's own text-in-bitmap fix
+  requires; Dark theme's real background is close enough to black that the wrong assumption
+  barely shows, Light theme's white background is about as far from black as possible. Fixed by
+  switching `OnPaintTitle`/`OnPaintContent`'s final draw call from `TextRenderer`/`TextRendererEx`
+  to GDI+'s `Graphics.DrawString` (`--patch-notification-text-drawstring`), which does its own
+  in-memory alpha compositing with no screen-read-back trick to go wrong — all upstream layout/
+  measurement (bounds, vertical centering, icon-width allowance) is untouched, still driven by the
+  same `TextRenderer.MeasureText`. A first fix attempt (passing an explicit `backColor` to force
+  GDI's opaque path instead) **crashed the app** — `NullReferenceException` deep in WinForms' own
+  `FontCache` internals, a separate Wine/.NET gap; reverted, documented as a dead end, do not
+  retry. Switching rendering engines surfaced five secondary regressions, all found via precise
+  pixel measurement against a confirmed-good reference screenshot (never eyeballed) and fixed in
+  the same round: content wrapping to 3 lines instead of 2 with an ellipsis (fixed with
+  `StringFormatFlags.LineLimit`); title losing its "…" truncation entirely, apparently another
+  Wine `gdiplus` gap (fixed with a hand-written manual measure-and-truncate helper,
+  `__truncateWithEllipsis`, reusing the same `TextRenderer.MeasureText` since measuring text never
+  renders pixels and was never implicated in the boldness bug); title rendering ~9px too low and
+  both title/content sitting ~8–16px too far right, both a GDI-vs-GDI+ font-metrics discrepancy
+  (internal leading and left-side glyph bearing respectively) fixed with empirically-measured
+  pixel corrections applied only to the value passed to `DrawString`, leaving the upstream
+  rectangle computations untouched. Final state confirmed via fresh screenshots and pixel
+  measurement matching the reference to the exact decimal in both themes:
+  `supporting/notification-drawstring-fix-{light,dark}-theme.png`. Full history:
+  `reports/notification-empty-until-fade-findings.md`'s twenty-eighth and twenty-ninth rounds.
 
 **Confirmed as a real, separate Wine bug, but not the cause of anything fixed above — patched
 anyway since it's a real bug and the fix is cheap:**
@@ -472,19 +502,7 @@ instruction), though fully committed in git and confirmed working — resume whe
   title-icon-clip) so the two bugs below can be investigated with fewer moving parts. Full
   history: `reports/notification-empty-until-fade-findings.md`'s twenty-eighth round.
 
-**Investigated, unresolved — the two current open items:**
-- **Notification title/content text renders visibly bolder under the Light theme than Dark**,
-  same font/size/weight in both (confirmed by decompile — font selection has no theme
-  dependency). Reproduced and screenshotted via the new `--patch-theme-switcher` dev tool (see
-  `il-patches/**`'s bullet below) — `supporting/notification-light-theme-bold-text-bug.png` vs.
-  `supporting/notification-dark-theme-normal-text-comparison.png`. First fix attempt (passing an
-  explicit `backColor` to `TextRendererEx.DrawText` to force GDI's opaque `ExtTextOut` path
-  instead of the transparent memory-DC blend path) **crashed the app** —
-  `NullReferenceException` inside WinForms' own internal `FontCache`/`WeakReference` machinery, a
-  genuine Wine/.NET gap in that specific code path, confirmed via the crash report and
-  immediately reverted. Do not retry that exact approach without first understanding why. Full
-  history and the untried next angle (`Graphics.TextRenderingHint`, or Wine's
-  `FontSmoothingType`/`FontSmoothingGamma` registry settings): twenty-eighth round.
+**Investigated, unresolved — the one remaining open item:**
 - **Hovering over the notification does not pause the auto-hide countdown** (a real, intentional
   eM Client feature, confirmed by the user from product knowledge, not a guess) **and once
   paused by any means, does not reliably resume it either.** Root-caused to the mechanism level:

@@ -88,6 +88,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-text-backcolor")
     return RunPatchNotificationTextBackColor(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-text-drawstring")
+{
+    return RunPatchNotificationTextDrawString(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-notification-content-padding")
 {
     return RunPatchNotificationContentPadding(args);
@@ -2874,6 +2879,511 @@ static int RunPatchNotificationTextBackColor(string[] args)
         }
 
         Console.WriteLine($"OK   {fileName}: {targetType}::OnPaintTitle/OnPaintContent -- now pass the theme's actual NotificationWindowHeaderStart/BackgroundStart color as TextRendererEx.DrawText's backColor argument (was Color.Empty), forcing the opaque ExtTextOut GDI path instead of the transparent memory-DC blend path");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-text-drawstring <input-dir> <output-dir>
+//
+// Second fix attempt for the same Light-theme-only bold-text bug --patch-notification-text-
+// backcolor tried and crashed on (see that patch's own doc comment; do not retry its approach).
+// Root cause theory, now better understood: `TextRendererEx.DrawText`/`TextRenderer.DrawText`'s
+// no-backColor overload draws in GDI's "transparent background" mode, which needs to read back
+// the REAL destination pixels to blend anti-aliased glyph edges correctly. That works fine
+// against a live on-screen window (confirmed: the main mail list -- also near-black-on-white,
+// same high contrast -- renders with completely normal weight in Light theme) but our
+// notification text is drawn into an OFFSCREEN `Bitmap` (`Graphics.FromImage(backgroundBitmap)`,
+// needed for the reliable `UpdateLayeredWindow` blit this whole project's fix chain depends on).
+// Plausible Wine gap: when GDI can't do a real read-back against that kind of surface, it likely
+// falls back to assuming a BLACK background for the anti-aliasing blend math regardless of what's
+// actually there. Dark theme's real background is close enough to black that the wrong
+// assumption barely shows; Light theme's white background is about as far from black as
+// possible, so the miscalibrated edges render far darker/heavier than intended -- visually
+// indistinguishable from bold. This explains every piece of observed evidence: theme-dependence,
+// notification-specificity, and why the main list (a live window, not a bitmap) is unaffected.
+//
+// Fix: stop using GDI's `TextRenderer`/`TextRendererEx` for this specific offscreen-bitmap
+// drawing entirely, in favor of GDI+'s `Graphics.DrawString` -- GDI+ does its own alpha
+// compositing directly against the in-memory pixel buffer it already has, with no native
+// screen-read-back trick involved at all, so this Wine gap has nothing to attach to. Deliberately
+// narrow in scope: only the FINAL draw call in `OnPaintTitle`/`OnPaintContent` is replaced (both
+// simple, branch-free straight-line tails, confirmed via --dump-il and a full-method branch-
+// target scan before removal) -- all upstream layout/measurement logic (bounds computation,
+// vertical centering, icon-width allowance) is left completely untouched, still driven by the
+// same `TextRenderer.MeasureText`-based `bounds` this project's earlier padding/centering fixes
+// already tuned, to avoid re-opening that already-carefully-measured work. `StringFormat` is
+// configured to approximate the original `TextFormatFlags` as closely as GDI+ allows: `NoWrap`
+// for the title (matching `SingleLine`) and default (wrapping allowed) for content (matching
+// `WordBreak`), `Trimming = EllipsisCharacter` for both (matching `EndEllipsis`) -- GDI+'s own
+// metrics differ slightly from GDI's (a long-documented historical discrepancy between
+// `Graphics.DrawString` and `TextRenderer.DrawText`), so a fresh visual re-check of wrapping/
+// truncation/positioning against both themes is still needed after this deploys, not just the
+// boldness itself.
+//
+// `Graphics`/`SolidBrush`/`StringFormat` live in `System.Drawing.Common.dll`;
+// `Rectangle`/`RectangleF` live in `System.Drawing.Primitives.dll` -- both app-deployed
+// assemblies (IL-patching lesson 5), resolved here from types ALREADY referenced in the method
+// being patched (the existing `Callvirt get_Graphics()`'s return type; the existing
+// `headerRect`/`contentRect` fields' own field types) rather than typeof() reflection on
+// il-patcher's own .NET 10 process.
+static int RunPatchNotificationTextDrawString(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-text-drawstring <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var onPaintTitleMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaintTitle" && m.HasBody);
+        var onPaintContentMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaintContent" && m.HasBody && m.DeclaringType == type);
+        if (onPaintTitleMethod is null) { Console.Error.WriteLine("FAIL: OnPaintTitle not found"); return 1; }
+        if (onPaintContentMethod is null) { Console.Error.WriteLine("FAIL: OnPaintContent not found (base class one, not FormIMStatusNotification's override)"); return 1; }
+
+        var titleField = type.Fields.FirstOrDefault(f => f.Name == "title");
+        var headerFontField = type.Fields.FirstOrDefault(f => f.Name == "headerFont");
+        var contentField = type.Fields.FirstOrDefault(f => f.Name == "content");
+        var contentRectField = type.Fields.FirstOrDefault(f => f.Name == "contentRect");
+        var headerRectField = type.Fields.FirstOrDefault(f => f.Name == "headerRect");
+        if (titleField is null || headerFontField is null || contentField is null || contentRectField is null || headerRectField is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't find title/headerFont/content/contentRect/headerRect field(s)");
+            return 1;
+        }
+
+        var rectangleTypeDef = headerRectField.FieldType.Resolve();
+        if (rectangleTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Rectangle from headerRect's own FieldType"); return 1; }
+        var drawingPrimitivesModule = rectangleTypeDef.Module;
+        var rectangleFTypeDef = drawingPrimitivesModule.GetType("System.Drawing.RectangleF");
+        if (rectangleFTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Drawing.RectangleF"); return 1; }
+        var rectToRectFOpDef = rectangleFTypeDef.Methods.FirstOrDefault(m => m.Name == "op_Implicit" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.Drawing.Rectangle");
+        if (rectToRectFOpDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve RectangleF.op_Implicit(Rectangle)"); return 1; }
+        var rectToRectFOpRef = module.ImportReference(rectToRectFOpDef);
+        // Title needs a RectangleF built with EXTRA height beyond the tightly-measured single-line
+        // bounds (see the call site below for why -- GDI+'s ellipsis trimming needs headroom to
+        // operate on width alone without an incidental vertical constraint interfering), so build
+        // it via RectangleF's own 4-float constructor from the original Rectangle's X/Y/Width plus
+        // a widened height, rather than a straight op_Implicit conversion.
+        var rectGetXDef = rectangleTypeDef.Methods.FirstOrDefault(m => m.Name == "get_X");
+        var rectGetYDef = rectangleTypeDef.Methods.FirstOrDefault(m => m.Name == "get_Y");
+        var rectGetWidthDef = rectangleTypeDef.Methods.FirstOrDefault(m => m.Name == "get_Width");
+        var rectGetHeightDef = rectangleTypeDef.Methods.FirstOrDefault(m => m.Name == "get_Height");
+        var rectangleFCtor4Def = rectangleFTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 4);
+        if (rectGetXDef is null || rectGetYDef is null || rectGetWidthDef is null || rectGetHeightDef is null || rectangleFCtor4Def is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't resolve Rectangle.get_X/get_Y/get_Width/get_Height or RectangleF(float,float,float,float)");
+            return 1;
+        }
+        var rectGetXRef = module.ImportReference(rectGetXDef);
+        var rectGetYRef = module.ImportReference(rectGetYDef);
+        var rectGetWidthRef = module.ImportReference(rectGetWidthDef);
+        var rectGetHeightRef = module.ImportReference(rectGetHeightDef);
+        var rectangleFCtor4Ref = module.ImportReference(rectangleFCtor4Def);
+
+        // Graphics/SolidBrush/StringFormat all live in System.Drawing.Common.dll -- resolve via
+        // the existing PaintEventArgs::get_Graphics() call already present in OnPaintTitle's own
+        // body, whose return type IS Graphics, rather than a fresh typeof() reflection.
+        var getGraphicsCallInTitle = onPaintTitleMethod.Body.Instructions.FirstOrDefault(i => i.Operand is MethodReference mr && mr.Name == "get_Graphics");
+        if (getGraphicsCallInTitle is null) { Console.Error.WriteLine("FAIL: couldn't find PaintEventArgs::get_Graphics() call in OnPaintTitle"); return 1; }
+        var getGraphicsMethodRef = (MethodReference)getGraphicsCallInTitle.Operand;
+        var graphicsTypeDef = getGraphicsMethodRef.ReturnType.Resolve();
+        if (graphicsTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Graphics type"); return 1; }
+        var drawingCommonModule = graphicsTypeDef.Module;
+        var solidBrushTypeDef = drawingCommonModule.GetType("System.Drawing.SolidBrush");
+        var stringFormatTypeDef = drawingCommonModule.GetType("System.Drawing.StringFormat");
+        if (solidBrushTypeDef is null || stringFormatTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve SolidBrush/StringFormat"); return 1; }
+        var solidBrushCtorDef = solidBrushTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 1);
+        // Match the parameter type by name explicitly -- StringFormat also has an internal
+        // single-parameter constructor taking a native GpStringFormat* pointer (interop plumbing),
+        // and a plain `Parameters.Count == 1` filter picked that one up instead of the public
+        // StringFormat(StringFormatFlags) constructor the first time this was written, confirmed
+        // via decompile showing `new StringFormat((GpStringFormat*)16384)` -- garbage that would
+        // have crashed the instant it ran.
+        var stringFormatCtorDef = stringFormatTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "StringFormatFlags");
+        var setTrimmingDef = stringFormatTypeDef.Methods.FirstOrDefault(m => m.Name == "set_Trimming");
+        if (solidBrushCtorDef is null || stringFormatCtorDef is null || setTrimmingDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve SolidBrush(Color)/StringFormat(StringFormatFlags)/set_Trimming"); return 1; }
+        var solidBrushCtorRef = module.ImportReference(solidBrushCtorDef);
+        var stringFormatCtorRef = module.ImportReference(stringFormatCtorDef);
+        var setTrimmingRef = module.ImportReference(setTrimmingDef);
+
+        var drawStringDef = graphicsTypeDef.Methods.FirstOrDefault(m => m.Name == "DrawString" && m.Parameters.Count == 5 &&
+            m.Parameters[0].ParameterType.Name == "String" && m.Parameters[2].ParameterType.Name == "Brush" &&
+            m.Parameters[3].ParameterType.Name == "RectangleF" && m.Parameters[4].ParameterType.Name == "StringFormat");
+        if (drawStringDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Graphics.DrawString(string, Font, Brush, RectangleF, StringFormat)"); return 1; }
+        var drawStringRef = module.ImportReference(drawStringDef);
+
+        // For the title's manual ellipsis-truncation helper (see its own doc comment below):
+        // TextRenderer.MeasureText and Size are both app-deployed (System.Windows.Forms.dll /
+        // System.Drawing.Primitives.dll -- IL-patching lesson 5), resolved from the EXISTING
+        // MeasureText call already present in OnPaintTitle's own (untouched-by-this-patch) bounds
+        // computation, rather than typeof() reflection.
+        var measureTextCall = onPaintTitleMethod.Body.Instructions.FirstOrDefault(i => i.Operand is MethodReference mr && mr.Name == "MeasureText" && mr.Parameters.Count == 4);
+        if (measureTextCall is null) { Console.Error.WriteLine("FAIL: couldn't find TextRenderer.MeasureText(string,Font,Size,TextFormatFlags) call in OnPaintTitle"); return 1; }
+        var measureTextRef = (MethodReference)measureTextCall.Operand;
+        var sizeTypeRef = measureTextRef.ReturnType;
+        var sizeTypeDef = sizeTypeRef.Resolve();
+        if (sizeTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Size type from MeasureText's return type"); return 1; }
+        var sizeCtorDef = sizeTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 2);
+        var sizeGetWidthDef = sizeTypeDef.Methods.FirstOrDefault(m => m.Name == "get_Width");
+        if (sizeCtorDef is null || sizeGetWidthDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Size(int,int)/get_Width"); return 1; }
+        var sizeCtorRef = module.ImportReference(sizeCtorDef);
+        var sizeGetWidthRef = module.ImportReference(sizeGetWidthDef);
+        // The TextFormatFlags combination this exact call already uses (NoPrefix | SingleLine) --
+        // captured as a literal from the existing instruction, confirmed via --dump-il to be the
+        // constant 2080, rather than re-deriving/guessing the combined flags value by hand.
+        var measureTextFlagsInstr = measureTextCall.Previous;
+        if (measureTextFlagsInstr is null || measureTextFlagsInstr.OpCode != OpCodes.Ldc_I4) { Console.Error.WriteLine("FAIL: expected Ldc_I4 (TextFormatFlags) immediately before MeasureText call"); return 1; }
+        int measureTextFlagsValue = (int)measureTextFlagsInstr.Operand;
+
+        var stringTypeDef = module.TypeSystem.String.Resolve();
+        var isNullOrEmptyRef = module.ImportReference(typeof(string).GetMethod("IsNullOrEmpty", new[] { typeof(string) })!);
+        var stringConcat2Ref = module.ImportReference(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) })!);
+        var stringGetLengthRef = module.ImportReference(typeof(string).GetProperty("Length")!.GetGetMethod()!);
+        var stringSubstringRef = module.ImportReference(typeof(string).GetMethod("Substring", new[] { typeof(int), typeof(int) })!);
+
+        // New private static helper: TruncateWithEllipsis(string text, Font font, int maxWidth).
+        // GDI+'s own StringFormat.Trimming (EllipsisCharacter) turned out not to work at all under
+        // Wine -- confirmed live: the title just cut off mid-word with no "..." shown whatsoever,
+        // even with Trimming explicitly set and ample RectangleF headroom (see the Y-offset fix
+        // above for the headroom experiment this was tested alongside) -- plausibly another
+        // instance of this whole project's recurring theme (Wine's gdiplus not fully implementing
+        // a GDI+ feature, same shape as the InterpolationMode gaps found much earlier). Worked
+        // around by measuring and truncating the string manually in code, using the SAME
+        // TextRenderer.MeasureText already used for layout (GDI-based measurement, unaffected by
+        // the unrelated GDI-vs-GDI+ RENDERING bug this whole DrawString migration exists to avoid
+        // -- measuring text doesn't render pixels, so it was never part of the boldness problem),
+        // then passing the already-fits literal string to DrawString instead of relying on its own
+        // trimming. Linear character-by-character shrink (not a binary search) -- simpler to get
+        // right in hand-written IL, and titles are short enough that a few dozen iterations worst
+        // case is irrelevant for a once-per-paint cost.
+        var truncateHelper = new MethodDefinition("__truncateWithEllipsis", MethodAttributes.Private | MethodAttributes.Static, module.TypeSystem.String);
+        truncateHelper.Parameters.Add(new ParameterDefinition("text", ParameterAttributes.None, module.TypeSystem.String));
+        var fontTypeRef = headerFontField.FieldType;
+        truncateHelper.Parameters.Add(new ParameterDefinition("font", ParameterAttributes.None, fontTypeRef));
+        truncateHelper.Parameters.Add(new ParameterDefinition("maxWidth", ParameterAttributes.None, module.TypeSystem.Int32));
+        type.Methods.Add(truncateHelper);
+        {
+            var thBody = truncateHelper.Body;
+            thBody.InitLocals = true;
+            var fullSizeLocal = new VariableDefinition(sizeTypeRef);
+            var sLocal = new VariableDefinition(module.TypeSystem.String);
+            var candidateLocal = new VariableDefinition(module.TypeSystem.String);
+            var szLocal = new VariableDefinition(sizeTypeRef);
+            thBody.Variables.Add(fullSizeLocal);
+            thBody.Variables.Add(sLocal);
+            thBody.Variables.Add(candidateLocal);
+            thBody.Variables.Add(szLocal);
+            var il = thBody.GetILProcessor();
+
+            var retEllipsisOnly = Instruction.Create(OpCodes.Ldstr, "…");
+            var retTextUnchanged = Instruction.Create(OpCodes.Ldarg_0);
+            var loopTop = Instruction.Create(OpCodes.Ldloc, sLocal);
+
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Call, isNullOrEmptyRef));
+            il.Append(Instruction.Create(OpCodes.Brtrue, retTextUnchanged));
+
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldarg_1));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4, int.MaxValue));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4, int.MaxValue));
+            il.Append(Instruction.Create(OpCodes.Newobj, sizeCtorRef));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4, measureTextFlagsValue));
+            il.Append(Instruction.Create(OpCodes.Call, measureTextRef));
+            il.Append(Instruction.Create(OpCodes.Stloc, fullSizeLocal));
+
+            il.Append(Instruction.Create(OpCodes.Ldloca, fullSizeLocal));
+            il.Append(Instruction.Create(OpCodes.Call, sizeGetWidthRef));
+            il.Append(Instruction.Create(OpCodes.Ldarg_2));
+            il.Append(Instruction.Create(OpCodes.Ble, retTextUnchanged));
+
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Stloc, sLocal));
+
+            il.Append(loopTop);
+            il.Append(Instruction.Create(OpCodes.Callvirt, stringGetLengthRef));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+            il.Append(Instruction.Create(OpCodes.Ble, retEllipsisOnly));
+
+            il.Append(Instruction.Create(OpCodes.Ldloc, sLocal));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+            il.Append(Instruction.Create(OpCodes.Ldloc, sLocal));
+            il.Append(Instruction.Create(OpCodes.Callvirt, stringGetLengthRef));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4_1));
+            il.Append(Instruction.Create(OpCodes.Sub));
+            il.Append(Instruction.Create(OpCodes.Callvirt, stringSubstringRef));
+            il.Append(Instruction.Create(OpCodes.Stloc, sLocal));
+
+            il.Append(Instruction.Create(OpCodes.Ldloc, sLocal));
+            il.Append(Instruction.Create(OpCodes.Ldstr, "…"));
+            il.Append(Instruction.Create(OpCodes.Call, stringConcat2Ref));
+            il.Append(Instruction.Create(OpCodes.Stloc, candidateLocal));
+
+            il.Append(Instruction.Create(OpCodes.Ldloc, candidateLocal));
+            il.Append(Instruction.Create(OpCodes.Ldarg_1));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4, int.MaxValue));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4, int.MaxValue));
+            il.Append(Instruction.Create(OpCodes.Newobj, sizeCtorRef));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4, measureTextFlagsValue));
+            il.Append(Instruction.Create(OpCodes.Call, measureTextRef));
+            il.Append(Instruction.Create(OpCodes.Stloc, szLocal));
+
+            il.Append(Instruction.Create(OpCodes.Ldloca, szLocal));
+            il.Append(Instruction.Create(OpCodes.Call, sizeGetWidthRef));
+            il.Append(Instruction.Create(OpCodes.Ldarg_2));
+            il.Append(Instruction.Create(OpCodes.Bgt, loopTop));
+
+            il.Append(Instruction.Create(OpCodes.Ldloc, candidateLocal));
+            il.Append(Instruction.Create(OpCodes.Ret));
+
+            il.Append(retEllipsisOnly);
+            il.Append(Instruction.Create(OpCodes.Ret));
+
+            il.Append(retTextUnchanged);
+            il.Append(Instruction.Create(OpCodes.Ret));
+        }
+        var truncateHelperRef = truncateHelper;
+
+        // Title's foreColor comes from ThemeManager.Instance.GetActiveTheme(this).
+        // NotificationWindowHeaderForeground -- capture the exact MethodReferences the EXISTING
+        // call chain in OnPaintTitle already uses, before that chain's instructions are removed.
+        var titleColorChainCalls = onPaintTitleMethod.Body.Instructions
+            .Where(i => i.OpCode == OpCodes.Call || i.OpCode == OpCodes.Callvirt)
+            .Select(i => i.Operand as MethodReference)
+            .Where(mr => mr is not null && (mr.Name == "get_Instance" || mr.Name == "GetActiveTheme" || mr.Name == "get_NotificationWindowHeaderForeground"))
+            .ToList();
+        var themeGetInstanceRef = titleColorChainCalls.FirstOrDefault(mr => mr!.Name == "get_Instance");
+        var getActiveThemeRef = titleColorChainCalls.FirstOrDefault(mr => mr!.Name == "GetActiveTheme");
+        var headerForegroundGetterRef = titleColorChainCalls.FirstOrDefault(mr => mr!.Name == "get_NotificationWindowHeaderForeground");
+        if (themeGetInstanceRef is null || getActiveThemeRef is null || headerForegroundGetterRef is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't find the existing ThemeManager.Instance.GetActiveTheme(this).NotificationWindowHeaderForeground call chain in OnPaintTitle");
+            return 1;
+        }
+
+        // Content's foreColor/font come from Control.get_ForeColor()/get_Font() -- capture from
+        // OnPaintContent's own existing calls the same way.
+        var contentColorFontCalls = onPaintContentMethod.Body.Instructions
+            .Where(i => i.OpCode == OpCodes.Callvirt)
+            .Select(i => i.Operand as MethodReference)
+            .Where(mr => mr is not null && (mr.Name == "get_ForeColor" || mr.Name == "get_Font"))
+            .ToList();
+        var controlGetForeColorRef = contentColorFontCalls.FirstOrDefault(mr => mr!.Name == "get_ForeColor");
+        var controlGetFontRef = contentColorFontCalls.FirstOrDefault(mr => mr!.Name == "get_Font");
+        if (controlGetForeColorRef is null || controlGetFontRef is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't find Control.get_ForeColor()/get_Font() calls in OnPaintContent");
+            return 1;
+        }
+
+        // OnPaintTitle stashes its computed bounds in a local Rectangle variable (V_0, confirmed
+        // via --dump-il) reused across the whole method -- capture it now, before the tail using
+        // it gets removed (removing instructions doesn't remove the local itself from
+        // body.Variables, but grab it up front for clarity).
+        var titleBoundsLocal = onPaintTitleMethod.Body.Variables[0];
+
+        // Verified directly against System.Drawing.Common.dll's own enum definitions (--dump -t)
+        // rather than trusted from memory, after the first draft got both wrong: NoWrap is
+        // 0x1000 (0x4000 is actually NoClip), and EllipsisCharacter is 3 (5 is EllipsisPath).
+        const int stringFormatFlagsNoWrap = 0x1000; // System.Drawing.StringFormatFlags.NoWrap
+        const int stringFormatFlagsLineLimit = 0x2000; // System.Drawing.StringFormatFlags.LineLimit
+        const int stringTrimmingEllipsisCharacter = 3; // System.Drawing.StringTrimming.EllipsisCharacter
+        const float titleRectExtraHeight = 40f; // generous headroom, see call site below
+
+        // Replaces the tail of `method` -- from the `Ldarg e` immediately preceding its
+        // `Callvirt PaintEventArgs::get_Graphics()` call through the final `Ret` -- with a
+        // DrawString-based sequence built from the caller-supplied instruction lists for pushing
+        // the text/font/color/rect arguments (the parts that differ between OnPaintTitle and
+        // OnPaintContent), keeping everything before that point (bounds computation, etc)
+        // untouched.
+        void ReplaceDrawCall(MethodDefinition method, string label, List<Instruction> pushText, List<Instruction> pushFont,
+            List<Instruction> pushColor, List<Instruction> pushRectF, int formatFlags)
+        {
+            var body = method.Body;
+            var il = body.GetILProcessor();
+            var instrs = body.Instructions;
+
+            var getGraphicsCalls = instrs.Where(i => i.Operand is MethodReference mr && mr.Name == "get_Graphics").ToList();
+            if (getGraphicsCalls.Count != 1) throw new InvalidOperationException($"{label}: expected exactly 1 get_Graphics() call, found {getGraphicsCalls.Count}");
+            var getGraphicsCall = getGraphicsCalls[0];
+            var graphicsGetterRef = (MethodReference)getGraphicsCall.Operand;
+            var rangeStart = getGraphicsCall.Previous; // the Ldarg pushing `e`
+            if (rangeStart is null) throw new InvalidOperationException($"{label}: get_Graphics() call has no preceding instruction");
+            var lastRet = instrs.Last(i => i.OpCode == OpCodes.Ret);
+
+            // Confirm nothing in the whole method (or its exception handlers, though these two
+            // methods have none) branches into the range about to be removed (IL-patching lesson
+            // 2) -- collect every instruction between rangeStart and lastRet inclusive, then scan
+            // ALL instructions' Operand for a reference to any of them.
+            var toRemove = new List<Instruction>();
+            for (var i = rangeStart; i is not null; i = i.Next)
+            {
+                toRemove.Add(i);
+                if (ReferenceEquals(i, lastRet)) break;
+            }
+            var toRemoveSet = new HashSet<Instruction>(toRemove);
+            int externalRefs = instrs.Count(i => !toRemoveSet.Contains(i) && i.Operand is Instruction target && toRemoveSet.Contains(target));
+            if (externalRefs != 0) throw new InvalidOperationException($"{label}: {externalRefs} instruction(s) outside the removed range branch into it -- not safe to remove, review needed");
+
+            foreach (var i in toRemove) il.Remove(i);
+
+            void Emit(IEnumerable<Instruction> group) { foreach (var i in group) il.Append(i); }
+
+            il.Append(Instruction.Create(OpCodes.Ldarg_1)); // `e` is always parameter index 1 on these two methods
+            il.Append(Instruction.Create(OpCodes.Callvirt, graphicsGetterRef));
+            Emit(pushText);
+            Emit(pushFont);
+            Emit(pushColor);
+            il.Append(Instruction.Create(OpCodes.Newobj, solidBrushCtorRef));
+            Emit(pushRectF);
+            il.Append(Instruction.Create(OpCodes.Ldc_I4, formatFlags));
+            il.Append(Instruction.Create(OpCodes.Newobj, stringFormatCtorRef));
+            il.Append(Instruction.Create(OpCodes.Dup));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4, stringTrimmingEllipsisCharacter));
+            il.Append(Instruction.Create(OpCodes.Callvirt, setTrimmingRef));
+            il.Append(Instruction.Create(OpCodes.Callvirt, drawStringRef));
+            il.Append(Instruction.Create(OpCodes.Ret));
+        }
+
+        try
+        {
+            // Title's RectangleF is built from the ALREADY-tightly-measured `bounds` local's own
+            // X/Y/Width (unchanged -- the horizontal ellipsis-clip position this project's own
+            // padding/centering fixes already tuned), but with a widened, generous Height instead
+            // of the tightly-fit `size.Height` the local actually holds. First deploy attempt used
+            // the local's real (single-line-tight) height via a straight Rectangle->RectangleF
+            // conversion and the title rendered with NO ellipsis at all -- just an abrupt mid-word
+            // cutoff -- confirmed live via screenshot. Root cause theory: GDI+'s EllipsisCharacter
+            // trimming logic needs vertical headroom to evaluate independently of the WIDTH-based
+            // trim decision it's actually meant to make; a rect exactly one line tall apparently
+            // isn't enough for it to even attempt the trim. DrawString's default LineAlignment
+            // (Near, i.e. top-aligned within the rect) means adding height below the already-
+            // correct Y doesn't move the rendered line at all, so this is safe.
+            ReplaceDrawCall(onPaintTitleMethod, "OnPaintTitle",
+                pushText: new List<Instruction> {
+                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldfld, titleField),
+                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldfld, headerFontField),
+                    Instruction.Create(OpCodes.Ldloca, titleBoundsLocal), Instruction.Create(OpCodes.Call, rectGetWidthRef),
+                    Instruction.Create(OpCodes.Call, truncateHelperRef)
+                },
+                pushFont: new List<Instruction> { Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldfld, headerFontField) },
+                pushColor: new List<Instruction> {
+                    Instruction.Create(OpCodes.Call, themeGetInstanceRef),
+                    Instruction.Create(OpCodes.Ldarg_0),
+                    Instruction.Create(OpCodes.Callvirt, getActiveThemeRef),
+                    Instruction.Create(OpCodes.Callvirt, headerForegroundGetterRef)
+                },
+                pushRectF: new List<Instruction> {
+                    // -8: DrawString renders title text ~8px further right than TextRenderer did
+                    // for the same nominal X -- confirmed by precise pixel measurement the same
+                    // way as the Y-offset below (avatar-diameter-normalized scale, first-non-
+                    // background-pixel detection on the same "J" glyph in both captures): title
+                    // text left edge sat 149px right of the avatar's own left edge in the new
+                    // DrawString capture vs 124px in the old TextRenderer reference, a
+                    // 25px-at-3x-scale = ~8px-native difference. Same root cause as the Y offset:
+                    // GDI+ includes its own left-side glyph bearing that GDI's TextRenderer
+                    // compensates for internally by default; DrawString does not.
+                    Instruction.Create(OpCodes.Ldloca, titleBoundsLocal), Instruction.Create(OpCodes.Call, rectGetXRef),
+                    Instruction.Create(OpCodes.Ldc_I4, 8), Instruction.Create(OpCodes.Sub), Instruction.Create(OpCodes.Conv_R4),
+                    // -9: DrawString renders ~9px lower than TextRenderer.DrawText did for the
+                    // same nominal Y, confirmed by precise pixel measurement against the
+                    // known-good TextRenderer screenshot (supporting/notification-dark-theme-
+                    // normal-text-comparison.png) -- avatar-circle diameter matched exactly
+                    // (87px at 3x scale in both, confirming identical capture scale), title text
+                    // top sat at +5.5px from avatar-center in the new DrawString capture vs
+                    // -21.5px in the old TextRenderer one, a 27px-at-3x-scale = 9px-native
+                    // difference. Root cause: GDI+'s DrawString positions a full font line-height
+                    // box (including its own internal leading above the glyph) starting at the
+                    // given Y, while GDI's TextRenderer computes Y from TextRenderer.MeasureText's
+                    // own (leading-excluded) metrics -- the same `rectangle.Y` value means two
+                    // different things to the two APIs. `rectangle.Y` itself (the vertical-
+                    // centering computation upstream) is untouched; only the value actually
+                    // passed to DrawString is corrected.
+                    Instruction.Create(OpCodes.Ldloca, titleBoundsLocal), Instruction.Create(OpCodes.Call, rectGetYRef),
+                    Instruction.Create(OpCodes.Ldc_I4, 9), Instruction.Create(OpCodes.Sub), Instruction.Create(OpCodes.Conv_R4),
+                    Instruction.Create(OpCodes.Ldloca, titleBoundsLocal), Instruction.Create(OpCodes.Call, rectGetWidthRef), Instruction.Create(OpCodes.Conv_R4),
+                    Instruction.Create(OpCodes.Ldc_R4, titleRectExtraHeight),
+                    Instruction.Create(OpCodes.Newobj, rectangleFCtor4Ref)
+                },
+                formatFlags: stringFormatFlagsNoWrap);
+
+            // Content keeps the plain conversion (its rect's height is meant to constrain wrapping,
+            // unlike title's) but adds LineLimit -- without it, the first live test showed content
+            // word-wrapping to a 3rd line and overflowing past the notification's intended bounds
+            // instead of stopping at 2 lines with an ellipsis, confirmed via screenshot (GDI+'s own
+            // line-wrap metrics differ slightly from GDI's, so a wrap point TextRenderer.MeasureText
+            // didn't anticipate became reachable). LineLimit disallows a partially-visible final
+            // line, restoring the intended "whole lines only, trimmed to fit the given height" shape.
+            ReplaceDrawCall(onPaintContentMethod, "OnPaintContent",
+                pushText: new List<Instruction> { Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldfld, contentField) },
+                pushFont: new List<Instruction> { Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Callvirt, controlGetFontRef) },
+                pushColor: new List<Instruction> { Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Callvirt, controlGetForeColorRef) },
+                // Built from contentRect's own parts (not a plain op_Implicit conversion) so the
+                // X can be corrected the same way as title's -- measured the same way: content's
+                // first line ("Re: ...") left edge sat 28px right of the avatar's own left edge
+                // in the new DrawString capture vs -20px in the old TextRenderer reference (i.e.
+                // to the LEFT of the avatar's own edge, since content is indented less than the
+                // avatar sits from the notification's own left border), a 48px-at-3x-scale =
+                // 16px-native difference -- about double title's shift, plausibly because
+                // content's font is a different size (side-bearing scales with font size) rather
+                // than a shared fixed DrawString quirk. Same GDI+-left-bearing-vs-GDI root cause.
+                pushRectF: new List<Instruction> {
+                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldflda, contentRectField), Instruction.Create(OpCodes.Call, rectGetXRef),
+                    Instruction.Create(OpCodes.Ldc_I4, 16), Instruction.Create(OpCodes.Sub), Instruction.Create(OpCodes.Conv_R4),
+                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldflda, contentRectField), Instruction.Create(OpCodes.Call, rectGetYRef), Instruction.Create(OpCodes.Conv_R4),
+                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldflda, contentRectField), Instruction.Create(OpCodes.Call, rectGetWidthRef), Instruction.Create(OpCodes.Conv_R4),
+                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldflda, contentRectField), Instruction.Create(OpCodes.Call, rectGetHeightRef), Instruction.Create(OpCodes.Conv_R4),
+                    Instruction.Create(OpCodes.Newobj, rectangleFCtor4Ref)
+                },
+                formatFlags: stringFormatFlagsLineLimit);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Console.Error.WriteLine("FAIL: " + ex.Message);
+            return 1;
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnPaintTitle/OnPaintContent -- now draw via Graphics.DrawString instead of TextRenderer/TextRendererEx.DrawText, sidestepping a Wine gap in GDI's transparent-background text rendering onto an offscreen bitmap");
         patched = true;
 
         module.Write(destPath);
