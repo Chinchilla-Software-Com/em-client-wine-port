@@ -43,6 +43,11 @@ if (args.Length > 0 && args[0] == "--patch-test-monogram-avatar")
     return RunPatchTestMonogramAvatar(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-title-singleline")
+{
+    return RunPatchNotificationTitleSingleLine(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-settings-refresh")
 {
     return RunPatchSettingsRefresh(args);
@@ -2066,6 +2071,109 @@ static int RunPatchTestMonogramAvatar(string[] args)
         }
 
         Console.WriteLine($"OK   {fileName}: added FormGenericNotification::__showTestMonogramNotification and {mainFormType}::OnShown -- fires a one-shot {delayMs}ms timer showing a test FormMailNotification with a UIAvatar.FromMonogram(\"JW\", \"Jaguar Workshop\") avatar, matching supporting/email-with-no-image.png");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-title-singleline <input-dir> <output-dir>
+//
+// The user directly caught this looking wrong live (monogram-avatar test screenshot: title
+// visibly hugging the TOP of the header band with a large empty gap below it, not centered) after
+// an earlier, too-hasty pixel measurement on a different, shorter test wrongly concluded this was
+// "close enough" post-font-fix. It is not -- it's a real, separate bug, independent of the
+// headerFont-null fix.
+//
+// `OnPaintTitle` calls `TextRendererEx.DrawText(..., TextFormatFlags.EndEllipsis |
+// TextFormatFlags.NoPrefix | TextFormatFlags.VerticalCenter)` -- flags value `34820` (0x8804),
+// confirmed via the raw IL (`ldc.i4 34820` immediately before the `TextRendererEx::DrawText`
+// call). `TextFormatFlags.VerticalCenter` is documented (MSDN) to have NO EFFECT unless
+// `TextFormatFlags.SingleLine` is also specified -- which it is not here. This is a real gap in
+// the app's own flags (plausibly harmless on real Windows if its GDI32 is more lenient about this
+// undocumented-behavior case, or simply not something anyone noticed since real Windows renders
+// notifications reliably enough that a few pixels of vertical misplacement isn't paired with the
+// far more obvious "whole box is blank" bug this project spent most of its effort on).
+//
+// Fix: flip the single constant from `34820` (0x8804) to `34852` (0x8824) -- adding
+// `TextFormatFlags.SingleLine` (0x20) via a plain OR, changing nothing else. A title/sender name
+// is exactly the kind of text `SingleLine` is meant for (already never wraps -- `EndEllipsis`
+// alone already truncates a too-long name to one line with "..."; `SingleLine` just makes
+// `VerticalCenter` actually take effect, per the documented API contract). Simplest possible
+// patch shape: a single Ldc_I4 operand rewrite, no insertion, no branch/handler concerns at all --
+// the same low-risk category as the very first patch in this whole project (the
+// InterpolationMode fix).
+static int RunPatchNotificationTitleSingleLine(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-title-singleline <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+    const int oldFlags = 34820; // EndEllipsis | NoPrefix | VerticalCenter
+    const int newFlags = 34852; // + SingleLine (0x20) -- required for VerticalCenter to take effect
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var onPaintTitleMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaintTitle" && m.HasBody);
+        if (onPaintTitleMethod is null) { Console.Error.WriteLine("FAIL: OnPaintTitle(PaintEventArgs) not found"); return 1; }
+
+        var instrs = onPaintTitleMethod.Body.Instructions;
+        int matchCount = 0;
+        Instruction? match = null;
+        for (int i = 0; i < instrs.Count - 1; i++)
+        {
+            if (instrs[i].OpCode == OpCodes.Ldc_I4 && instrs[i].Operand is int v && v == oldFlags &&
+                (instrs[i + 1].OpCode == OpCodes.Call || instrs[i + 1].OpCode == OpCodes.Callvirt) &&
+                instrs[i + 1].Operand is MethodReference mr && mr.Name == "DrawText")
+            {
+                match = instrs[i];
+                matchCount++;
+            }
+        }
+        if (matchCount != 1) { Console.Error.WriteLine($"FAIL: expected exactly 1 `ldc.i4 {oldFlags}` immediately before a DrawText call in OnPaintTitle, found {matchCount} -- method shape changed, review needed"); return 1; }
+
+        match!.Operand = newFlags;
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnPaintTitle -- TextFormatFlags {oldFlags} (0x{oldFlags:X}) -> {newFlags} (0x{newFlags:X}), adding SingleLine so VerticalCenter actually takes effect (MSDN: VerticalCenter is ignored without SingleLine)");
         patched = true;
 
         module.Write(destPath);
