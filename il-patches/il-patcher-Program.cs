@@ -3358,24 +3358,27 @@ static int RunPatchNotificationTextDrawString(string[] args)
                 pushText: new List<Instruction> { Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldfld, contentField) },
                 pushFont: new List<Instruction> { Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Callvirt, controlGetFontRef) },
                 pushColor: new List<Instruction> { Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Callvirt, controlGetForeColorRef) },
-                // NO X correction for content -- a "-16" correction was applied here in an earlier
-                // draft based on a flawed measurement (the automated pixel-scan caught a stray
-                // background pixel bleeding in from UI behind the notification crop, not the real
-                // "R" glyph, in the reference image it was compared against). Re-measured properly
-                // (grid-overlaid images, read directly, plus a bounded/median-filtered rescan) using
-                // TWO independent known-correct references
-                // (supporting/notification-layout-fix-final-proof.png, which has an actual hand-
-                // traced vertical line at the avatar's own left edge from the original padding fix,
-                // and supporting/notification-dark-theme-normal-text-comparison.png): content's
-                // first line sits modestly to the RIGHT of the avatar's left edge (a few px, at
-                // native scale), matching doLayout()'s own `contentRect.X = scaledPadding.Left + 9`
-                // formula (avatar/imageRect.X is `scaledPadding.Left`, no +9) almost exactly -- i.e.
-                // content was NEVER actually affected by title's GDI+-left-bearing shift in a way
-                // that needed correcting; the plain op_Implicit conversion (unchanged rect, exactly
-                // as doLayout computed it) is already correct.
+                // -7: content DOES need a left-bearing correction after all -- confirmed via a
+                // clean, controlled, SAME-SESSION A/B comparison (not a cross-session/cross-scale
+                // reference, which is what produced two earlier wrong conclusions in a row here).
+                // Deployed the UN-migrated `output-theme` build (still TextRenderer.DrawText,
+                // never touched by this patch) in the exact same live environment, confirmed via
+                // the existing --patch-notification-geometry-diag logging that its `contentRect`/
+                // `imageRect` values are IDENTICAL to the DrawString build's (image.X=8,
+                // content.X=17, both builds -- doLayout() itself was never touched by this whole
+                // migration). With that confirmed-identical rect input: the OLD TextRenderer
+                // mechanism renders content's first ink at native x=22 (avatar edge x=19, offset
+                // +3); the NEW DrawString mechanism (no correction) renders it at x=29-30 (offset
+                // +10). Same rect, different visual result -- conclusively isolating the ~7px gap
+                // to the rendering API switch, exactly the same class of bug as title's, which an
+                // earlier flawed cross-session-image comparison wrongly ruled out for content.
                 pushRectF: new List<Instruction> {
-                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldfld, contentRectField),
-                    Instruction.Create(OpCodes.Call, rectToRectFOpRef)
+                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldflda, contentRectField), Instruction.Create(OpCodes.Call, rectGetXRef),
+                    Instruction.Create(OpCodes.Ldc_I4, 7), Instruction.Create(OpCodes.Sub), Instruction.Create(OpCodes.Conv_R4),
+                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldflda, contentRectField), Instruction.Create(OpCodes.Call, rectGetYRef), Instruction.Create(OpCodes.Conv_R4),
+                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldflda, contentRectField), Instruction.Create(OpCodes.Call, rectGetWidthRef), Instruction.Create(OpCodes.Conv_R4),
+                    Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldflda, contentRectField), Instruction.Create(OpCodes.Call, rectGetHeightRef), Instruction.Create(OpCodes.Conv_R4),
+                    Instruction.Create(OpCodes.Newobj, rectangleFCtor4Ref)
                 },
                 formatFlags: stringFormatFlagsLineLimit);
         }

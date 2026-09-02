@@ -2364,3 +2364,64 @@ during a supposedly independent re-check. Prefer a second, genuinely different m
 technique (here: reading a gridded overlay directly, and consulting a DIFFERENT pre-existing
 reference image with its own hand-verified trace line) over re-running the same script again as
 "confirmation."
+
+## Thirty-first round: the thirtieth round's "content needs no correction" conclusion was ALSO
+wrong -- fixed for real this time via a same-session, same-DPI controlled A/B comparison, the
+only technique in this whole saga that actually held up
+
+After the thirtieth round shipped "no X correction for content," the user looked at fresh trace-
+line screenshots and pushed back again: content still looked too far right of the avatar compared
+to the ACTUAL historical proof image, not just "the right direction" as the thirtieth round had
+declared. Right again -- the thirtieth round's fix was itself incomplete.
+
+**Root cause of getting it wrong twice in a row: every comparison so far was cross-session and/or
+cross-scale.** The twenty-ninth round's "-16" came from misreading a stray pixel in one screenshot.
+The thirtieth round's "0 correction" came from reading TWO different historical screenshots
+(including one with real but ambiguous hand-drawn annotation lines whose exact meaning wasn't
+re-derivable with confidence) and cross-scaling them against a fresh capture via avatar-diameter
+ratio -- a method vulnerable to any DPI or capture-pipeline difference between sessions, which
+this project has no way to rule out for screenshots taken hours or days apart.
+
+**What finally worked, and should be the FIRST resort for any future rendering-regression
+question like this, not a last resort:** deploy the OLD, un-migrated build
+(`il-patches/output-theme/`, still using `TextRenderer.DrawText`, completely untouched by the
+DrawString migration) in the SAME live session, same DPI, same display, immediately after
+measuring the new build. Confirmed via the existing `--patch-notification-geometry-diag` logging
+that both builds compute the IDENTICAL `contentRect`/`imageRect` values (`image.X=8, content.X=17`
+-- `doLayout()` itself was never touched by any part of this migration) -- so any visual
+difference between the two builds' screenshots is caused ONLY by the rendering API switch, with
+zero cross-session scale ambiguity, because both screenshots come from the same session at the
+same resolution. Measured on RAW, uncropped-and-unscaled native-resolution PNG crops (no 3x
+LANCZOS upscaling in the measurement path this time, only for the final display images) via a
+transparent, printed-out pixel-by-pixel scan (shown to the user, not just a script's summary
+number): old (TextRenderer) mechanism renders content's first ink at native x=22 with the avatar's
+edge at x=19 (offset **+3**); new (DrawString, no correction) mechanism renders it at x=29-30
+(offset **+10**) -- a real, ~7px rightward shift from the engine switch alone, the exact same
+class of bug already fixed for title, wrongly ruled out for content twice in a row by less rigorous
+comparisons.
+
+Fixed with a `-7` correction to content's X (mirroring title's own `-8`/`-9` X/Y corrections,
+same pattern: built via `RectangleF`'s 4-float constructor from `contentRect`'s own X/Y/Width/
+Height, only X adjusted). Re-measured with the identical same-session method after deploying:
+native content ink now at x=23 (avatar edge x=19, offset **+4**), within 1px of the old
+mechanism's +3 -- as close a match as this measurement technique's own precision allows. Confirmed
+in both Light and Dark theme. While re-deriving content's number this way, also cross-checked
+title's existing `-8`/`-9` corrections against the SAME old-mechanism build for the first time
+(they had only ever been checked against the cross-session images before, same flawed category of
+evidence as content's wrong fixes) -- title's numbers held up (native offset +42 old vs ~+42
+current for X; Y within ~1.5-2px, plausibly just measurement-threshold noise rather than a real
+residual error) -- title was not touched further this round.
+
+`il-patches/output-drawstring7/` is the current fully-verified, deployed checkpoint, superseding
+`output-drawstring6/`. `supporting/notification-drawstring-fix-{light,dark}-theme.png` and
+`supporting/notification-content-alignment-traced-proof.png` were re-captured a further time (now
+built from native-resolution crops with an 8x nearest-neighbor zoom for the traced proof
+specifically, so individual source pixels are directly countable rather than LANCZOS-smoothed)
+to reflect this actually-final state.
+
+**The standing lesson, updated again:** for this specific class of "did switching rendering
+mechanism X for Y shift something by N pixels" question, a same-session A/B deploy of the
+pre-change build is strictly better evidence than any cross-session screenshot comparison,
+regardless of how carefully the cross-session comparison tries to normalize for scale -- prefer it
+from the start next time, rather than reaching for it only after two cross-session-based fixes
+already turned out wrong.

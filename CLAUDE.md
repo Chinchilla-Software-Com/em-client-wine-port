@@ -449,20 +449,24 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   renders pixels and was never implicated in the boldness bug); title rendering ~9px too low and
   ~8px too far right, a genuine GDI-vs-GDI+ font-metrics discrepancy (internal leading and
   left-side glyph bearing), fixed with empirically-measured pixel corrections applied only to the
-  value passed to `DrawString`, leaving the upstream rectangle computations untouched. **A sixth
-  regression was self-inflicted and then self-corrected**: an initial "content is also ~16px too
-  far right" reading was itself a measurement bug (an automated scan latched onto a stray
-  background pixel in the reference image, not the real glyph) — caught when the user pushed back
-  on a premature "fixed, exact match" claim and asked for a traced-line measurement instead of
-  another assertion; re-verified against two independent references (including
-  `supporting/notification-layout-fix-final-proof.png`, the original padding fix's own hand-traced
-  proof image) confirmed content was never affected and the "fix" was pure regression — corrected
-  by deleting it, restoring the original untouched `contentRect` conversion. Final state confirmed
-  via a freshly-traced verification line drawn at the avatar's own measured edge on new
-  screenshots (not reused crops) in both themes:
+  value passed to `DrawString`, leaving the upstream rectangle computations untouched. **Content's
+  own X position took three attempts to get right** — first a "-16" correction from a measurement
+  bug (an automated scan latched onto a stray background pixel, not the real glyph), then an
+  overcorrection to "no adjustment needed" from comparing cross-session/cross-scale screenshots
+  (ambiguous, DPI-sensitive), both caught by the user pushing back and asking for a properly traced
+  measurement rather than accepting an assertion. **What actually resolved it**: a same-session,
+  same-DPI A/B deploy — the old, un-migrated `TextRenderer`-based build next to the new
+  `DrawString` one, both confirmed via `--patch-notification-geometry-diag` to compute identical
+  `contentRect`/`imageRect` values, isolating the entire visual difference to the rendering API
+  switch with no cross-session ambiguity at all. That comparison showed a genuine ~7px rightward
+  shift, fixed with a `-7` correction (mirroring title's own `-8`/`-9`). This same-session-A/B
+  technique is the one that should be reached for FIRST for any future "did switching rendering
+  mechanism X shift something by N pixels" question — not after two less rigorous comparisons have
+  already gone wrong. Final state confirmed via freshly-traced, native-resolution (no LANCZOS
+  smoothing) verification lines in both themes:
   `supporting/notification-drawstring-fix-{light,dark}-theme.png`,
   `supporting/notification-content-alignment-traced-proof.png`. Full history:
-  `reports/notification-empty-until-fade-findings.md`'s twenty-eighth through thirtieth rounds.
+  `reports/notification-empty-until-fade-findings.md`'s twenty-eighth through thirty-first rounds.
 
 **Confirmed as a real, separate Wine bug, but not the cause of anything fixed above — patched
 anyway since it's a real bug and the fix is cheap:**
