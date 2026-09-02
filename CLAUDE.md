@@ -565,6 +565,46 @@ session, all worth guarding against explicitly next time:
    find the member on that already-correctly-versioned `TypeDefinition`), the same technique
    already used elsewhere in this file for `System.Windows.Forms.Control` (walk the base-type
    chain rather than reflect on `typeof(Control)`).
+6. **A struct property setter call needs its target (`this`, via `Ldloca`/`Ldloca_S` on the local)
+   pushed *before* the new value, not after.** `bounds.Height = measured.Height;` compiled by hand
+   as `Ldloca_S sizeLocal; Call get_Height(); Call set_Height(int)` — missing the
+   `Ldloca_S boundsLocal` that should have come first to push `&bounds` as the implicit `this` for
+   the instance `set_Height` call. Easy to miss because the *previous* statement in the same
+   sequence (`bounds.Y = ...`) got this right (an explicit `Ldloca_S boundsLocal` was already on
+   the stack from a `Dup`), making the omission on the very next statement look consistent at a
+   glance. Caught by working through each new sequence's stack effect by hand, instruction by
+   instruction, rather than trusting that a pattern used correctly once nearby was necessarily
+   copied correctly the second time (`--patch-notification-title-vcenter-fix`'s first draft).
+7. **Never hold a instruction's list *position* as a bare `int` index across any insertion or
+   removal on that same list — capture the `Instruction` object itself instead.** A method's flags
+   constant was found once (as an index into `body.Instructions`) *before* ~20 new instructions
+   were inserted earlier in the same method, then edited via `instrs[thatIndex].Operand = ...`
+   *after* the insertion. The insertion shifted every later instruction to a higher index without
+   updating the stale saved index, so the edit landed on one of the *newly inserted* instructions
+   instead of the intended one — silently overwriting a `VariableDefinition`-typed `Ldloca_S`
+   operand with an `int`. This didn't surface as a decompile error (the corruption only existed in
+   the mutated `Instruction` list, and decompiling from a fresh read of the already-written file
+   would have looked fine had the write not thrown first) — it crashed as an
+   `InvalidCastException: Unable to cast object of type 'System.Int32' to type
+   'Mono.Cecil.Cil.VariableDefinition'` deep inside `Mono.Cecil.Cil.CodeWriter.WriteOperand`, only
+   at `module.Write()` time, with a stack trace pointing at Cecil's own internals rather than
+   anything resembling the actual mistake. Fix: assign `Instruction? target = instrs[i];` inside
+   the search loop (not `int targetIndex = i;`) whenever the found instruction will be mutated
+   later in the same function, especially after any insertion happens in between — object
+   references stay valid across list mutation, indices don't.
+
+**A new `--dump-il <dll> <type> <method>` utility mode** (same rationale as `--dump-handlers`)
+prints a method's real instruction stream with offsets — use it before writing any patch that
+edits an *existing* numeric constant or inserts around a specific expression, rather than guessing
+at IL shape from decompiled C#. Decompiled C# doesn't distinguish compact-form opcodes (`ldc.i4.5`,
+`ldc.i4.8`, `ldarg.1`, whose operand is implicit in the opcode and can't be edited in place — the
+instruction must be replaced outright) from general-form ones (`ldc.i4 <n>`, whose operand can be
+reassigned directly) — both decompile identically. Two of this round's patches
+(`--patch-notification-content-padding`, `--patch-notification-avatar-title-gap`) needed exactly
+this distinction, and a third (`--patch-notification-title-vcenter-fix`) needed it to notice that
+`body.SimplifyMacros()` (needed anyway, for the insertion) converts a pattern being searched for
+elsewhere in the same method to its general form too, breaking a compact-opcode-based search that
+worked before `SimplifyMacros()` was added.
 
 **Always re-decompile and read the result before deploying** anything beyond a simple operand
 rewrite — `ilspycmd -m "<doc-id>" <dll>` or `ilspycmd -t "<type>" <dll>` on the patched output.

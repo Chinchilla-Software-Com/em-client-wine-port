@@ -68,6 +68,26 @@ if (args.Length > 0 && args[0] == "--dump-handlers")
     return RunDumpHandlers(args);
 }
 
+if (args.Length > 0 && args[0] == "--dump-il")
+{
+    return RunDumpIL(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-notification-content-padding")
+{
+    return RunPatchNotificationContentPadding(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-notification-avatar-title-gap")
+{
+    return RunPatchNotificationAvatarTitleGap(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-notification-title-vcenter-fix")
+{
+    return RunPatchNotificationTitleVCenterFix(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-license-icon")
 {
     return RunPatchLicenseIcon(args);
@@ -263,6 +283,478 @@ static int RunDumpHandlers(string[] args)
     }
     Console.WriteLine(ok ? "OK: nesting order looks correct." : "FAIL: nesting order violation(s) found above.");
     return ok ? 0 : 1;
+}
+
+// --patch-notification-content-padding <input-dir> <output-dir>
+//
+// User directly measured this against the real-Windows reference screenshot (pixel-precise, not
+// eyeballed) once a genuinely opaque capture was possible (after the empty-box-until-fade fix was
+// restored -- see reports/notification-empty-until-fade-findings.md's twenty-first/twenty-second
+// rounds): content text sits flush with the avatar's own left edge and right at the header/content
+// boundary with no top breathing room, where the reference has a small (~4px, ~13% of the avatar's
+// own diameter) left inset past the avatar and a visible top gap. `doLayout()`'s own IL (dumped via
+// --dump-il, not guessed from decompiled C#) computes `contentRect` as:
+//   new Rectangle(scaledPadding.Left, num + 5, base.Width - scaledPadding.Horizontal, base.Height - num - 10)
+// where `num` is the scaled header height. Fix: add 4 to X (and subtract 4 from Width, to keep the
+// right edge where it was) for the left inset, and change the Y offset from `+5` to `+11` (and the
+// Height's trailing `-10` to `-16`, to keep the bottom edge where it was) for the top padding --
+// four small, independently-verified edits within the same Rectangle-construction instruction
+// range (bounded by the unique `getScaledPadding()` call and the `stfld contentRect` that follows
+// it), not a wholesale rewrite of the expression.
+static int RunPatchNotificationContentPadding(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-content-padding <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var doLayoutMethod = type.Methods.FirstOrDefault(m => m.Name == "doLayout" && m.HasBody);
+        if (doLayoutMethod is null) { Console.Error.WriteLine("FAIL: doLayout not found"); return 1; }
+
+        var body = doLayoutMethod.Body;
+        // Normalize compact-form opcodes (ldc.i4.5, ldc.i4.s 10) to general ldc.i4 <n> up front --
+        // both the value-based scan below and IL-patching lesson 4 (this patch inserts new
+        // instructions too) need this regardless.
+        body.SimplifyMacros();
+        var il = body.GetILProcessor();
+        var instrs = body.Instructions;
+
+        int paddingCallIdx = -1, contentStfldIdx = -1;
+        for (int i = 0; i < instrs.Count; i++)
+        {
+            if (paddingCallIdx < 0 && instrs[i].OpCode == OpCodes.Call && instrs[i].Operand is MethodReference mr0 && mr0.Name == "getScaledPadding")
+            {
+                paddingCallIdx = i;
+            }
+            if (instrs[i].OpCode == OpCodes.Stfld && instrs[i].Operand is FieldReference fr0 && fr0.Name == "contentRect")
+            {
+                contentStfldIdx = i;
+                break;
+            }
+        }
+        if (paddingCallIdx < 0 || contentStfldIdx < 0 || contentStfldIdx <= paddingCallIdx)
+        {
+            Console.Error.WriteLine("FAIL: couldn't bound the contentRect construction (getScaledPadding()...stfld contentRect) -- method shape changed, review needed");
+            return 1;
+        }
+
+        // Within [paddingCallIdx, contentStfldIdx), find the four unique sites.
+        Instruction? xSite = null, ySite = null, widthSubSite = null, heightSite = null;
+        int xCount = 0, yCount = 0, widthCount = 0, heightCount = 0;
+        for (int i = paddingCallIdx; i < contentStfldIdx; i++)
+        {
+            var instr = instrs[i];
+            if (instr.OpCode == OpCodes.Call && instr.Operand is MethodReference mrX && mrX.Name == "get_Left" && mrX.DeclaringType.Name == "Padding")
+            {
+                xSite = instr; xCount++;
+            }
+            else if (instr.OpCode == OpCodes.Ldc_I4 && instr.Operand is int v5 && v5 == 5)
+            {
+                ySite = instr; yCount++;
+            }
+            else if (instr.OpCode == OpCodes.Call && instr.Operand is MethodReference mrH && mrH.Name == "get_Horizontal" && mrH.DeclaringType.Name == "Padding"
+                     && i + 1 < contentStfldIdx && instrs[i + 1].OpCode == OpCodes.Sub)
+            {
+                widthSubSite = instrs[i + 1]; widthCount++;
+            }
+            else if (instr.OpCode == OpCodes.Ldc_I4 && instr.Operand is int v10 && v10 == 10)
+            {
+                heightSite = instr; heightCount++;
+            }
+        }
+        if (xCount != 1 || yCount != 1 || widthCount != 1 || heightCount != 1)
+        {
+            Console.Error.WriteLine($"FAIL: expected exactly 1 of each site within contentRect's construction, found X={xCount} Y={yCount} Width={widthCount} Height={heightCount} -- method shape changed, review needed");
+            return 1;
+        }
+
+        // Y offset +5 -> +11 (6px more top padding), Height's trailing -10 -> -16 (keep bottom edge).
+        ySite!.Operand = 11;
+        heightSite!.Operand = 16;
+
+        // X: insert `+ 4` right after get_Left(); Width: insert `- 4` right after the existing sub,
+        // to keep the right edge where it was. Neither insertion point is a branch target or
+        // handler boundary (contentRect's construction is straight-line code within doLayout, per
+        // the raw --dump-il read this patch was designed against).
+        il.InsertAfter(xSite!, Instruction.Create(OpCodes.Add));
+        il.InsertAfter(xSite!, Instruction.Create(OpCodes.Ldc_I4, 4));
+        il.InsertAfter(widthSubSite!, Instruction.Create(OpCodes.Sub));
+        il.InsertAfter(widthSubSite!, Instruction.Create(OpCodes.Ldc_I4, 4));
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::doLayout -- contentRect.X += 4 (left inset past the avatar's own edge, matching the real-Windows reference), contentRect.Y offset +5 -> +11 (top padding), Width/Height trimmed to match so the right/bottom edges don't move");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-avatar-title-gap <input-dir> <output-dir>
+//
+// Same measurement round as --patch-notification-content-padding (see its own comment): the gap
+// between the avatar and the sender-name title is visibly tighter than the real-Windows reference.
+// `OnPaintTitle`'s IL (dumped via --dump-il) shows the gap as a single compact-form `ldc.i4.8`
+// instruction feeding `ScaleUtils.Scale(this, 8)`, added to both `bounds.X` (past the avatar) and
+// subtracted from `bounds.Width` -- unlike a general-form `ldc.i4 <n>`, `ldc.i4.8`'s operand is
+// implicit in the opcode itself and can't be edited in place; replace the instruction outright with
+// a new `ldc.i4 14` (6px more gap, matching the content-padding fix's own magnitude).
+static int RunPatchNotificationAvatarTitleGap(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-avatar-title-gap <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var onPaintTitleMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaintTitle" && m.HasBody);
+        if (onPaintTitleMethod is null) { Console.Error.WriteLine("FAIL: OnPaintTitle(PaintEventArgs) not found"); return 1; }
+
+        var il = onPaintTitleMethod.Body.GetILProcessor();
+        var instrs = onPaintTitleMethod.Body.Instructions;
+
+        int matchCount = 0;
+        Instruction? match = null;
+        for (int i = 0; i < instrs.Count - 1; i++)
+        {
+            if (instrs[i].OpCode == OpCodes.Ldc_I4_8 &&
+                instrs[i + 1].OpCode == OpCodes.Call && instrs[i + 1].Operand is MethodReference mr && mr.Name == "Scale")
+            {
+                match = instrs[i];
+                matchCount++;
+            }
+        }
+        if (matchCount != 1) { Console.Error.WriteLine($"FAIL: expected exactly 1 `ldc.i4.8` immediately before a Scale() call in OnPaintTitle, found {matchCount} -- method shape changed, review needed"); return 1; }
+
+        il.Replace(match!, Instruction.Create(OpCodes.Ldc_I4, 14));
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnPaintTitle -- avatar-to-title gap constant 8 -> 14 (6px more space, matching the real-Windows reference)");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-title-vcenter-fix <input-dir> <output-dir>
+//
+// Same measurement round as the two patches above. Unlike those, this one IS a genuine Wine gap,
+// not a design-constant tweak: `OnPaintTitle` already passes `TextFormatFlags.VerticalCenter |
+// TextFormatFlags.SingleLine` (added by --patch-notification-title-singleline, MSDN-required
+// together) to `TextRendererEx.DrawText`, which for non-emoji text (this title) is confirmed by
+// reading `TextRendererEx.DrawTextInternal`'s own decompiled source to fall through to plain
+// `System.Windows.Forms.TextRenderer.DrawText` -- so this bounces off the real native Win32
+// DrawTextEx, not a custom rendering path. Measured directly against the app's own logged
+// `headerRect` (--patch-notification-geometry-diag) on a genuinely opaque capture (only possible
+// after the empty-box-until-fade fix was restored): the title's rendered ink sits centered
+// ~9px above the header band's true vertical center, not straddling it -- Wine's DrawTextEx isn't
+// vertically centering this flag combination correctly.
+//
+// Fix: stop relying on VerticalCenter under Wine at all. Measure the title's actual rendered
+// height via `TextRenderer.MeasureText(title, headerFont, new Size(bounds.Width, int.MaxValue),
+// SingleLine | NoPrefix)` (the same native call, just asked what size it would need instead of
+// asking it to center), then explicitly set `bounds.Y`/`bounds.Height` so the measured text
+// exactly fills bounds -- top-alignment within a rect sized to match the text is mathematically
+// identical to true centering, without depending on DrawTextEx's own (here, wrong) centering math.
+// Drops VerticalCenter from the final flags constant (34852 -> 34848, i.e. 0x8824 &~ 0x0004) since
+// it's now a no-op by construction. All new types/methods (TextRenderer, Size, TextFormatFlags) are
+// resolved from references already present in this exact method body or module -- never via
+// typeof() reflection on the patching tool's own process (IL-patching lesson 5: TextRenderer lives
+// in System.Windows.Forms, a WinForms-shared-framework assembly MailClient.dll references at its
+// own version, not necessarily the patching tool's net10.0 one).
+static int RunPatchNotificationTitleVCenterFix(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-title-vcenter-fix <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+    const int oldFlags = 34852; // EndEllipsis | NoPrefix | SingleLine | VerticalCenter
+    const int newFlags = 34848; // - VerticalCenter (now redundant -- bounds is sized to fit exactly)
+    const int measureFlags = 2080; // SingleLine (0x20) | NoPrefix (0x800)
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var onPaintTitleMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaintTitle" && m.HasBody);
+        if (onPaintTitleMethod is null) { Console.Error.WriteLine("FAIL: OnPaintTitle(PaintEventArgs) not found"); return 1; }
+        var titleField = type.Fields.FirstOrDefault(f => f.Name == "title");
+        var headerFontField = type.Fields.FirstOrDefault(f => f.Name == "headerFont");
+        if (titleField is null || headerFontField is null) { Console.Error.WriteLine("FAIL: title/headerFont field(s) not found"); return 1; }
+
+        var body = onPaintTitleMethod.Body;
+        body.SimplifyMacros(); // widen this method's several .s short-form branches up front (lesson 4)
+        var il = body.GetILProcessor();
+        var instrs = body.Instructions;
+
+        // Find the final `ldc.i4 34852` immediately before the DrawText call (also gives us the
+        // TextRendererEx.DrawText MethodReference itself, and from its last parameter, an
+        // already-correctly-versioned TextFormatFlags TypeReference -- module.GetType() only finds
+        // types DEFINED in this module, not referenced ones, so this is what the file's other
+        // patches use instead of typeof() reflection).
+        // Captured as an Instruction OBJECT, not an index -- the Emit() insertions below happen
+        // earlier in the list and would shift any captured index out from under it (hit for real:
+        // the first version of this patch used an index here and ended up overwriting one of the
+        // newly-inserted instructions' Operand with the int 34848 instead, an Int32-into-
+        // VariableDefinition-slot corruption that only surfaced as a cast exception at write time).
+        Instruction? flagsInstr = null;
+        MethodReference? drawTextRef = null;
+        for (int i = 0; i < instrs.Count - 1; i++)
+        {
+            if (instrs[i].OpCode == OpCodes.Ldc_I4 && instrs[i].Operand is int v && v == oldFlags &&
+                instrs[i + 1].OpCode == OpCodes.Call && instrs[i + 1].Operand is MethodReference mr && mr.Name == "DrawText")
+            {
+                flagsInstr = instrs[i];
+                drawTextRef = mr;
+            }
+        }
+        if (flagsInstr is null || drawTextRef is null) { Console.Error.WriteLine($"FAIL: expected exactly 1 `ldc.i4 {oldFlags}` immediately before a DrawText call in OnPaintTitle -- method shape changed, review needed"); return 1; }
+        var textFormatFlagsTypeRef = drawTextRef.Parameters[drawTextRef.Parameters.Count - 1].ParameterType;
+
+        // Ldarg.1(e).callvirt get_Graphics() marks the start of the DrawText call's own argument
+        // list -- our new bounds.Y/Height computation must run before it. Also the target of the
+        // imageList-null-check branch (per IL-patching lesson 2), so any branch pointing at it must
+        // be retargeted to whatever we insert first.
+        Instruction? drawTextArgsStart = null;
+        int drawTextArgsStartCount = 0;
+        for (int i = 0; i < instrs.Count - 1; i++)
+        {
+            // SimplifyMacros() above already converted the original compact Ldarg_1 to the general
+            // Ldarg form (operand = the `e` ParameterDefinition, Index 0 since Index excludes the
+            // implicit `this`) -- match that, not the macro opcode which no longer appears.
+            if (instrs[i].OpCode == OpCodes.Ldarg && instrs[i].Operand is ParameterDefinition pd && pd.Index == 0 &&
+                instrs[i + 1].OpCode == OpCodes.Callvirt &&
+                instrs[i + 1].Operand is MethodReference mrG && mrG.Name == "get_Graphics")
+            {
+                drawTextArgsStart = instrs[i];
+                drawTextArgsStartCount++;
+            }
+        }
+        if (drawTextArgsStartCount != 1 || drawTextArgsStart is null) { Console.Error.WriteLine($"FAIL: expected exactly 1 Ldarg_1+get_Graphics() pair in OnPaintTitle, found {drawTextArgsStartCount} -- method shape changed, review needed"); return 1; }
+
+        // `bounds` is V_0 (a Rectangle local) -- confirmed via --dump-il: stloc.0 right after
+        // loading headerRect at the top of the method, reused (ldloca.s V_0) throughout.
+        var boundsLocal = body.Variables[0];
+        if (boundsLocal.VariableType.Name != "Rectangle") { Console.Error.WriteLine($"FAIL: expected V_0 to be Rectangle, got {boundsLocal.VariableType.Name} -- method shape changed, review needed"); return 1; }
+        var rectangleTypeDef = boundsLocal.VariableType.Resolve();
+        if (rectangleTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Rectangle from V_0's own VariableType"); return 1; }
+        var rectGetWidthRef = module.ImportReference(rectangleTypeDef.Methods.First(m => m.Name == "get_Width"));
+        var rectGetHeightRef = module.ImportReference(rectangleTypeDef.Methods.First(m => m.Name == "get_Height"));
+        var rectSetYRef = module.ImportReference(rectangleTypeDef.Methods.First(m => m.Name == "set_Y" && m.Parameters.Count == 1));
+        var rectSetHeightRef = module.ImportReference(rectangleTypeDef.Methods.First(m => m.Name == "set_Height" && m.Parameters.Count == 1));
+
+        // TextRenderer and Size aren't referenced by OnPaintTitle itself -- pull their
+        // already-correctly-versioned TypeReferences from the module's own reference table
+        // (GetTypeReferences(), a Mono.Cecil.Rocks extension already `using`d in this file) rather
+        // than typeof() reflection on the patching tool's own process (lesson 5).
+        var textRendererTypeRef = module.GetTypeReferences().FirstOrDefault(t => t.FullName == "System.Windows.Forms.TextRenderer");
+        var sizeTypeRef = module.GetTypeReferences().FirstOrDefault(t => t.FullName == "System.Drawing.Size");
+        if (textRendererTypeRef is null || sizeTypeRef is null) { Console.Error.WriteLine("FAIL: couldn't find System.Windows.Forms.TextRenderer/System.Drawing.Size in this module's own type references"); return 1; }
+        var sizeTypeDef = sizeTypeRef.Resolve();
+        if (sizeTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Drawing.Size"); return 1; }
+        var sizeCtorRef = module.ImportReference(sizeTypeDef.Methods.First(m => m.Name == ".ctor" && m.Parameters.Count == 2));
+        var sizeGetHeightRef = module.ImportReference(sizeTypeDef.Methods.First(m => m.Name == "get_Height"));
+
+        var measureTextRef = new MethodReference("MeasureText", module.ImportReference(sizeTypeRef), module.ImportReference(textRendererTypeRef)) { HasThis = false };
+        measureTextRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        measureTextRef.Parameters.Add(new ParameterDefinition(headerFontField.FieldType));
+        measureTextRef.Parameters.Add(new ParameterDefinition(module.ImportReference(sizeTypeRef)));
+        measureTextRef.Parameters.Add(new ParameterDefinition(module.ImportReference(textFormatFlagsTypeRef)));
+        var measureTextRefImported = module.ImportReference(measureTextRef);
+
+        var sizeLocal = new VariableDefinition(module.ImportReference(sizeTypeRef));
+        body.Variables.Add(sizeLocal);
+
+        var newFirst = Instruction.Create(OpCodes.Ldarg_0);
+        il.InsertBefore(drawTextArgsStart!, newFirst);
+        void Emit(params Instruction[] ins) { foreach (var i in ins) il.InsertBefore(drawTextArgsStart!, i); }
+
+        // Size measured = TextRenderer.MeasureText(title, headerFont, new Size(bounds.Width, int.MaxValue), measureFlags);
+        Emit(
+            Instruction.Create(OpCodes.Ldfld, titleField),
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldfld, headerFontField),
+            Instruction.Create(OpCodes.Ldloca_S, boundsLocal),
+            Instruction.Create(OpCodes.Call, rectGetWidthRef),
+            Instruction.Create(OpCodes.Ldc_I4, int.MaxValue),
+            Instruction.Create(OpCodes.Newobj, sizeCtorRef),
+            Instruction.Create(OpCodes.Ldc_I4, measureFlags),
+            Instruction.Create(OpCodes.Call, measureTextRefImported),
+            Instruction.Create(OpCodes.Stloc, sizeLocal),
+            // bounds.Y = (bounds.Height - measured.Height) / 2;
+            Instruction.Create(OpCodes.Ldloca_S, boundsLocal),
+            Instruction.Create(OpCodes.Dup),
+            Instruction.Create(OpCodes.Call, rectGetHeightRef),
+            Instruction.Create(OpCodes.Ldloca_S, sizeLocal),
+            Instruction.Create(OpCodes.Call, sizeGetHeightRef),
+            Instruction.Create(OpCodes.Sub),
+            Instruction.Create(OpCodes.Ldc_I4_2),
+            Instruction.Create(OpCodes.Div),
+            Instruction.Create(OpCodes.Call, rectSetYRef),
+            // bounds.Height = measured.Height;
+            Instruction.Create(OpCodes.Ldloca_S, boundsLocal),
+            Instruction.Create(OpCodes.Ldloca_S, sizeLocal),
+            Instruction.Create(OpCodes.Call, sizeGetHeightRef),
+            Instruction.Create(OpCodes.Call, rectSetHeightRef)
+        );
+
+        // Retarget the imageList-null-check branch (the only one pointing at the old first
+        // instruction of the DrawText-args sequence) to our new first inserted instruction.
+        int retargeted = 0;
+        foreach (var instr in instrs)
+        {
+            if (instr != newFirst && instr.Operand == drawTextArgsStart) { instr.Operand = newFirst; retargeted++; }
+        }
+
+        flagsInstr.Operand = newFlags;
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnPaintTitle -- explicitly measures and centers the title text instead of relying on Wine's DrawTextEx VerticalCenter (confirmed off by ~9px on this flag combination); {retargeted} branch(es) retargeted");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --dump-il <dll> <type> <method> -- generic raw-IL dumper, same rationale as --dump-handlers:
+// planning a constant/operand edit against decompiled C# is guesswork about what the compiler
+// actually emitted (a `new Rectangle(a, b + 5, c, d - 10)` call could tokenize its constants in any
+// order); dumping the real instruction stream removes that guesswork before writing a patch.
+static int RunDumpIL(string[] args)
+{
+    if (args.Length < 4)
+    {
+        Console.Error.WriteLine("usage: il-patcher --dump-il <dll> <type> <method>");
+        return 2;
+    }
+    string dllPath = args[1], typeName = args[2], methodName = args[3];
+    var resolver = new DefaultAssemblyResolver();
+    resolver.AddSearchDirectory(Path.GetDirectoryName(Path.GetFullPath(dllPath))!);
+    using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters { AssemblyResolver = resolver });
+    var type = module.GetType(typeName);
+    if (type is null) { Console.Error.WriteLine($"type not found: {typeName}"); return 1; }
+    var method = type.Methods.FirstOrDefault(m => m.Name == methodName && m.HasBody);
+    if (method is null) { Console.Error.WriteLine($"method not found: {typeName}::{methodName}"); return 1; }
+
+    foreach (var instr in method.Body.Instructions)
+    {
+        Console.WriteLine($"0x{instr.Offset:x4}  {instr.OpCode,-12} {instr.Operand}");
+    }
+    return 0;
 }
 
 static int RunScan(string[] args)
@@ -2052,6 +2544,47 @@ static int RunPatchTestMonogramAvatar(string[] args)
         tmIl.Append(Instruction.Create(OpCodes.Ret));
         var testMethodRef = module.ImportReference(testMethod);
 
+        // --- New public method on FormMailNotification itself (not FormGenericNotification --
+        // button_Reply/Flag/Delete are FormMailNotification's own private fields, only accessible
+        // from a method the CLR verifier considers part of that same type): shows the reply/flag/
+        // delete buttons directly, bypassing the real OnDisplayedNotificationChanged's requirement
+        // for a genuine IMail-backed CurrentMailItemNotification (which this synthetic test has no
+        // easy way to construct) -- purely for visual layout testing (does the new content padding
+        // collide with these controls?), matching this whole patch's own "exercise the rendering
+        // path directly, skip the parts that need real data" approach.
+        var buttonReplyField = notifType.Fields.FirstOrDefault(f => f.Name == "button_Reply");
+        var buttonFlagField = notifType.Fields.FirstOrDefault(f => f.Name == "button_Flag");
+        var buttonDeleteField = notifType.Fields.FirstOrDefault(f => f.Name == "button_Delete");
+        if (buttonReplyField is null || buttonFlagField is null || buttonDeleteField is null) { Console.Error.WriteLine("FAIL: button_Reply/button_Flag/button_Delete field(s) not found on FormMailNotification"); return 1; }
+
+        TypeDefinition? buttonType = buttonReplyField.FieldType.Resolve();
+        while (buttonType is not null && buttonType.FullName != "System.Windows.Forms.Control")
+        {
+            buttonType = buttonType.BaseType?.Resolve();
+        }
+        if (buttonType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control from button_Reply's own field type"); return 1; }
+        var buttonShowRef = module.ImportReference(buttonType.Methods.First(m => m.Name == "Show" && m.Parameters.Count == 0));
+
+        var showButtonsMethod = new MethodDefinition("__showTestNotificationButtons", MethodAttributes.Public, module.TypeSystem.Void);
+        notifType.Methods.Add(showButtonsMethod);
+        var sbIl = showButtonsMethod.Body.GetILProcessor();
+        foreach (var f in new[] { buttonReplyField, buttonFlagField, buttonDeleteField })
+        {
+            sbIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+            sbIl.Append(Instruction.Create(OpCodes.Ldfld, f));
+            sbIl.Append(Instruction.Create(OpCodes.Callvirt, buttonShowRef));
+        }
+        // Show() alone left the buttons visually absent on the first live test -- consistent with
+        // this whole project's throughline (Wine not repainting on a state change alone); force a
+        // real layout+paint pass the same way the actual test method already does, reusing
+        // performLayoutRef/invalidateRef already resolved above for that.
+        sbIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        sbIl.Append(Instruction.Create(OpCodes.Call, performLayoutRef));
+        sbIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        sbIl.Append(Instruction.Create(OpCodes.Call, invalidateRef));
+        sbIl.Append(Instruction.Create(OpCodes.Ret));
+        var showButtonsMethodRef = module.ImportReference(showButtonsMethod);
+
         // --- Timer field + tick method on formMain, calling the new public method.
         var timerField = new FieldDefinition("__monogramTestTimer", FieldAttributes.Private, timerTypeRef);
         mainType.Fields.Add(timerField);
@@ -2091,6 +2624,8 @@ static int RunPatchTestMonogramAvatar(string[] args)
         ttIl.Append(Instruction.Create(OpCodes.Ldstr, "JW"));
         ttIl.Append(Instruction.Create(OpCodes.Ldstr, "Jaguar Workshop Auto Restoration Specialists Ltd"));
         ttIl.Append(Instruction.Create(OpCodes.Callvirt, testMethodRef));
+        ttIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
+        ttIl.Append(Instruction.Create(OpCodes.Callvirt, showButtonsMethodRef));
         ttIl.Append(ttRet);
 
         // --- Prepend to formMain.OnShown: create/configure/start __monogramTestTimer.

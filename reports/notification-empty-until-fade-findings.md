@@ -1487,3 +1487,107 @@ about false confidence -- flagging both as unresolved-but-probably-not-bugs rath
 pending either a genuinely opaque capture (which would need the real empty-box fix first) or the
 user's own direct, live-eyes comparison to point at something more specific than these frames
 show.
+
+## Twenty-first round: the empty-box fix regressed out of the dev chain, then came back -- and with it, real, confirmed padding/alignment bugs
+
+Between rounds, the user noticed live that text had stopped showing at all, at any point in the
+notification's lifecycle -- a regression from the sixteenth/seventeenth rounds' confirmed fix.
+Root cause: this session's own earlier rebuilds (rounds nineteen and twenty) built their dev/test
+chain starting from the plain Stage-1-7 `output-final/` tree and never re-applied the four-patch
+chain (`--patch-notification-text-in-bitmap`, `--patch-notification-refresh-on-content-change`,
+`--patch-notification-periodic-reblit`, `--patch-notification-suppress-self-text-only`) that fixed
+it -- an honest process gap, not a code regression. Rebuilt the dev chain with all four patches
+included again, verified through the full pipeline (interpolation scan, `--dump-handlers`,
+decompile of every touched method), deployed, and confirmed via `ffmpeg` screen recording: text
+visible continuously through the whole appear-hold-fade lifecycle this time, not just glimpsed at
+the fade transition. See CLAUDE.md's own Status section for the corrected long-term record of this
+fix; this paragraph is the regression's own story for future reference.
+
+Fixing this unlocked something the twentieth round explicitly couldn't do: a genuinely opaque
+capture. Redid the padding/line-height measurement from scratch against clean, non-faded frames
+(`ffmpeg` recording, `fps`-based frame extraction, no fade blending at all) -- and this time found
+three real, confirmed layout bugs the twentieth round's fade-blended measurements had missed or
+gotten wrong:
+
+1. **Title text not vertically centered in its header band** -- sits with its ink concentrated in
+   the upper half, closer to the top than genuinely straddling the header's vertical center.
+   Traced to `TextRendererEx.DrawTextInternal`'s own decompiled source: for non-emoji text (this
+   title) it falls through to plain `System.Windows.Forms.TextRenderer.DrawText` -- so this is
+   real native Win32 `DrawTextEx` under Wine, not a custom rendering path, and it isn't honoring
+   `TextFormatFlags.VerticalCenter` correctly for this flag combination. A genuine Wine gap, not a
+   design-constant tweak.
+2. **Content text flush against the avatar's own left edge**, where the real-Windows reference has
+   a small (~4px, measured precisely via pixel-edge-detection on both images, not eyeballed) inset
+   past it.
+3. **Content text starting with no top padding**, right at the header/content boundary, where the
+   reference has visible breathing room above the first line.
+
+(The twentieth round's own conclusion -- "no bug found, probably a Wine font-metric artifact" --
+was wrong for reasons directly traceable to its own acknowledged methodology gap: every
+measurement in that round came from a partial-opacity fade-blended frame, because the empty-box
+bug was still live at the time and no opaque capture was possible. Padding measurements are
+edge-position-sensitive in a way font/AA comparisons aren't, and partial alpha blending shifts
+apparent edge positions enough to hide a real ~4-6px offset. Confirms the round's own stated
+worry -- "no bug found" from a compromised capture method isn't the same as "no bug" -- was
+justified.)
+
+**Fixes**, all built against raw IL dumped via a new `--dump-il <dll> <type> <method>` utility
+mode (same rationale as `--dump-handlers`: planning an edit against decompiled C# is guesswork
+about what the compiler actually emitted for compact vs. general opcode forms; dumping the real
+instruction stream removes that guesswork):
+
+- `--patch-notification-content-padding`: edits `doLayout()`'s `contentRect` construction --
+  `X` gets `+4` (with `Width` trimmed by the same 4 so the right edge doesn't move), and the `Y`
+  offset changes from `+5` to `+11` (with `Height`'s trailing `-10` becoming `-16`, again to keep
+  the bottom edge fixed). Four independently-verified edits within the same
+  `getScaledPadding()`...`stfld contentRect` instruction range, not a wholesale rewrite.
+- `--patch-notification-avatar-title-gap`: `OnPaintTitle`'s avatar-to-title gap constant, a
+  compact-form `ldc.i4.8` (not a general `ldc.i4 8` -- compact-form operands are implicit in the
+  opcode and can't be edited in place, so this replaces the instruction outright), becomes
+  `ldc.i4 14`.
+- `--patch-notification-title-vcenter-fix`: stops relying on Wine's `VerticalCenter` at all.
+  Measures the title's actual rendered size via `TextRenderer.MeasureText(title, headerFont, new
+  Size(bounds.Width, int.MaxValue), SingleLine | NoPrefix)` -- the same native call, just asked
+  what size it needs instead of asking it to center -- then explicitly sets `bounds.Y`/
+  `bounds.Height` so the measured text exactly fills the bounds passed to `DrawText`; top-alignment
+  within a rect sized to match the text is mathematically identical to true centering, without
+  depending on `DrawTextEx`'s own (here, wrong) centering math. Drops `VerticalCenter` from the
+  final flags constant (34852 -> 34848) since it's now a no-op by construction.
+
+  Two real implementation bugs were caught and fixed before this one worked, both worth recording
+  as their own lessons (added to CLAUDE.md's "IL-patching lessons" -- see there for the canonical
+  version): (a) the `bounds.Height = measured.Height` sequence was initially missing the `Ldloca_S
+  boundsLocal` push before the value, calling `set_Height` with the wrong stack shape entirely;
+  (b) far more subtly, the final flags-constant edit was originally done via a captured `int`
+  index into the instruction list rather than a captured `Instruction` object -- since ~20 new
+  instructions were inserted earlier in the same list first, the stale index ended up pointing at
+  one of those new instructions instead, and `.Operand = 34848` silently corrupted it (a
+  `VariableDefinition`-typed operand overwritten with an `int`), surfacing only as an
+  `InvalidCastException` deep in Cecil's writer at `module.Write()` time -- decompiling the
+  pre-write state wouldn't have caught this at all, since the corruption only existed after
+  insertion shifted indices. General lesson: never hold an instruction position as a bare `int`
+  index across any insertion/removal on the same list -- capture the `Instruction` object itself.
+
+Also extended `--patch-test-monogram-avatar` with a new `__showTestNotificationButtons()` method
+(added directly to `FormMailNotification`, not the base class, since `button_Reply`/`button_Flag`/
+`button_Delete` are `FormMailNotification`'s own private fields and the CLR verifier only allows a
+type's own methods to touch its private members) to check whether the new content-padding
+adjustments would collide with the reply/flag/delete controls -- user-requested, to answer "will
+this fit?" without needing a real email. Calling `.Show()` on the three buttons alone produced no
+visible change (consistent with this whole project's throughline: a visibility/state change alone
+doesn't reliably trigger a Wine repaint); added `PerformLayout()`/`Invalidate()` calls after the
+`Show()` calls, same as the main test method already does, but the buttons still didn't appear in
+the time available this round. Left as an open, low-priority test-tooling gap -- the actual
+positioning fixes above were confirmed independently via the video-recorded, non-faded frames
+without needing the buttons visible, so this doesn't block anything, but overlap with those
+controls specifically has NOT yet been confirmed either way and should be checked against a real
+incoming email before considering this fully done.
+
+**Confirmed via `ffmpeg` recording against a clean, non-faded frame, compared directly to
+`supporting/notifications-working-example-from-windows-with-long-subject.png` at matched zoom**
+(saved as `supporting/notification-layout-fix-comparison.png`): title now sits with visible space
+above and below within its header band, matching the reference's centering; avatar-to-title gap
+visibly widened; content text now starts with both a small left inset past the avatar and a top
+gap before the first line, matching the reference's proportions closely. All three fixes verified
+through the standard pipeline (interpolation regression scan, `--dump-handlers`, decompile of
+every touched method) before deploying, per this project's standing discipline.
