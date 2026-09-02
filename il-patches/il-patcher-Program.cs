@@ -33,6 +33,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-layout-diag")
     return RunPatchNotificationLayoutDiag(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-force-onload")
+{
+    return RunPatchNotificationForceOnLoad(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-settings-refresh")
 {
     return RunPatchSettingsRefresh(args);
@@ -1666,6 +1671,109 @@ static int RunPatchNotificationLayoutDiag(string[] args)
         );
 
         Console.WriteLine($"OK   {fileName}: {targetType}::doLayout -- now logs defaultPadding.Left/Top, headerFont/Font null-ness, and CornerRadius to {logPath}");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-force-onload <input-dir> <output-dir>
+//
+// Confirmed via --patch-notification-layout-diag's live readback: `headerFont` is null at paint
+// time. `FormGenericNotification.OnLoad()` is the ONLY place that sets `headerFont`/`Font` (from
+// `FontManager.UIFont` at 11pt/10pt) -- if it never fires, `headerFont` stays permanently null and
+// `Font` stays whatever ambient default Control.Font falls back to, neither being the intended
+// Segoe-UI-family font. This is the exact same class of bug this project already found and fixed
+// once before (reports/settings-panel-clip-region-findings.md: formSettings's Load event never
+// firing under Wine at all) -- a WinForms lifecycle method silently not being raised, not a
+// Wine rendering gap. Passing a null Font to TextRenderer.DrawText doesn't throw -- the native
+// DrawTextEx call falls back to whatever font is already selected into the HDC (a raw GDI stock
+// font, not a TrueType one), which plausibly explains both the wrong font size/family AND the
+// missing anti-aliasing the user noticed in the title specifically.
+//
+// Fix: same playbook as the formSettings fix -- call the method directly rather than relying on
+// the event/lifecycle callback to fire. Insert `if (!loaded) { OnLoad(EventArgs.Empty); }` at the
+// very top of OnShown (same safe insertion point already used for --patch-diag/
+// --patch-auto-test-notification/--patch-close-listener/--patch-notification-periodic-reblit in
+// this file). Guarding on the existing `loaded` field (already set true at the end of OnLoad, and
+// otherwise unused for gating anything else) makes this correctly run-once despite OnShown firing
+// repeatedly across the form's reused lifetime -- necessary because OnLoad's own body is NOT
+// idempotent: it unconditionally does `ThemeManager.Instance.ThemeChanged += Instance_ThemeChanged;`
+// with no matching `-=`, so calling it more than once would reproduce the exact double-subscription
+// bug already found and fixed for `layeredWindow.Click` in Stage 8.
+static int RunPatchNotificationForceOnLoad(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-force-onload <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var onShownMethod = type.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody);
+        if (onShownMethod is null) { Console.Error.WriteLine("FAIL: OnShown not found"); return 1; }
+        var onLoadMethod = type.Methods.FirstOrDefault(m => m.Name == "OnLoad" && m.HasBody);
+        if (onLoadMethod is null) { Console.Error.WriteLine("FAIL: OnLoad not found"); return 1; }
+        var loadedField = type.Fields.FirstOrDefault(f => f.Name == "loaded");
+        if (loadedField is null) { Console.Error.WriteLine("FAIL: loaded field not found"); return 1; }
+
+        var eventArgsEmptyRef = module.ImportReference(typeof(EventArgs).GetField("Empty")!);
+
+        var body = onShownMethod.Body;
+        var il = body.GetILProcessor();
+        var first = body.Instructions[0];
+        void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(first, i); }
+
+        var skipOnLoad = first;
+        Emit(
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldfld, loadedField),
+            Instruction.Create(OpCodes.Brtrue, skipOnLoad),
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldsfld, eventArgsEmptyRef),
+            Instruction.Create(OpCodes.Call, module.ImportReference(onLoadMethod))
+        );
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::OnShown -- now calls OnLoad(EventArgs.Empty) directly (guarded by the existing `loaded` field, so exactly once per form instance) if it hasn't already run, since OnLoad appears to never fire on its own under Wine -- this is what sets headerFont/Font to the intended UI font instead of leaving headerFont permanently null");
         patched = true;
 
         module.Write(destPath);
