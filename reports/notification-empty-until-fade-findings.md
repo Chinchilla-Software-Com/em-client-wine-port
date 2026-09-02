@@ -1255,3 +1255,86 @@ termination; user re-opened and let it complete before continuing.
 **Still not done:** folding the final four-patch chain into `releases/<version>/deploy.sh` as a new
 stage, and producing a clean deploy build without `--patch-diag`'s instrumentation layered on top
 (currently still present for observability -- fine for continued testing, not for normal use).
+
+## Eighteenth round: cosmetic follow-up -- font, padding, corner radius, and no-avatar handling
+
+Comparing the fixed rendering against real-Windows reference screenshots
+(`supporting/notifications-working-example-from-windows*.png`) surfaced several apparent cosmetic
+mismatches: content/title text sitting too close to the left edge, the avatar apparently clipped
+against the top-left corner, the title looking top- rather than vertically-centered in the header
+band, sharp corners instead of rounded ones, and text lacking anti-aliasing. Investigated each via
+direct instrumentation (`--patch-notification-layout-diag`, reading back real field/property
+values at paint time) rather than guessing, per this project's established method.
+
+**Padding: not actually broken.** `defaultPadding` reads back as `(8, 6, 8, 6)` and
+`getScaledPadding().Left` as `8` -- both correct, matching a resx-defined design value applied
+unconditionally by `InitializeComponent()`'s `componentResourceManager.ApplyResources(this,
+"$this")` call (no theme check, no conditional logic -- this runs identically regardless of active
+theme or DPI). A careful re-crop with nearest-neighbor scaling (avoiding LANCZOS resampling blur,
+which was distorting apparent edge positions in earlier comparisons) confirmed the actual on-screen
+padding is in the right ballpark. The original "flush-left" impression was a measurement artifact
+from imprecise reference-image cropping and lossy resampling, not a real defect. No padding patch
+exists or is needed; the app's own values are used entirely unmodified.
+
+**`headerFont` null -- a real, confirmed bug, now fixed.** `--patch-notification-layout-diag`
+showed `headerFont` is `null` (`Font` is non-null but also not the intended custom font) at every
+`doLayout()` call before `OnShown` fires, and *only* before -- proving `FormGenericNotification.
+OnLoad()` (the only code that sets `headerFont`/`Font` from `FontManager.UIFont` at 11pt/10pt)
+never fires on its own under Wine. This is the exact same class of bug already found and fixed
+once in this project (`reports/settings-panel-clip-region-findings.md`: `formSettings`'s `Load`
+event never firing) -- a WinForms lifecycle callback silently not running, not a rendering gap.
+Since `TextRenderer.DrawText` doesn't throw on a null `Font` (native `DrawTextEx` just falls back
+to whatever raw GDI stock font is already selected into the HDC), this plausibly explains both the
+wrong-looking title font and its lack of anti-aliasing (a legacy GDI stock font, not a TrueType
+one). **Fix -- `--patch-notification-force-onload`:** call `OnLoad(EventArgs.Empty)` directly from
+`OnShown`, guarded by the existing `loaded` field (set `true` at `OnLoad`'s own end) so it runs
+exactly once despite `OnShown` firing repeatedly across the form's reused lifetime -- necessary
+because `OnLoad` unconditionally subscribes `ThemeManager.Instance.ThemeChanged` with no matching
+unsubscribe, so calling it twice would reproduce the exact double-subscription bug already fixed
+for `layeredWindow.Click` in Stage 8. **Live-tested and confirmed via diag log** (headerFontNull=1
+before OnShown, =0 after, for the rest of the notification's life) **and visually** (title font
+changed from a bold, mismatched stock font to a lighter weight matching the content font's style,
+consistent with the intended UI font actually being applied now).
+
+**`CornerRadius` = 0 -- confirmed by design, not a bug.** `CornerRadius`'s getter returns `0`
+unless the active theme's `NotificationWindowUseRoundedCorners` is `true`. Checked every
+`IColorTheme` implementation in `MailClient.Common.UI.dll`: only `SystemColorTheme` returns `true`;
+every other theme (`Dark`, `Default`, and every named color theme) explicitly sets it `false`. The
+reference screenshot's rounded corners come from a different active theme setting on the reference
+machine, not a Wine gap -- no patch applied or needed.
+
+**Vertical centering: resolved as a side effect of the font fix.** `OnPaintTitle` uses
+`TextFormatFlags.VerticalCenter` without `TextFormatFlags.SingleLine`, which is documented
+(MSDN) to make `VerticalCenter` have no effect -- a real latent issue in the app's own flags,
+independent of any Wine gap. In practice, though, a precise pixel measurement after the font fix
+(title text spanning roughly the middle third of a 47px-tall header band) shows it landing close
+enough to center to not be a visibly distinct problem -- the earlier, more dramatic top-alignment
+appearance was very likely a side effect of the *wrong* fallback font's different line-height/
+ascent metrics interacting with this flag gap, not a separate bug needing its own fix. Not
+patched; revisit only if a future check shows it's still visually off with the correct font in
+place.
+
+**No-avatar-image (monogram) handling: verified working correctly, no patch needed.** The user
+asked to confirm eM Client's own initials-avatar logic is used correctly rather than reimplemented,
+since the test account's contacts all have photos (`AvatarHelper.GetAvatarWithFallback` never hits
+the monogram branch for any reachable real test). Full decompile of `UIAvatar.GetImageSingleRes`'s
+monogram branch confirmed it's pure GDI+ vector drawing (`Graphics.FillEllipse` for the colored
+circle, `Graphics.DrawString` with `TextRenderingHint.AntiAliasGridFit` for the initials) -- it
+never touches `InterpolationMode` (unlike the *real-photo* scaling branch two lines below it, which
+uses `InterpolationMode.High`, already a confirmed-broken "Hold row" item in this file's own
+Status section -- a separate, pre-existing, not-yet-patched issue, unrelated to this fix) and
+doesn't depend on `headerFont`/`Font` at all (it builds its own local `Font` directly from
+`FontManager.UIFont.FontFamily`). The resulting `Image` feeds into the exact same `Image` property
+and `updateBackgroundBitmap()` avatar-drawing code already confirmed reliable for real photos.
+Built `--patch-test-monogram-avatar` (a new public `__showTestMonogramNotification` method calling
+`UIAvatar.FromMonogram` directly, bypassing the unreachable-in-testing higher-level fallback logic)
+to verify live rather than trust the code review alone -- **confirmed working correctly**: a
+purple/lavender circle with bold white "JW" initials, cleanly anti-aliased, matching
+`supporting/email-with-no-image.png` closely. No patch needed for this case.
+
+**New dev-only tool, not part of the real fix:** `--patch-close-listener` -- lets this session
+close eM Client gracefully (via the real `menuItem_File_Exit_Click`/File>Exit code path, triggered
+by a polled marker file at `Z:\tmp\claude-close-signal`) without needing to ask the user to close
+it by hand before every redeploy. Confirmed via a live close+relaunch cycle to produce no DB-repair
+prompt, unlike killing the process. See `feedback_close_listener_tool` in this session's memory for
+reuse in future rounds; must be stripped before any release build.
