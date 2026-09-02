@@ -28,6 +28,11 @@ if (args.Length > 0 && args[0] == "--patch-close-listener")
     return RunPatchCloseListener(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-layout-diag")
+{
+    return RunPatchNotificationLayoutDiag(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-settings-refresh")
 {
     return RunPatchSettingsRefresh(args);
@@ -1457,6 +1462,194 @@ static int RunPatchCloseListener(string[] args)
         }
 
         Console.WriteLine($"OK   {fileName}: {mainFormType}::OnShown -- now polls every {pollIntervalMs}ms for {signalPath}; when present, deletes it and calls the real menuItem_File_Exit_Click (same as File > Exit) for a graceful shutdown");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-layout-diag <input-dir> <output-dir>
+//
+// One-off diagnostic for the cosmetic padding/font follow-up to the empty-box fix (see
+// reports/notification-empty-until-fade-findings.md's eighteenth round): a full decompile pass
+// found that FormGenericNotification DOES have a real mechanism that should set
+// `defaultPadding` to (8,6,8,6) -- a `public new Padding Padding { get => defaultPadding; set {
+// defaultPadding = value; base.Padding = getScaledPadding(); } }` property, fed by
+// `ApplyResources(this, "$this")` in InitializeComponent from an embedded resx value -- and a
+// separate mechanism (`OnLoad()`) that should set `headerFont`/`Font` from `FontManager.UIFont`
+// at 11pt/10pt. Both *should* work; whether they actually do under Wine is unconfirmed without
+// reading the live runtime values back -- exactly the kind of question this project's own
+// established investigation method (CLAUDE.md) says to answer via direct instrumentation rather
+// than more guessing, especially given this project has a confirmed precedent
+// (reports/settings-panel-clip-region-findings.md) of a WinForms lifecycle method
+// (formSettings's Load event) simply never firing under Wine at all.
+//
+// Logs, once per doLayout() call (a frequently-called, already-safe top-of-method insertion
+// point used elsewhere in this file): defaultPadding.Left/Top, whether headerFont/Font are null,
+// and CornerRadius's value.
+static int RunPatchNotificationLayoutDiag(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-layout-diag <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+    const string logPath = @"Z:\tmp\claude-diag.log";
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var doLayoutMethod = type.Methods.FirstOrDefault(m => m.Name == "doLayout" && m.HasBody);
+        if (doLayoutMethod is null) { Console.Error.WriteLine("FAIL: doLayout not found"); return 1; }
+        var defaultPaddingField = type.Fields.FirstOrDefault(f => f.Name == "defaultPadding");
+        if (defaultPaddingField is null) { Console.Error.WriteLine("FAIL: defaultPadding field not found"); return 1; }
+        var headerFontField = type.Fields.FirstOrDefault(f => f.Name == "headerFont");
+        if (headerFontField is null) { Console.Error.WriteLine("FAIL: headerFont field not found"); return 1; }
+        var cornerRadiusGetterDef = type.Methods.FirstOrDefault(m => m.Name == "get_CornerRadius");
+        if (cornerRadiusGetterDef is null) { Console.Error.WriteLine("FAIL: get_CornerRadius not found"); return 1; }
+        var cornerRadiusGetterRef = module.ImportReference(cornerRadiusGetterDef);
+
+        var paddingTypeDef = defaultPaddingField.FieldType.Resolve();
+        if (paddingTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Padding from defaultPadding's own FieldType"); return 1; }
+        var paddingGetLeftDef = paddingTypeDef.Methods.FirstOrDefault(m => m.Name == "get_Left");
+        var paddingGetTopDef = paddingTypeDef.Methods.FirstOrDefault(m => m.Name == "get_Top");
+        if (paddingGetLeftDef is null || paddingGetTopDef is null) { Console.Error.WriteLine("FAIL: Padding missing get_Left/get_Top"); return 1; }
+        var paddingGetLeftRef = module.ImportReference(paddingGetLeftDef);
+        var paddingGetTopRef = module.ImportReference(paddingGetTopDef);
+
+        TypeDefinition? controlType = type;
+        while (controlType is not null && controlType.FullName != "System.Windows.Forms.Control")
+        {
+            controlType = controlType.BaseType?.Resolve();
+        }
+        if (controlType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control in base-type chain"); return 1; }
+        var getFontDef = controlType.Methods.FirstOrDefault(m => m.Name == "get_Font");
+        if (getFontDef is null) { Console.Error.WriteLine("FAIL: Control missing get_Font"); return 1; }
+        var getFontRef = module.ImportReference(getFontDef);
+
+        MethodReference Import(System.Reflection.MethodBase mb) => module.ImportReference(mb);
+        var int32ToString = Import(typeof(int).GetMethod("ToString", Type.EmptyTypes)!);
+        var stringConcat2 = Import(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) })!);
+        var appendAllText = Import(typeof(File).GetMethod("AppendAllText", new[] { typeof(string), typeof(string) })!);
+
+        var body = doLayoutMethod.Body;
+        body.InitLocals = true;
+        var tmpInt = new VariableDefinition(module.TypeSystem.Int32);
+        var tmpMsg = new VariableDefinition(module.TypeSystem.String);
+        body.Variables.Add(tmpInt);
+        body.Variables.Add(tmpMsg);
+        var il = body.GetILProcessor();
+        var first = body.Instructions[0];
+        void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(first, i); }
+
+        // Each null-check below follows the same shape: push the field, Brtrue to the
+        // "not null" string literal (skipping the "is null" literal + an unconditional Br past
+        // it), falling through to the "is null" literal otherwise -- both paths converge on the
+        // shared `merge` instruction (the next real instruction, a Call to stringConcat2), which
+        // is captured once and only ever appears once in the emitted list (per IL-patching lesson
+        // 1: an Instruction object can only occupy one position in a method body -- reusing one
+        // as both a branch target AND a second literal list entry, as an earlier draft of this
+        // function mistakenly did, corrupts the instruction list).
+        var headerFontIsNull = Instruction.Create(OpCodes.Ldstr, "headerFontNull=1 ");
+        var headerFontNotNull = Instruction.Create(OpCodes.Ldstr, "headerFontNull=0 ");
+        var mergeHeaderFont = Instruction.Create(OpCodes.Call, stringConcat2);
+        var fontIsNull = Instruction.Create(OpCodes.Ldstr, "fontNull=1 ");
+        var fontNotNull = Instruction.Create(OpCodes.Ldstr, "fontNull=0 ");
+        var mergeFont = Instruction.Create(OpCodes.Call, stringConcat2);
+
+        // "LAYOUT paddingL=<n> paddingT=<n> headerFontNull=<0|1> fontNull=<0|1> cornerRadius=<n>\n"
+        Emit(
+            Instruction.Create(OpCodes.Ldstr, "LAYOUT paddingL="),
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldflda, defaultPaddingField),
+            Instruction.Create(OpCodes.Call, paddingGetLeftRef),
+            Instruction.Create(OpCodes.Stloc, tmpInt),
+            Instruction.Create(OpCodes.Ldloca, tmpInt),
+            Instruction.Create(OpCodes.Call, int32ToString),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldstr, " paddingT="),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldflda, defaultPaddingField),
+            Instruction.Create(OpCodes.Call, paddingGetTopRef),
+            Instruction.Create(OpCodes.Stloc, tmpInt),
+            Instruction.Create(OpCodes.Ldloca, tmpInt),
+            Instruction.Create(OpCodes.Call, int32ToString),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldstr, " "),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            // headerFont == null ?
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldfld, headerFontField),
+            Instruction.Create(OpCodes.Brtrue, headerFontNotNull),
+            headerFontIsNull,
+            Instruction.Create(OpCodes.Br, mergeHeaderFont),
+            headerFontNotNull,
+            mergeHeaderFont,
+            Instruction.Create(OpCodes.Ldstr, " "),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            // Font == null ?
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Callvirt, getFontRef),
+            Instruction.Create(OpCodes.Brtrue, fontNotNull),
+            fontIsNull,
+            Instruction.Create(OpCodes.Br, mergeFont),
+            fontNotNull,
+            mergeFont,
+            Instruction.Create(OpCodes.Ldstr, " cornerRadius="),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Call, cornerRadiusGetterRef),
+            Instruction.Create(OpCodes.Stloc, tmpInt),
+            Instruction.Create(OpCodes.Ldloca, tmpInt),
+            Instruction.Create(OpCodes.Call, int32ToString),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Ldstr, "\n"),
+            Instruction.Create(OpCodes.Call, stringConcat2),
+            Instruction.Create(OpCodes.Stloc, tmpMsg),
+            Instruction.Create(OpCodes.Ldstr, logPath),
+            Instruction.Create(OpCodes.Ldloc, tmpMsg),
+            Instruction.Create(OpCodes.Call, appendAllText)
+        );
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::doLayout -- now logs defaultPadding.Left/Top, headerFont/Font null-ness, and CornerRadius to {logPath}");
         patched = true;
 
         module.Write(destPath);
