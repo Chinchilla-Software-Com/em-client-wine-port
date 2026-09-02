@@ -399,6 +399,26 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   commonly wanted together) until it is. Full history, including every dead end ruled out before
   landing on this fix: `reports/notification-empty-until-fade-findings.md`'s "Sixteenth/Seventeenth
   round" sections.
+- **Notification close/settings icons (top-right) showing an empty box until fade, same root
+  cause and shape as the title/content text bug above** — the icons were still being drawn
+  directly by `OnPaint` onto `this`'s own unreliably-painted device context. Fixed the same way:
+  extended `--patch-notification-icon-bitmap` bakes `closeImage`/`closeImageOver`/`settingsImage`/
+  `settingsImageOver` directly into `backgroundBitmap` (reusing the same reliable
+  `layeredWindow`/`UpdateLayeredWindow` blit path proven for text) instead of building a second,
+  independent layered window from scratch — two architectural alternatives were explored first
+  (a plain, non-layered overlay window per the user's own "Option 2" idea, and this pragmatic
+  extension of the existing bitmap as "Option 1"); Option 2 hit a genuine, reproducible Wine
+  child-control paint gap that resisted four independent Z-order mitigations and was abandoned per
+  the user's own stated standard, fully documented (not deleted) as `MailClient.Notifications.
+  ButtonOverlay/` for reference. User confirmed live via video capture: both icons visible from
+  the earliest frame of the static hold period, well before fade, and the crash this patch's first
+  attempt introduced (`Graphics.DrawImage` on a not-yet-`OnLoad()`-populated `Image` field) is
+  fixed with null guards. **Reply/flag/delete icons are separately confirmed to have the exact
+  same bug but are not yet fixed** — scoped as a harder second pass (real `ControlToolStripButton`
+  instances backed by `MultiResImageList` resources, not simple `Image` fields) and not started.
+  Hover-state icon swap is decompile-verified but not live-tested (no mouse-automation tooling
+  available in this environment). Full history: `reports/notification-empty-until-fade-
+  findings.md`'s twenty-third through twenty-sixth rounds.
 
 **Confirmed as a real, separate Wine bug, but not the cause of anything fixed above — patched
 anyway since it's a real bug and the fix is cheap:**
@@ -592,6 +612,26 @@ session, all worth guarding against explicitly next time:
    the search loop (not `int targetIndex = i;`) whenever the found instruction will be mutated
    later in the same function, especially after any insertion happens in between — object
    references stay valid across list mutation, indices don't.
+8. **A branch-target instruction reused as a join point for multiple incoming paths must have a
+   neutral (`Nop`) stack effect — never repurpose a real load instruction as the label.** Building
+   a "skip this draw, the image field is null" guard, the natural instinct was to reuse
+   `Instruction.Create(OpCodes.Ldarg_0)` as the shared target both the fall-through-after-a-
+   successful-draw path and the branch-in-because-null path land on — it looked like a convenient
+   existing instruction to jump to rather than manufacturing a bare label. But that instruction
+   *executes* on both paths, and `Ldarg_0` has a real effect (pushes `this`, consumed by nothing
+   downstream) — it would have silently corrupted the evaluation stack on every single call,
+   regardless of which path was taken. Caught by manually tracing the generated IL's stack effect
+   before ever building it, not by a compiler or runtime error. Fix: use `OpCodes.Nop` for any
+   instruction whose only job is to be a jump target multiple paths converge on — zero stack
+   effect, purely structural (`--patch-notification-icon-bitmap`'s null-guard fix).
+9. **Comparing a `FieldReference` pulled off an existing instruction to an independently-
+   `Resolve()`d `FieldDefinition` via C# `==` doesn't reliably match, even when they name the same
+   field.** `instrs[i+1].Operand == mouseOverField` silently failed to match real occurrences —
+   `FieldReference`/`FieldDefinition` don't guarantee reference equality just because they resolve
+   to the same field, and Cecil doesn't override `==` to value-compare them. Fix: compare `.Name`
+   strings instead (`instrs[i+1].Operand is FieldReference fr && fr.Name == mouseOverField.Name`) —
+   safe here because the search is already scoped to a single known method/type, so name collision
+   isn't a real risk (`--patch-notification-icon-bitmap`'s `OnPaint` block-removal search).
 
 **A new `--dump-il <dll> <type> <method>` utility mode** (same rationale as `--dump-handlers`)
 prints a method's real instruction stream with offsets — use it before writing any patch that

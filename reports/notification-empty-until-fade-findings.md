@@ -1873,3 +1873,111 @@ itself was not rebuilt/redeployed with this round's helper-assembly-only changes
 `notification-button-overlay-patcher`-produced `MailClient.dll` from the twenty-fourth round's
 commit is still the current wired-in version and remains valid (the interface between the two
 assemblies -- `ButtonOverlayManager.Sync`/`HideAll`'s signatures -- did not change this round).
+
+## Twenty-sixth round: Option 1 -- close/settings icons baked into `backgroundBitmap`, confirmed working live
+
+Per the user's explicit "yes try option 1", implemented pragmatically rather than literally: instead
+of building a brand-new second `UpdateLayeredWindow`-backed window from scratch, extended the
+*existing* `backgroundBitmap`/`layeredWindow` mechanism that already fixed the title/content text
+(see the earlier rounds) to also draw the close/settings icons. This reuses the one blit path
+already proven to reach the screen reliably under Wine, instead of introducing a second one.
+
+New IL patch, `--patch-notification-icon-bitmap`, three parts:
+1. **`__drawNotificationTextIntoBitmap`** (the method that already draws title/content into
+   `backgroundBitmap`) extended to also `graphics.DrawImage(mouseOverClose ? closeImageOver :
+   closeImage, closeRect)` and the same for settings, guarded by `closeImage != null` /
+   `settingsImage != null` null checks (see crash below for why the guards are required).
+2. **`OnMouseMove`**: both existing `Invalidate()` calls (on `mouseOverClose`/`mouseOverSettings`
+   state change) now also call `updateLayeredBackground(refreshBitmap: true)`, so a hover-state
+   change actually gets baked into the bitmap and reblitted, not just requested via `Invalidate()`
+   (which alone was already established, for title/content, as insufficient under Wine without a
+   real message-loop tick).
+3. **`OnPaint`**: the `mouseOver` block's direct `e.Graphics.DrawImage(closeImage/closeImageOver,
+   closeRect)` calls (and the settings equivalent) removed outright -- confirmed via `--dump-il`
+   that only the `backgroundBitmap`-sourced sub-rectangle redraws remain. Leaving the direct draws
+   in place alongside the new bitmap-sourced ones would have painted correctly the instant `OnPaint`
+   itself is Wine-processed (which the whole rest of this investigation has shown isn't reliable)
+   while doing nothing to fix the actual bug -- the bitmap-only redraw is the one already proven to
+   reach the screen via `layeredWindow`'s own forced `UpdateLayeredWindow` call regardless of
+   whether Wine ever processes this window's own `WM_PAINT`.
+
+**Two real bugs hit and fixed before this was safe to deploy, both caught by this project's own
+established discipline rather than by a live failure (well, one of them was, the first time):**
+- **Live crash, first deploy attempt, zero diagnostic output beyond two `updateBackgroundBitmap`
+  calls then silence, no `bug.*.txt` crash-report file.** Diagnosed (no debugger available under
+  Wine for this class of native-boundary crash) as `Graphics.DrawImage(null, rect)` throwing inside
+  GDI+'s own call stack: `closeImage`/`closeImageOver`/`settingsImage`/`settingsImageOver` are only
+  populated by `recolorImages()`, called from `OnLoad()`, and `updateBackgroundBitmap()` -- unlike
+  the *original* code's icon-drawing, which only ever ran from a live-mouse-hover context where the
+  form was necessarily already loaded -- can now run on a freshly-constructed form *before*
+  `OnLoad()` completes, a new risk this patch itself introduced. Fixed with the null guards in part
+  1 above. Confirmed on redeploy: a fresh launch replaying the exact same trigger sequence that
+  crashed before now runs clean (see below) -- the crash-reporter's own `bug.20260903053059.txt`
+  from the earlier failed attempt was inspected and confirmed to contain `ArgumentNullException`
+  inside `DrawImage`, matching the diagnosis exactly.
+- **Self-caught stack-balance bug in the null-guard fix itself**, before ever building it: the
+  branch-target instructions for "skip the draw, image is null" (`closeSkipInstr`/
+  `settingsSkipInstr`) were initially created as `Instruction.Create(OpCodes.Ldarg_0)`. Since these
+  execute on *both* the fall-through-after-a-successful-draw path and the branch-in-because-null
+  path, and `Ldarg_0` has a real stack effect (pushes `this`, consumed by nothing), this would have
+  corrupted the evaluation stack on every single call regardless of which path was taken -- caught
+  by manually tracing the stack effect of the generated IL before ever attempting a build, not by a
+  build error or a live failure. Fixed by using `OpCodes.Nop` instead (zero stack effect, a pure
+  jump-target marker) -- exactly what a "do nothing, just land here" branch target needs.
+
+Also hit, in the `OnPaint` block-removal search specifically: `body.SimplifyMacros()` (called up
+front on this method, per IL-patching lesson 4, since the insertion is large enough to risk a
+short-branch range issue) converts the compact `Ldarg_0` opcode to the general `Ldarg` opcode with a
+`ThisParameter` operand -- a pattern search anchored on `OpCodes.Ldarg_0` specifically silently
+never matched (same class of bug as the button-overlay patcher's `ShowNotification` helper, earlier
+this investigation). Fixed by anchoring on the `Ldfld` field-access instruction instead (a value
+`SimplifyMacros()` never touches). A related smaller bug in the same search: comparing
+`instrs[i+1].Operand == mouseOverField` (C# reference equality between a `FieldReference` pulled off
+an existing instruction and an independently-`Resolve()`d `FieldDefinition`) doesn't reliably match
+even when they name the same field -- fixed by comparing `.Name` strings instead.
+
+**Full verification before deploy:** decompiled `__drawNotificationTextIntoBitmap` (shows both null
+guards exactly as intended), `OnMouseMove` (shows both `updateLayeredBackground(refreshBitmap:
+true)` calls), and `--dump-il`'d `OnPaint` directly (confirms zero remaining `closeImage`/
+`settingsImage`/`closeImageOver`/`settingsImageOver` field references -- only `backgroundBitmap`
+sub-rectangle redraws) -- all against the exact final chained build about to be deployed, not an
+earlier pre-null-guard build. Interpolation regression scan (13/13 unchanged) and `--dump-handlers`
+(nesting order correct) both clean.
+
+**Live-tested, confirmed working, on a genuinely fresh launch (not a `cxstart` reactivation --
+timed at ~8s to main-window-loaded, matching this project's own established fresh-launch signature)
+against bottle 8:**
+- **The crash is fixed.** App survived the full notification lifecycle -- diag log shows
+  `OnPaint`/`timer_OnTimer` firing continuously from first paint through fade-out (05:43:20 through
+  05:43:31, over 4000 log lines), process still running afterward, no new `bug.*.txt` file.
+- **Close and settings icons are visible from the earliest captured frame of the static hold
+  period (~1.7s after trigger, well before any fade-out), not just glimpsed during fade** -- the
+  exact bug this whole line of investigation was chasing. Confirmed via `ffmpeg` continuous
+  screen recording (15fps, correct display resolution 1897x1171 -- an earlier capture attempt used
+  a stale hardcoded 1920x1080 and failed outright with "Capture area ... outside the screen size")
+  and frame extraction at 3fps; both the gear (settings) and X (close) icons are clearly visible,
+  consistently, across every extracted frame during the hold period, cropped and upscaled 3x for
+  direct visual inspection.
+- **Not live-tested this round: the hover-state icon swap** (Part 2's actual purpose). No mouse
+  automation tooling exists in this environment (`xdotool` confirmed absent) to move the pointer
+  onto the icons programmatically, and the test-notification dev timer
+  (`--patch-test-monogram-avatar`) only fires once per app session, so re-testing costs a full
+  app restart each time -- not spent this round since the primary bug (visibility during the hold
+  period, and the crash) is now solidly confirmed. Part 2's code is decompile-verified correct
+  (both `Invalidate()` sites now also call `updateLayeredBackground(refreshBitmap: true)`) but a
+  human moving the mouse over the icons live is the next real confirmation step if pursued.
+- **Not tested at all this round: reply/flag/delete.** The test notification used
+  (`--patch-test-monogram-avatar`'s `FormMailNotification`) does not have a reply/flag/delete
+  panel in its captured frames -- consistent with the project's own earlier note that not every
+  `FormGenericNotification` subclass has one (`Controls.Find("tableLayoutPanel1", ...)` comes back
+  empty for some). Reply/flag/delete was always explicitly scoped as a second, more complex pass
+  (real `ControlToolStripButton` instances backed by `MultiResImageList` resources, not simple
+  `Image` fields) -- not started.
+
+**State left at this checkpoint:** `il-patches/output-icon-final/` is the fully chained, verified,
+deployed build (deployed to bottle 8, hash-confirmed). The now-unused `MailClient.Notifications.
+ButtonOverlay` companion assembly and its patcher (option 2, twenty-third through twenty-fifth
+rounds) remain in the repo, untouched, as historical/fallback reference -- not wired into this
+build. `--patch-notification-icon-bitmap` is not yet folded into `releases/<version>/deploy.sh`'s
+main pipeline (still applied as a manual extra stage on top of `output-final2-final`) pending the
+reply/flag/delete second pass and a live hover-swap check.

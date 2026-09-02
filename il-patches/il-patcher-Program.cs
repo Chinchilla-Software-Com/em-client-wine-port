@@ -88,6 +88,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-title-vcenter-fix")
     return RunPatchNotificationTitleVCenterFix(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-icon-bitmap")
+{
+    return RunPatchNotificationIconBitmap(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-license-icon")
 {
     return RunPatchLicenseIcon(args);
@@ -766,6 +771,345 @@ static int RunPatchNotificationTitleVCenterFix(string[] args)
         Console.WriteLine($"OK   {fileName}: {targetType}::OnPaintTitle -- explicitly measures and centers the title text instead of relying on Wine's DrawTextEx VerticalCenter (confirmed off by ~9px on this flag combination); {retargeted} branch(es) retargeted");
         patched = true;
 
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-icon-bitmap <input-dir> <output-dir>
+//
+// Option 1 from the reply/flag/delete/close/settings invisible-until-fade investigation (see
+// reports/notification-empty-until-fade-findings.md's twenty-fourth/twenty-fifth rounds): option 2
+// (a plain, non-layered overlay window) hit a real, unresolved Wine paint gap for child controls
+// after several rounds of otherwise-successful Z-order fixes. This patch instead reuses the SAME
+// mechanism that already fixed title/content text -- bake the close/settings icons directly into
+// `backgroundBitmap`, which `layeredWindow` already blits reliably via a genuine forced
+// `UpdateLayeredWindow` call every time, matching this project's own core finding: reliable
+// rendering under Wine means never depending on `this` form's own live, compositor-mediated
+// `WM_PAINT` at all. Scoped to close/settings only for this first pass -- they already use plain
+// `Image` fields (`closeImage`/`closeImageOver`/`settingsImage`/`settingsImageOver`), no
+// `MultiResImageList` resolution needed, unlike reply/flag/delete's real `ControlToolStripButton`
+// instances.
+//
+// Three coordinated edits, all designed from a raw `--dump-il` read (not decompiled C#, per this
+// project's own established discipline):
+//
+// 1. Extend `__drawNotificationTextIntoBitmap` (added by --patch-notification-text-in-bitmap) to
+//    also draw the close/settings icons, using the already-correct `mouseOverClose`/
+//    `mouseOverSettings` fields to pick the hover-state image -- inserted before the method's
+//    existing `graphics.Dispose()` call, which per --dump-il is not itself a branch target (the
+//    method's one branch targets an *earlier*, distinct `Ldloc` of the same graphics variable).
+// 2. Hook `OnMouseMove`'s two existing `Invalidate()` calls (one for close, one for settings hover
+//    changes) to also call `updateLayeredBackground(refreshBitmap: true)` -- forcing the same
+//    reliable rebuild-and-blit the text fix already depends on, so a hover-state change actually
+//    reaches the screen instead of relying on `this`'s own unreliable repaint.
+// 3. Remove the two *direct* `DrawImage(icon, rect)` calls from `OnPaint`'s `if (mouseOver)` block
+//    -- the ones that draw straight onto `this`'s own (unshadowed) device context, at a 9px offset
+//    from where the shadow-padded bitmap's own copy would land. Left untouched: the two
+//    `DrawImage(backgroundBitmap, rect, ...)` calls immediately before them, which *refresh that
+//    area from the bitmap* -- now correct and useful (they'll show the bitmap-baked icon, at the
+//    right position) instead of redundant, since the bitmap now always has the correct icon baked
+//    in. This is the same class of ghost-duplicate risk `--patch-notification-suppress-self-
+//    text-only` fixed for text (a live, unshadowed draw landing at a different pixel offset than
+//    the shadow-padded bitmap's own copy) -- removing only the offending calls, per that same
+//    precedent, rather than the whole block.
+static int RunPatchNotificationIconBitmap(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-icon-bitmap <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var closeRectField = type.Fields.FirstOrDefault(f => f.Name == "closeRect");
+        var settingsRectField = type.Fields.FirstOrDefault(f => f.Name == "settingsRect");
+        var closeImageField = type.Fields.FirstOrDefault(f => f.Name == "closeImage");
+        var closeImageOverField = type.Fields.FirstOrDefault(f => f.Name == "closeImageOver");
+        var settingsImageField = type.Fields.FirstOrDefault(f => f.Name == "settingsImage");
+        var settingsImageOverField = type.Fields.FirstOrDefault(f => f.Name == "settingsImageOver");
+        var mouseOverCloseField = type.Fields.FirstOrDefault(f => f.Name == "mouseOverClose");
+        var mouseOverSettingsField = type.Fields.FirstOrDefault(f => f.Name == "mouseOverSettings");
+        if (closeRectField is null || settingsRectField is null || closeImageField is null || closeImageOverField is null ||
+            settingsImageField is null || settingsImageOverField is null || mouseOverCloseField is null || mouseOverSettingsField is null)
+        {
+            Console.Error.WriteLine("FAIL: one or more required fields not found on FormGenericNotification");
+            return 1;
+        }
+
+        var updateLayeredBackgroundMethod = type.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground" && m.HasBody) ??
+            type.BaseType?.Resolve()?.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground");
+        if (updateLayeredBackgroundMethod is null) { Console.Error.WriteLine("FAIL: updateLayeredBackground(bool) not found"); return 1; }
+        var updateLayeredBackgroundRef = module.ImportReference(updateLayeredBackgroundMethod);
+
+        var updateBgMethod = type.Methods.FirstOrDefault(m => m.Name == "updateBackgroundBitmap" && m.HasBody);
+        if (updateBgMethod is null) { Console.Error.WriteLine("FAIL: updateBackgroundBitmap not found"); return 1; }
+        MethodReference? drawImageRef = null;
+        foreach (var instr in updateBgMethod.Body.Instructions)
+        {
+            if (instr.OpCode == OpCodes.Callvirt && instr.Operand is MethodReference mrDraw && mrDraw.Name == "DrawImage" && mrDraw.Parameters.Count == 2)
+            { drawImageRef = mrDraw; break; }
+        }
+        if (drawImageRef is null) { Console.Error.WriteLine("FAIL: couldn't find Graphics::DrawImage(Image,Rectangle) in updateBackgroundBitmap"); return 1; }
+        drawImageRef = module.ImportReference(drawImageRef);
+
+        // === Part 1: extend __drawNotificationTextIntoBitmap ===
+        var drawTextMethod = type.Methods.FirstOrDefault(m => m.Name == "__drawNotificationTextIntoBitmap" && m.HasBody);
+        if (drawTextMethod is null) { Console.Error.WriteLine("FAIL: __drawNotificationTextIntoBitmap not found (expected from --patch-notification-text-in-bitmap)"); return 1; }
+        {
+            var body = drawTextMethod.Body;
+            body.SimplifyMacros();
+            var il = body.GetILProcessor();
+            var instrs = body.Instructions;
+
+            Instruction? disposeCall = null;
+            foreach (var instr in instrs)
+            {
+                if (instr.OpCode == OpCodes.Callvirt && instr.Operand is MethodReference mrDispose && mrDispose.Name == "Dispose" && mrDispose.DeclaringType.Name == "Graphics")
+                    disposeCall = instr;
+            }
+            if (disposeCall is null) { Console.Error.WriteLine("FAIL: couldn't find Graphics::Dispose() call in __drawNotificationTextIntoBitmap"); return 1; }
+            int disposeIdx = instrs.IndexOf(disposeCall);
+            var ldlocGraphics = instrs[disposeIdx - 1];
+            if (ldlocGraphics.OpCode != OpCodes.Ldloc || ldlocGraphics.Operand is not VariableDefinition graphicsVar)
+            {
+                Console.Error.WriteLine($"FAIL: expected Ldloc <graphics var> immediately before Dispose() call, got {ldlocGraphics.OpCode} {ldlocGraphics.Operand}");
+                return 1;
+            }
+
+            void Emit(Instruction[] ins) { foreach (var i in ins) il.InsertBefore(ldlocGraphics, i); }
+
+            // Guard both icon draws on the relevant Image field being non-null: closeImage/
+            // closeImageOver/settingsImage/settingsImageOver are only populated once
+            // recolorImages() (called from OnLoad()) has actually run. This method can run before
+            // that -- confirmed live: the very first updateBackgroundBitmap() call for a freshly
+            // constructed form crashed the whole process (no .NET exception/bug report at all,
+            // consistent with an unhandled ArgumentNullException from Graphics.DrawImage(null,...)
+            // inside GDI+'s own call stack rather than ordinary managed code) before this guard was
+            // added. The original code never hit this because it only ever drew these icons from
+            // `this`'s own OnPaint `if (mouseOver)` block, which can't fire before a user has had
+            // time to move the mouse over an already-loaded, already-visible form.
+            // Nop, not another Ldarg_0: this is purely a branch-target marker for the null-check
+            // (both the fall-through-after-drawing path and the skip-because-null path land here),
+            // and must have zero stack effect -- an Ldarg_0 here would push an orphaned `this`
+            // reference nothing ever consumes, corrupting the stack for everything after it.
+            var closeSkipInstr = Instruction.Create(OpCodes.Nop);
+            var closeOverInstr = Instruction.Create(OpCodes.Ldarg_0);
+            var closeLoadedInstr = Instruction.Create(OpCodes.Ldarg_0);
+            Emit(new[]
+            {
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, closeImageField),
+                Instruction.Create(OpCodes.Brfalse, closeSkipInstr),
+                Instruction.Create(OpCodes.Ldloc, graphicsVar),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, mouseOverCloseField),
+                Instruction.Create(OpCodes.Brtrue, closeOverInstr),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, closeImageField),
+                Instruction.Create(OpCodes.Br, closeLoadedInstr),
+                closeOverInstr,
+                Instruction.Create(OpCodes.Ldfld, closeImageOverField),
+                closeLoadedInstr,
+                Instruction.Create(OpCodes.Ldfld, closeRectField),
+                Instruction.Create(OpCodes.Callvirt, drawImageRef),
+                closeSkipInstr,
+            });
+
+            var settingsSkipInstr = Instruction.Create(OpCodes.Nop); // same reasoning as closeSkipInstr above
+            var settingsOverInstr = Instruction.Create(OpCodes.Ldarg_0);
+            var settingsLoadedInstr = Instruction.Create(OpCodes.Ldarg_0);
+            Emit(new[]
+            {
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, settingsImageField),
+                Instruction.Create(OpCodes.Brfalse, settingsSkipInstr),
+                Instruction.Create(OpCodes.Ldloc, graphicsVar),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, mouseOverSettingsField),
+                Instruction.Create(OpCodes.Brtrue, settingsOverInstr),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, settingsImageField),
+                Instruction.Create(OpCodes.Br, settingsLoadedInstr),
+                settingsOverInstr,
+                Instruction.Create(OpCodes.Ldfld, settingsImageOverField),
+                settingsLoadedInstr,
+                Instruction.Create(OpCodes.Ldfld, settingsRectField),
+                Instruction.Create(OpCodes.Callvirt, drawImageRef),
+                settingsSkipInstr,
+            });
+
+            Console.WriteLine($"OK   {fileName}: {targetType}::__drawNotificationTextIntoBitmap -- now also draws the close/settings icons (hover-state-aware) into backgroundBitmap");
+        }
+
+        // === Part 2: hook OnMouseMove's two Invalidate() calls ===
+        var onMouseMoveMethod = type.Methods.FirstOrDefault(m => m.Name == "OnMouseMove" && m.HasBody);
+        if (onMouseMoveMethod is null) { Console.Error.WriteLine("FAIL: OnMouseMove not found"); return 1; }
+        {
+            var body = onMouseMoveMethod.Body;
+            body.SimplifyMacros();
+            var il = body.GetILProcessor();
+            var instrs = body.Instructions;
+
+            var invalidateCalls = new List<Instruction>();
+            foreach (var instr in instrs)
+            {
+                if (instr.OpCode == OpCodes.Call && instr.Operand is MethodReference mrInv && mrInv.Name == "Invalidate" && mrInv.Parameters.Count == 0)
+                    invalidateCalls.Add(instr);
+            }
+            if (invalidateCalls.Count != 2) { Console.Error.WriteLine($"FAIL: expected exactly 2 Invalidate() calls in OnMouseMove, found {invalidateCalls.Count} -- method shape changed, review needed"); return 1; }
+
+            foreach (var invalidateCall in invalidateCalls)
+            {
+                var insertionPoint = invalidateCall.Next
+                    ?? throw new Exception("OnMouseMove: an Invalidate() call has no following instruction");
+                il.InsertBefore(insertionPoint, Instruction.Create(OpCodes.Ldarg_0));
+                il.InsertBefore(insertionPoint, Instruction.Create(OpCodes.Ldc_I4_1));
+                il.InsertBefore(insertionPoint, Instruction.Create(OpCodes.Call, updateLayeredBackgroundRef));
+            }
+
+            Console.WriteLine($"OK   {fileName}: {targetType}::OnMouseMove -- both hover-state Invalidate() calls now also force updateLayeredBackground(refreshBitmap: true)");
+        }
+
+        // === Part 3: remove the two direct DrawImage(icon, rect) calls from OnPaint's mouseOver block ===
+        var onPaintMethod = type.Methods.FirstOrDefault(m => m.Name == "OnPaint" && m.HasBody && m.Parameters.Count == 1);
+        if (onPaintMethod is null) { Console.Error.WriteLine("FAIL: OnPaint(PaintEventArgs) not found"); return 1; }
+        {
+            var body = onPaintMethod.Body;
+            body.SimplifyMacros();
+            var il = body.GetILProcessor();
+            var instrs = body.Instructions;
+
+            // Each removable block starts at `Ldarg_0; Ldfld mouseOverClose|mouseOverSettings` and
+            // ends at the `Callvirt DrawImage(Image,Rectangle)` call that immediately follows the
+            // corresponding `Ldfld closeRect|settingsRect`.
+            (Instruction start, Instruction end)? FindBlock(FieldDefinition mouseOverField, FieldDefinition rectField)
+            {
+                for (int i = 1; i < instrs.Count - 1; i++)
+                {
+                    // Compare by field NAME, not object/reference equality -- FieldDefinition
+                    // instances resolved independently (module.GetType(...).Fields.FirstOrDefault)
+                    // are not guaranteed to be reference-equal to whatever FieldReference Cecil
+                    // attached as an existing instruction's Operand, even for the same field in the
+                    // same module. Anchor on the Ldfld itself (index i), not on the `this`-load
+                    // before it (index i-1) having a specific opcode -- body.SimplifyMacros() above
+                    // converts the original compact Ldarg_0 to the general Ldarg form (operand =
+                    // the implicit `this` parameter), so checking OpCodes.Ldarg_0 specifically would
+                    // never match post-simplification (hit for real, this exact patch's first
+                    // attempt).
+                    if (instrs[i].OpCode == OpCodes.Ldfld &&
+                        instrs[i].Operand is FieldReference frMouseOver && frMouseOver.Name == mouseOverField.Name)
+                    {
+                        var blockStart = instrs[i - 1];
+                        // scan forward for the matching DrawImage(Image,Rectangle) call, requiring
+                        // an Ldfld of rectField to appear immediately before it (the icon-rect
+                        // argument), to distinguish this from the earlier
+                        // DrawImage(Image,Rectangle,Rectangle,GraphicsUnit) bitmap-refresh call.
+                        for (int j = i + 2; j < instrs.Count - 1; j++)
+                        {
+                            if (instrs[j].OpCode == OpCodes.Ldfld && instrs[j].Operand is FieldReference frRect && frRect.Name == rectField.Name &&
+                                instrs[j + 1].OpCode == OpCodes.Callvirt && instrs[j + 1].Operand is MethodReference mrD &&
+                                mrD.Name == "DrawImage" && mrD.Parameters.Count == 2)
+                            {
+                                return (blockStart, instrs[j + 1]);
+                            }
+                        }
+                        return null;
+                    }
+                }
+                return null;
+            }
+
+            var closeBlock = FindBlock(mouseOverCloseField, closeRectField);
+            var settingsBlock = FindBlock(mouseOverSettingsField, settingsRectField);
+            if (closeBlock is null || settingsBlock is null)
+            {
+                Console.Error.WriteLine($"FAIL: couldn't find both removable icon-draw blocks in OnPaint (close found={closeBlock is not null}, settings found={settingsBlock is not null})");
+                return 1;
+            }
+
+            void RemoveBlock((Instruction start, Instruction end) block)
+            {
+                var afterBlock = block.end.Next ?? throw new Exception("OnPaint: a removable block has no following instruction");
+                // Per IL-patching lesson 2/3: retarget anything pointing at block.start (the
+                // block's own first instruction) to afterBlock, since the block is being removed
+                // wholesale. Confirmed via --dump-il that each block's start IS a branch target
+                // (the preceding `if (backgroundBitmap != null)` check skips straight to it when
+                // backgroundBitmap is null).
+                foreach (var instr in instrs)
+                {
+                    if (instr.Operand == block.start) instr.Operand = afterBlock;
+                }
+                foreach (var eh in body.ExceptionHandlers)
+                {
+                    if (eh.TryStart == block.start) eh.TryStart = afterBlock;
+                    if (eh.TryEnd == block.start) eh.TryEnd = afterBlock;
+                    if (eh.HandlerStart == block.start) eh.HandlerStart = afterBlock;
+                    if (eh.HandlerEnd == block.start) eh.HandlerEnd = afterBlock;
+                    if (eh.FilterStart == block.start) eh.FilterStart = afterBlock;
+                }
+                // Remove the whole [start, end] range. Internal branches (this block's own
+                // brtrue.s/br.s picking closeImage vs closeImageOver) target instructions strictly
+                // inside the range and are removed together with their targets -- nothing outside
+                // the range references them.
+                var toRemove = new List<Instruction>();
+                var cur = block.start;
+                while (true)
+                {
+                    toRemove.Add(cur);
+                    if (cur == block.end) break;
+                    cur = cur.Next!;
+                }
+                foreach (var instr in toRemove) il.Remove(instr);
+            }
+
+            // Remove settings block first (later in the method) so removing it doesn't invalidate
+            // the already-captured close block's own instruction references.
+            RemoveBlock(settingsBlock.Value);
+            RemoveBlock(closeBlock.Value);
+
+            Console.WriteLine($"OK   {fileName}: {targetType}::OnPaint -- removed the two direct DrawImage(icon, rect) calls from the mouseOver block (the DrawImage(backgroundBitmap, ...) refresh calls immediately before them are unchanged and now correct, since the bitmap has the icon baked in)");
+        }
+
+        patched = true;
         module.Write(destPath);
     }
 
