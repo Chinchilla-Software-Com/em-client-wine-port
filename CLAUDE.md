@@ -368,6 +368,37 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   `layeredWindow_Click`/`notificationForm_Click`/`Hide()` each fired exactly once (previously:
   twice), fade proceeded cleanly, no hang or crash. Full history:
   `reports/notification-empty-until-fade-findings.md`'s "Sixth/Seventh round" sections.
+- **New-mail notification toast showing an empty box until it started to fade out.** Root cause:
+  `this` form's title/content text is drawn live by `OnPaintTitle()`/`OnPaintContent()` from its
+  own `OnPaint`/`OnPaintBackground`, directly onto `this`'s own device context — and `this`'s own
+  client-area painting only succeeds while real Wine message-loop ticks are actively running (the
+  same class of Wine gap chased throughout this investigation), which is why content only ever
+  flashed into view during the brief Appearing/Disappearing tick bursts. The `layeredWindow`
+  drop-shadow companion window, by contrast, receives its `backgroundBitmap` via a genuine, always-
+  forced native `UpdateLayeredWindow` blit — reliable from the very first frame — but that bitmap
+  never contained the title/content text at all, only the background/border/avatar. Fixed with a
+  four-patch chain (`--patch-notification-text-in-bitmap`, `--patch-notification-refresh-on-
+  content-change`, `--patch-notification-periodic-reblit`, `--patch-notification-suppress-self-
+  text-only`): draws title/content directly into `backgroundBitmap` itself (reusing the real
+  `OnPaintTitle`/`OnPaintContent` methods against a `Graphics` built on the bitmap, so any subclass
+  override and the existing ellipsis/bounds/image-offset logic all still apply unchanged), forces
+  an immediate rebuild-and-blit through the already-reliable `layeredWindow` path the moment
+  `ShowNotification` sets new content (instead of relying on `this`'s own unreliable paint cycle to
+  ever pick it up), periodically re-asserts that same blit every 300ms while visible, and removes
+  the now-redundant (and ghost-prone — a faint, ~9px-offset duplicate could flash behind the real
+  text right at the fade transition) `OnPaintTitle`/`OnPaintContent` calls from `this`'s own
+  `OnPaintBackground`. User confirmed live ("I saw text the whole time... YAY") and against a
+  genuine incoming real email, with a video-frame-extraction re-confirmation later in the same
+  investigation. **This fix was lost for a time** — a later dev-testing session rebuilt its test
+  chain starting from the plain Stage-1-7 output and never re-applied these four patches, so the
+  bug silently reappeared in every build after that point until the user caught it live and this
+  was corrected; see `reports/notification-empty-until-fade-findings.md`'s twenty-first round for
+  the regression's own story. **Not yet folded into `releases/<version>/deploy.sh`** (same
+  standing gap as Stage 8 above) — apply the four flags manually via `~/tools/il-patcher` on top of
+  Stage 7's output (or Stage 8's, if also applying the click-dispatch fix, which is unrelated but
+  commonly wanted together) until it is. Full history, including every dead end ruled out before
+  landing on this fix: `reports/notification-empty-until-fade-findings.md`'s "Sixteenth/Seventeenth
+  round" sections.
 
 **Confirmed as a real, separate Wine bug, but not the cause of anything fixed above — patched
 anyway since it's a real bug and the fix is cheap:**
@@ -393,56 +424,17 @@ anyway since it's a real bug and the fix is cheap:**
   the same disassembly (High aliases to HighQualityBicubic internally). Promote to a stage if
   pursued — don't leave as "Hold, no evidence", that reasoning is now stale.
 
-**Investigated extensively, unresolved — no fix currently applied:**
-- **New-mail notification toast shows an empty box until it starts to fade out.** The one open
-  bug as of this writing. Direct app instrumentation confirmed the data (title/content) and the
-  fade animation's state machine are both correct from the very first paint — not a timing or
-  data bug. Three hypothesis-driven fixes all made no observable difference: an extra
-  `Invalidate()` call; forcing a genuine `SetLayeredWindowAttributes` alpha change; and a deliberate
-  dip-and-recover opacity sequence using real message-loop cycles (`Application.DoEvents()` +
-  `Thread.Sleep()` between steps, mimicking the working fade-out's own mechanism). All three were
-  confirmed via trace/recording to have been patching mechanisms that were never actually broken:
-  Wine's `window_surface_flush` and `SetLayeredWindowAttributes` handling both check out correct, a
-  further trace confirmed `NtGdiExtTextOutW` and per-glyph `NtGdiGetGlyphOutline` calls fire
-  correctly on the very first paint, and a frame-by-frame screen-recording analysis of the third
-  attempt showed the fix's own deliberate, drastic opacity swing (1.0→0.1→1.0) produced **zero
-  visible change** during the blank period — the whole window's on-screen appearance is frozen
-  from the compositor's perspective, not just its text content. Cinnamon's window-open "Map"
-  animation effect looked like a strong compositor-level candidate but was ruled out (user tested
-  with all Cinnamon desktop effects disabled — no change). Pixel-level analysis of a screenshot
-  separately confirmed the content is genuinely absent from what's composited to screen at that
-  moment, not a low-contrast/color issue. Every mechanism inspectable via instrumentation, trace,
-  and recording is confirmed correct, yet the screen doesn't reflect it — a real gap between "the
-  app/GDI did the work" and "the screen shows it" with no specific mechanism identified.
-  Follow-up round: read Wine's actual `winex11.drv` source and confirmed `SetLayeredWindowAttributes`
-  does no compositing itself — it just sets/deletes the X11 `_NET_WM_WINDOW_OPACITY` property and
-  leaves the actual compositing to the window manager, consistent with everything else found. Built
-  a minimal standalone repro app (`notif-repro.exe`, not yet tracked in the repo) to iterate faster
-  than patching `MailClient.dll`; five iterations (base layered-window mechanism, +drop-shadow
-  window +raw Win32 show sequence, +avatar image, +secondary-window-alongside-active-main-window,
-  +cross-thread avatar via `Invoke`) all failed to reproduce the bug — real, useful negative
-  evidence that rules out the WinForms mechanism itself as sufficient cause. Read Muffin's (Mint's
-  Mutter fork) actual compositor source and found a real, named window-freeze mechanism tied to the
-  X11 Sync extension frame-completion protocol — a strong candidate, but directly ruled out via
-  `xprop` on both the repro app and the real notification window (`WM_PROTOCOLS` has no
-  `_NET_WM_SYNC_REQUEST`, no counter property — Wine never engages this protocol for its windows at
-  all). Very likely X11-specific given how deeply tied to X11 properties/extensions every confirmed
-  mechanism is — plausibly avoided entirely on Wayland (`winewayland.drv`, a different driver and
-  compositing model), though untested. All experimental changes reverted; bottle back to its
-  confirmed-working baseline. A later round chasing a click-triggered hang/crash found and fixed a
-  genuine, separate double click-dispatch bug (`OnShown()` double-subscribing `layeredWindow.Click`
-  — see the Stage 8 bullet above) but that fix is not expected to resolve the rendering gap
-  described here; no evidence links the two beyond both surfacing from the same notification code
-  path. Full history, including everything ruled out and what's not yet tried:
-  `reports/notification-empty-until-fade-findings.md`.
-
-The two bugs originally reported (blank Settings panel, and the category-click crash found once
-the panel worked), the License Activation failure and "Get a license" icon bug found during that
-testing, the attachment file-type-association gap found during multi-OS testing, and the
-notification double click-dispatch bug found while investigating the item below, are all fixed
-and confirmed. The notification empty-box-until-fade rendering bug above remains open as of this
-writing. Stage 2/3/Hold interpolation items above remain scanned-but-not-pursued if a future
-session wants to extend that work.
+**Not started (scanned, not confirmed, not patched):** Stage 2/3/Hold interpolation items above
+remain scanned-but-not-pursued if a future session wants to extend that work. No other bugs are
+currently in an "investigated, unresolved" state — the empty-box-until-fade bug that used to be
+the one open item here is now fixed and confirmed (see its bullet above); everything found and
+fixed so far, including that one, is listed in the "Fixed and confirmed" section. The many dead
+ends ruled out on the way to that fix (Invalidate() calls, forced SetLayeredWindowAttributes
+changes, opacity dip-and-recover sequences, the Cinnamon "Map" animation and X11 Sync-extension
+compositor hypotheses, a standalone repro app that never reproduced it, and more) remain fully
+documented in `reports/notification-empty-until-fade-findings.md` so none of them get re-tried —
+read that file's early rounds before starting any new notification-rendering investigation, even
+though the bug itself is now closed.
 
 ## Investigation method (what actually worked this round)
 
