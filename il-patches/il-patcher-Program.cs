@@ -48,6 +48,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-title-singleline")
     return RunPatchNotificationTitleSingleLine(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-notification-geometry-diag")
+{
+    return RunPatchNotificationGeometryDiag(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-settings-refresh")
 {
     return RunPatchSettingsRefresh(args);
@@ -2036,10 +2041,10 @@ static int RunPatchTestMonogramAvatar(string[] args)
         ttIl.Append(Instruction.Create(OpCodes.Ldnull));
         ttIl.Append(Instruction.Create(OpCodes.Callvirt, notifShowRef));
         ttIl.Append(Instruction.Create(OpCodes.Ldloc, notifLocal));
-        ttIl.Append(Instruction.Create(OpCodes.Ldstr, "Jaguar Workshop"));
-        ttIl.Append(Instruction.Create(OpCodes.Ldstr, "Jaguar MK2"));
+        ttIl.Append(Instruction.Create(OpCodes.Ldstr, "Jaguar Workshop Auto Restoration Specialists Ltd"));
+        ttIl.Append(Instruction.Create(OpCodes.Ldstr, "Re: Your 1967 Jaguar E-Type Series 1 MK2 Restoration Quote and Timeline Estimate for Review"));
         ttIl.Append(Instruction.Create(OpCodes.Ldstr, "JW"));
-        ttIl.Append(Instruction.Create(OpCodes.Ldstr, "Jaguar Workshop"));
+        ttIl.Append(Instruction.Create(OpCodes.Ldstr, "Jaguar Workshop Auto Restoration Specialists Ltd"));
         ttIl.Append(Instruction.Create(OpCodes.Callvirt, testMethodRef));
         ttIl.Append(Instruction.Create(OpCodes.Ret));
 
@@ -2174,6 +2179,169 @@ static int RunPatchNotificationTitleSingleLine(string[] args)
         match!.Operand = newFlags;
 
         Console.WriteLine($"OK   {fileName}: {targetType}::OnPaintTitle -- TextFormatFlags {oldFlags} (0x{oldFlags:X}) -> {newFlags} (0x{newFlags:X}), adding SingleLine so VerticalCenter actually takes effect (MSDN: VerticalCenter is ignored without SingleLine)");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-geometry-diag <input-dir> <output-dir>
+//
+// User directly disputed the eighteenth round's "padding is fine" conclusion after watching the
+// title-singleline fix live -- rightly so; that conclusion was based on eyeballing/measuring
+// screenshots, not ground truth. This logs the actual computed `headerRect`/`contentRect`/
+// `imageRect` (via their own `ToString()`, far simpler than rebuilding each field manually the
+// way --patch-notification-layout-diag did) at the very end of `doLayout()` -- once it has
+// actually finished computing them, not the stale pre-call values a top-of-method insertion would
+// see. `doLayout()` has a single, branch-free exit (all its if/else branches converge before the
+// end, no exception handlers), so this is a plain "insert before the method's one and only final
+// ret" -- same low-risk shape as the append-only insertions already used elsewhere in this file
+// (e.g. --patch-notification-text-in-bitmap's call into updateBackgroundBitmap), verified the same
+// way (checking the anchor isn't itself a branch target or handler boundary before inserting).
+static int RunPatchNotificationGeometryDiag(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-geometry-diag <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+    const string logPath = @"Z:\tmp\claude-diag.log";
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var doLayoutMethod = type.Methods.FirstOrDefault(m => m.Name == "doLayout" && m.HasBody);
+        if (doLayoutMethod is null) { Console.Error.WriteLine("FAIL: doLayout not found"); return 1; }
+        var headerRectField = type.Fields.FirstOrDefault(f => f.Name == "headerRect");
+        var contentRectField = type.Fields.FirstOrDefault(f => f.Name == "contentRect");
+        var imageRectField = type.Fields.FirstOrDefault(f => f.Name == "imageRect");
+        if (headerRectField is null || contentRectField is null || imageRectField is null) { Console.Error.WriteLine("FAIL: headerRect/contentRect/imageRect field(s) not found"); return 1; }
+
+        var rectangleTypeDef = headerRectField.FieldType.Resolve();
+        if (rectangleTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Rectangle from headerRect's own FieldType"); return 1; }
+        var rectangleToStringDef = rectangleTypeDef.Methods.FirstOrDefault(m => m.Name == "ToString" && m.Parameters.Count == 0);
+        if (rectangleToStringDef is null) { Console.Error.WriteLine("FAIL: Rectangle.ToString() not found"); return 1; }
+        var rectangleToStringRef = module.ImportReference(rectangleToStringDef);
+
+        MethodReference Import(System.Reflection.MethodBase mb) => module.ImportReference(mb);
+        var stringConcat2 = Import(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) })!);
+        var appendAllText = Import(typeof(File).GetMethod("AppendAllText", new[] { typeof(string), typeof(string) })!);
+
+        var body = doLayoutMethod.Body;
+        body.SimplifyMacros();
+        var il = body.GetILProcessor();
+        var instrs = body.Instructions;
+        var lastInstr = instrs[instrs.Count - 1];
+        if (lastInstr.OpCode != OpCodes.Ret) { Console.Error.WriteLine($"FAIL: doLayout's last instruction isn't Ret (got {lastInstr.OpCode}) -- method shape changed, review needed"); return 1; }
+
+        // The final `ret` IS a branch target here -- doLayout's if/else-if/else-if chain (bigImage
+        // / image / imageList) compiles with each branch jumping to a shared exit point at the
+        // method's end. Per IL-patching lesson 2, inserting new code immediately before it would
+        // get skipped by those branches; retarget them (and any exception-handler boundary
+        // pointing at it, per lesson 3) to the new first inserted instruction instead, same
+        // pattern already used in RunPatchNotificationTextInBitmap.
+        var newFirst = Instruction.Create(OpCodes.Ldstr, "GEOMETRY header=");
+        il.InsertBefore(lastInstr, newFirst);
+        int retargetedBranches = 0;
+        foreach (var instr in instrs)
+        {
+            if (instr != newFirst && instr.Operand == lastInstr) { instr.Operand = newFirst; retargetedBranches++; }
+        }
+        // The bigImage/image branches in doLayout's if/else-if/else-if chain don't actually jump to
+        // a shared exit point at all -- each ends its own block with its own standalone `ret`
+        // (confirmed via raw IL dump: IL_00f0 and IL_0145 are independent Ret instructions, not
+        // branches to the method's real final ret). The branch-operand retargeting above can't catch
+        // these -- a bare `ret` has no Operand to compare. Convert every OTHER Ret instruction in the
+        // body to `br newFirst` so those paths also flow through the new logging before falling
+        // through to the real final ret.
+        int retargetedRets = 0;
+        foreach (var instr in instrs.ToList())
+        {
+            if (instr != lastInstr && instr.OpCode == OpCodes.Ret)
+            {
+                instr.OpCode = OpCodes.Br;
+                instr.Operand = newFirst;
+                retargetedRets++;
+            }
+        }
+        int retargetedHandlerBounds = 0;
+        foreach (var handler in body.ExceptionHandlers)
+        {
+            if (handler.TryStart == lastInstr) { handler.TryStart = newFirst; retargetedHandlerBounds++; }
+            if (handler.TryEnd == lastInstr) { handler.TryEnd = newFirst; retargetedHandlerBounds++; }
+            if (handler.HandlerStart == lastInstr) { handler.HandlerStart = newFirst; retargetedHandlerBounds++; }
+            if (handler.HandlerEnd == lastInstr) { handler.HandlerEnd = newFirst; retargetedHandlerBounds++; }
+        }
+        Console.WriteLine($"     ({retargetedBranches} branch operand(s), {retargetedRets} standalone early-ret instruction(s), {retargetedHandlerBounds} handler boundary field(s) retargeted from the old final ret to the new pre-ret logging)");
+
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldarg_0));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldflda, headerRectField));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, rectangleToStringRef));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, " content="));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldarg_0));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldflda, contentRectField));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, rectangleToStringRef));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, " image="));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldarg_0));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldflda, imageRectField));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, rectangleToStringRef));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, "\n"));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+        // Stack is now [msg]. AppendAllText(string path, string contents) needs [path, msg] in
+        // that push order -- store the built message in a local first, then push path and reload
+        // the message, rather than trying to have built `path` before `msg` above (which would
+        // have needed the whole concatenation chain reordered).
+        var tmpMsg = new VariableDefinition(module.TypeSystem.String);
+        body.Variables.Add(tmpMsg);
+        body.InitLocals = true;
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Stloc, tmpMsg));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, logPath));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldloc, tmpMsg));
+        il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, appendAllText));
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::doLayout -- now logs headerRect/contentRect/imageRect (via ToString()) to {logPath}");
         patched = true;
 
         module.Write(destPath);
