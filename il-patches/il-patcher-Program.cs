@@ -401,9 +401,17 @@ static int RunPatchNotificationContentPadding(string[] args)
             return 1;
         }
 
-        // Y offset +5 -> +11 (6px more top padding), Height's trailing -10 -> -16 (keep bottom edge).
-        ySite!.Operand = 11;
-        heightSite!.Operand = 16;
+        // Y offset +5 -> +16 (11px more top padding), Height's trailing -10 -> -21 (keep bottom edge).
+        //
+        // First landed on +11 (6px extra) by eyeballing the reference's proportions. Live-measured
+        // afterward (per-row pixel profile, not eyeballed) against the real deployed build: content
+        // ink actually starts rendering ~5px higher than the coded contentRect.Y (frame-relative
+        // ink onset ~61 vs the coded target's ~66) -- the same "renders higher than its coordinate"
+        // bias load-bearing in --patch-notification-title-vcenter-fix's own empirical correction,
+        // apparently a broader Wine text-positioning characteristic and not specific to
+        // VerticalCenter. Bumped by that measured 5px gap (11 -> 16) rather than re-guessing.
+        ySite!.Operand = 16;
+        heightSite!.Operand = 21;
 
         // X: insert `+ 4` right after get_Left(); Width: insert `- 4` right after the existing sub,
         // to keep the right edge where it was. Neither insertion point is a branch target or
@@ -414,7 +422,7 @@ static int RunPatchNotificationContentPadding(string[] args)
         il.InsertAfter(widthSubSite!, Instruction.Create(OpCodes.Sub));
         il.InsertAfter(widthSubSite!, Instruction.Create(OpCodes.Ldc_I4, 4));
 
-        Console.WriteLine($"OK   {fileName}: {targetType}::doLayout -- contentRect.X += 4 (left inset past the avatar's own edge, matching the real-Windows reference), contentRect.Y offset +5 -> +11 (top padding), Width/Height trimmed to match so the right/bottom edges don't move");
+        Console.WriteLine($"OK   {fileName}: {targetType}::doLayout -- contentRect.X += 4 (left inset past the avatar's own edge, matching the real-Windows reference), contentRect.Y offset +5 -> +16 (top padding, includes an empirically-measured +5 correction for the same Wine text-positioning bias --patch-notification-title-vcenter-fix found), Width/Height trimmed to match so the right/bottom edges don't move");
         patched = true;
 
         module.Write(destPath);
@@ -688,7 +696,26 @@ static int RunPatchNotificationTitleVCenterFix(string[] args)
             Instruction.Create(OpCodes.Ldc_I4, measureFlags),
             Instruction.Create(OpCodes.Call, measureTextRefImported),
             Instruction.Create(OpCodes.Stloc, sizeLocal),
-            // bounds.Y = (bounds.Height - measured.Height) / 2;
+            // bounds.Y = (bounds.Height - measured.Height) / 2 + 6;
+            //
+            // The `+ 6` is an empirically-measured correction, not part of the original plan --
+            // live-measured (per-column pixel scan, not eyeballed) after deploying the plain
+            // mathematically-centered version: with just the /2 centering, the title's visible ink
+            // spanned frame-relative Y 24-34 (window-relative 9-19, center ~14) against the header's
+            // true center at window-relative Y=20 -- entirely in the upper half, not straddling
+            // center at all. TextRenderer.MeasureText's returned Size.Height is the font's full
+            // line-height metric (ascent + descent + internal leading), not the visible glyph span;
+            // mathematically centering a box sized to that full metric still visually favors the
+            // ascent region for a typical Latin string, because the reserved descender space below
+            // the baseline mostly goes unused (this title's few true descenders -- 'g', 'p' -- don't
+            // reach anywhere near the metric's full reserve). So `bounds.Y = (Height-measured)/2`
+            // was mathematically correct for centering the *box* and still visually wrong for
+            // centering the *ink* -- confirmed, not assumed: fixing this "properly" would mean
+            // computing centering from the font's actual cap-height-to-baseline span (via
+            // FontFamily.GetCellAscent/GetCellDescent design-unit metrics) instead of its full
+            // line-height, which risks the exact same Wine-font-metric-reporting gap that caused
+            // this in the first place. Simpler and directly verified instead: shift down by the
+            // measured gap (target ink-center Y=20 minus observed ink-center Y=14 = 6).
             Instruction.Create(OpCodes.Ldloca_S, boundsLocal),
             Instruction.Create(OpCodes.Dup),
             Instruction.Create(OpCodes.Call, rectGetHeightRef),
@@ -697,6 +724,8 @@ static int RunPatchNotificationTitleVCenterFix(string[] args)
             Instruction.Create(OpCodes.Sub),
             Instruction.Create(OpCodes.Ldc_I4_2),
             Instruction.Create(OpCodes.Div),
+            Instruction.Create(OpCodes.Ldc_I4_6),
+            Instruction.Create(OpCodes.Add),
             Instruction.Create(OpCodes.Call, rectSetYRef),
             // bounds.Height = measured.Height;
             Instruction.Create(OpCodes.Ldloca_S, boundsLocal),

@@ -1591,3 +1591,80 @@ visibly widened; content text now starts with both a small left inset past the a
 gap before the first line, matching the reference's proportions closely. All three fixes verified
 through the standard pipeline (interpolation regression scan, `--dump-handlers`, decompile of
 every touched method) before deploying, per this project's standing discipline.
+
+**Correction (twenty-second round, immediately after): this "confirmed" claim was wrong, caught
+by the user, and the actual cause was a real measurement gap this project should have caught
+itself.** The user tested with a genuine incoming real email (not this session's synthetic
+Jaguar-Workshop test) and reported "made no difference. All alignments are still wrong" --
+directly disputing the round-twenty-one claim above. Re-measured properly this time: precise
+per-column and per-row pixel-deviation profiles (not eyeballing a 4x-nearest-neighbor crop, which
+is what produced the false "confirmed" claim above) against a freshly-deployed, freshly-launched
+build, cross-checked against the app's own logged `contentRect`/`headerRect` values. Found the
+title-vcenter-fix's `TextRenderer.MeasureText`-based centering, while decompiling exactly as
+designed, was **not producing a visually centered result at all** -- the title's ink stayed
+entirely in the upper half of the header band (measured span: frame-relative Y 24-34, dead center
+~29, against the header's true center at Y 35 -- essentially zero ink below center).
+
+**Root cause of why the "fix" didn't fix anything:** `TextRenderer.MeasureText`'s returned
+`Size.Height` is the font's full line-height metric (ascent + descent + internal leading), not the
+visible glyph span. Mathematically centering a box sized to that full metric still visually favors
+the ascent region for ordinary Latin text, because the reserved descender space below the baseline
+mostly goes unused (this title's few true descenders -- the 'g' in "Jaguar", the 'p' in
+"Workshop" -- don't reach anywhere near the metric's full reserve). The box was centered exactly
+as coded; the ink within it wasn't, because the box and the ink don't coincide. Computing "true"
+centering from the font's actual cap-height-to-baseline span (`FontFamily.GetCellAscent`/
+`GetCellDescent` design-unit metrics) would risk hitting the exact same Wine-font-metric-reporting
+gap that caused this in the first place, so this project's own established pragmatic-empirical
+style was used instead: measured the actual gap directly (target ink-center Y=20 minus observed
+ink-center Y=14, in window-relative units, = 6) and added that as a flat `+ 6` to the computed
+`bounds.Y`, live-verified against pixel measurements rather than assumed.
+
+The same live remeasurement also caught a second instance of the identical bias: content text's
+top padding (from `--patch-notification-content-padding`) rendered ~5px higher than its coded
+`contentRect.Y`, matching the title's own pattern closely enough to suggest this is a **general
+Wine text-positioning characteristic** (rendered ink sits systematically above whatever Y
+coordinate a text draw call is given, for both `VerticalCenter` and plain top-aligned text) rather
+than anything specific to `VerticalCenter`. Corrected the same way: measured the gap directly (ink
+onset moved from frame-Y 61 under the round-twenty-one coding to a target of 66) and bumped the Y
+offset by that same +5 (contentRect's `+11` -> `+16`, `Height`'s trailing `-16` -> `-21` to keep
+the bottom edge fixed).
+
+**Re-verified from scratch after both corrections**, same rigor as the disproof: fresh app launch
+(confirmed genuinely fresh via a ~9s startup, not an instant-reuse of a stale instance -- CrossOver
+bottles single-instance-activate rather than truly relaunch on a second `cxstart` of an
+already-running app, a real trap hit repeatedly this round while chasing this measurement, see
+below), `ffmpeg` recording, per-row/per-column pixel profiles cross-checked against the app's own
+logged `contentRect` values. Title ink band now spans frame-relative Y 27-37 (center ~32) against
+the true center at Y 35 -- a 3px residual, down from the original ~11px and the first "fix"
+attempt's ~9-11px (itself no improvement at all). Content ink onset now lands at frame-relative Y
+66, exactly matching where the correction's math predicted (confirming the +5 bias is a real, flat
+offset, not noise -- moving the coded target by 5 moved the rendered result by exactly 5). Visual
+comparison against the reference screenshot at matched zoom (title vertically centered similarly,
+content indented and top-padded similarly) sent to the user for direct confirmation alongside
+these numbers, not instead of them.
+
+**Live-capture lessons hit hard this round, worth recording for next time:**
+- **A second `cxstart` of an already-running bottle instance does not relaunch the app -- it
+  activates the existing window and returns almost instantly (~1s vs. a genuine ~9-10s cold
+  start).** Burned significant time this round assuming a fresh launch when the instance was
+  actually hours-old and in an unknown state (window z-order, timer state) from many prior test
+  cycles. Check for this by timing the "main window loaded" poll -- a ~1s result means it's the
+  same instance, not a new one; if a genuinely fresh state is needed, close first (graceful
+  `close-listener` signal, confirmed via `pgrep` returning nothing) and only then relaunch.
+- **The main application window can end up stacked in front of the notification popup**,
+  hiding it completely from any screen region grab even though the notification window genuinely
+  exists and is mapped (`xwininfo` shows `IsMapped`) -- confirmed by taking a full-desktop
+  screenshot mid-investigation and seeing the main window's own mail list rendered exactly where
+  the notification should have been. Restacking it programmatically (`ConfigureWindow` with
+  `stack_mode=Above`, with or without an explicit sibling) did **not** reliably fix this in this
+  Cinnamon/Muffin session -- the WM did not honor it. What worked: moving the main window itself
+  out of the way (`wmctrl -ir <id> -e 0,x,y,w,h`) before triggering the notification, or --
+  ultimately more reliable -- doing a genuinely fresh app launch (previous bullet), which reset
+  whatever z-order state had accumulated.
+- **The notification's own visible window is short-lived enough that any multi-step Python script
+  (import Xlib, connect to the display, poll, capture) risks missing it entirely**, even when the
+  poll loop itself detects the window within one 200ms iteration -- Python/Xlib startup overhead
+  alone can eat the whole window before a `get_image()` call ever runs. An `ffmpeg` recording
+  started *before* the trigger and left running for several seconds afterward, then frame-extracted
+  after the fact, was far more reliable than any single-shot live screenshot attempt for this
+  short-lived a target, even one triggered by "the window just appeared."
