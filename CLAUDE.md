@@ -265,367 +265,65 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
 
 ## Status
 
-**Fixed and confirmed working (visually, by the user):**
-- **Splash screen banner rendering.** Wine's `gdiplus` doesn't implement
-  `InterpolationMode.HighQualityBicubic` (7) — confirmed by disassembling
-  `/opt/cxoffice/lib/wine/i386-windows/gdiplus.dll`'s `resample_bitmap_pixel`: only `Bilinear`
-  (3) and `NearestNeighbor` (5) are implemented; everything else (0, 1, 2, 4, 6, 7) hits an
-  "Unimplemented interpolation %i" stub. Two wrong guesses before landing on 3 — `HighQualityBilinear`
-  (6) and `High` (2, which internally aliases to 7) are *also* unimplemented; don't reuse either
-  without new evidence. Full history: `reports/gdiplus-interpolation-findings.md`. **Correction:**
-  this fix was originally marked "confirmed working" on the strength of the disassembly evidence
-  alone — the banner image itself was never actually visually re-checked by the user under
-  Windows 7 at the time. It was properly visually confirmed only later, incidentally, while
-  testing the splash-tip-icon fix below (same screen, both bugs visible together in
-  `supporting/splash-broken.png` before either fix, both gone after).
-- **Splash screen tip label showing tofu boxes before the tip text.** Not a Wine font-substitution
-  gap in the way originally guessed, and not the same class of bug as the license icon below:
-  `FormSplashScreen.labelTip`'s baseline text is a genuine emoji (U+1F4A1, light bulb) that Wine
-  has no glyph for. A proper fix was attempted first — vendoring real, user-licensed Segoe UI/Segoe
-  UI Emoji fonts and configuring Wine's `FontLink\SystemLink` registry fallback (see `fonts/` and
-  the release script's `--install-fonts` step) — and a real `wine regedit` multi-string import bug
-  was found and worked around along the way, but the glyph still didn't render even with correct
-  registry configuration confirmed via trace: the gap is deeper, in Wine's glyph-shaping code
-  itself, not something registry configuration alone fixes. Fixed instead with the same narrow,
-  safe resource-string patch used for the license icon (`--patch-splash-tip-icon`, Stage 7).
-  Full history: `reports/splash-tip-icon-findings.md`.
-- **Settings dialog left category panel (was completely blank).** Root cause: `formSettings`'s
-  `Load` event never fires under Wine at all (not a paint bug, not a data bug — the event
-  handler's first instruction never executes). Fixed by calling
-  `formSettings_Load(this, EventArgs.Empty)` directly from the public
-  `formSettings(string tabName)` constructor, after its `SwitchToTabPanel(...)` call. Two wrong
-  intermediate fixes and why they failed (a Wine clip-region bug that was real but not the
-  cause; calling the same fix from the wrong constructor, which crashed on unset
-  `CurrentPanel`) are documented so they aren't re-tried: `reports/settings-panel-clip-region-findings.md`.
-- **Settings category click crash.** `NotImplementedException` from
-  `IApplicationAssociationRegistration.QueryAppIsDefaultAll` — a Windows Shell "is this the
-  default mail client" COM API Wine doesn't implement, thrown unhandled instead of failing
-  gracefully. Fixed by adding a sibling `catch (NotImplementedException) { return false; }`
-  handler next to `Integration.IsDefaultClientVista`'s existing `catch (COMException) { return
-  false; }` — the app already anticipated this class of COM failure, Wine just throws a
-  differently-typed exception for it. User confirmed: moved between all categories, changed and
-  saved settings, no further crash. Full history (including two exception-handler IL-correctness
-  bugs hit and fixed along the way): `reports/default-mail-client-notimplemented-findings.md`.
-- **License Activation failure** (spinner, then silent revert, no visible error). Root cause: an
-  RSA-OAEP private-key decrypt (`DecryptAndVerify.DecryptAndVerifyString`/`...StringV1` in
-  `MailClient.dll`, behind the License dialog's Activate button) fails inside Wine's `bcrypt.dll`
-  — `gnutls_x509_privkey_set_spki` hits an internal GnuTLS assertion specific to OAEP's parameter
-  encoding, throws, and is caught by the app's own blanket handler in `ReporterMode.Silent` (why
-  nothing visible happens). Fixed by redirecting both call sites to a new pure-managed
-  BouncyCastle-backed RSA-OAEP implementation (`MailClient.Licensing.BouncyCastlePatch.dll`,
-  built against the app's already-vendored `BouncyCastle.Cryptography.dll`) instead of the native
-  CNG-backed `RSA.Decrypt` — BouncyCastle has no P/Invoke, so it never touches the broken Wine
-  code path. Cryptographic correctness verified independently before deploying (32/32 checks
-  across 4 key sizes × 4 plaintext shapes, byte-identical to native .NET RSA-OAEP decrypt). User
-  confirmed: Activation completed successfully. Full history, including the standalone
-  verification harness and the trace evidence: `reports/license-activation-oaep-findings.md`.
-- **License dialog "Get a license" button showing two tofu boxes.** Root cause: **not a Wine
-  bug** — the button's own `Text` resource (`MailClient.UI.Forms.formLicense.resources`'s
-  `buttonGetLicense.Text`, embedded in `MailClient.dll` itself) contains two literal Unicode C1
-  control characters (U+0083) baked into the app's own resource data, confirmed isolated (occurs
-  exactly once in the whole assembly) and confirmed not font-substitution-related (the button's
-  paint code does plain `TextRenderer.DrawText`, no icon-glyph logic anywhere). Almost certainly
-  an upstream eM Client resource-authoring/encoding bug that would show the same way on real
-  Windows. Fixed anyway — cheap and safe regardless of platform — via a raw byte-level resource
-  edit (`--patch-license-icon`, `~/tools/il-patcher`): U+0083 U+0083 → U+00A0 U+00A0
-  (non-breaking space), chosen to keep the resource's byte length exactly unchanged so the
-  `.resources` container's offset table needs no adjustment. User confirmed: "That's fixed the
-  icon issue on button... There's no icons visible... just text... but that's nice and clean."
-  Full history: `reports/license-icon-findings.md`.
-- **Attachments (office documents, images, archives, audio/video) failing to open** with "There
-  is no Windows program configured to open this type of file." Root cause: **not an eM Client
-  bug** — its own attachment-open code (`UIUtils.OpenFileInDefaultApp` →
-  `ShellInterop.OpenItem`) faithfully mirrors the same `IContextMenu`-based mechanism Explorer
-  itself uses; a fresh CrossOver bottle just doesn't ship file-type associations for these
-  extensions (`.pdf` is associated out of the box, most others aren't). Confirmed the error text
-  itself is a Wine `shell32.dll` built-in string, not something eM Client generates. Fixed by
-  importing `.reg` files (`file-associations/**`) that associate each extension with its own
-  `EMClientWinePort.<ext>` ProgID pointed at the same `winebrowser.exe` handler `.pdf` already
-  used — `deploy.sh` imports only extensions missing an association on the target bottle, so a
-  bottle with a real Office/LibreOffice install isn't disturbed. Initially misreported as
-  PDF-specific; PDFs were already working — the real, confirmed failure was `.docx`, and a
-  systematic registry check turned up a much wider set of broken attachment types. User confirmed
-  after live-testing multiple attachment types: "It worked." Full history:
-  `reports/office-file-associations-findings.md`.
-- **New-mail notification click firing its handler twice per single click.** Found while
-  instrumenting the still-open empty-box notification bug below (not the same bug — see that
-  bullet's own note on scope). Root cause: **not a Wine bug** —
-  `FormGenericNotification.OnShown()` runs `layeredWindow.Click += layeredWindow_Click;`
-  unconditionally every time it runs, with no matching `-=` anywhere in the class, and `OnShown()`
-  runs at least twice per notification shown (confirmed via instrumentation: once early while the
-  form is still blank, once again once Title/Content are populated) — each adding another
-  subscription of the same handler to the same event, so a single click invoked
-  `layeredWindow_Click`/`notificationForm_Click`/`PerformAction`/`ShowMailForm` twice. This also
-  explained why real clicks never fire `FormGenericNotification.OnMouseClick` at all — clicks land
-  on the `layeredWindow` drop-shadow companion window, whose own `layeredWindow_Click` handler
-  calls `performMouseClick()` directly. Fixed via a new `--patch-notification-click-resubscribe`
-  mode (Stage 8, not yet folded into `releases/<version>/deploy.sh` — apply manually via
-  `~/tools/il-patcher` on top of Stage 7's output for now) inserting the missing
-  `layeredWindow.Click -= layeredWindow_Click;` immediately before the existing `+=`, the standard
-  unsubscribe-then-subscribe idiom (a no-op on the very first call, since removing a
-  never-added delegate is a documented .NET no-op). User confirmed on a live bottle (with
-  diagnostic logging still layered on top for direct verification): one notification, one click →
-  `layeredWindow_Click`/`notificationForm_Click`/`Hide()` each fired exactly once (previously:
-  twice), fade proceeded cleanly, no hang or crash. Full history:
-  `reports/notification-empty-until-fade-findings.md`'s "Sixth/Seventh round" sections.
-- **New-mail notification toast showing an empty box until it started to fade out.** Root cause:
-  `this` form's title/content text is drawn live by `OnPaintTitle()`/`OnPaintContent()` from its
-  own `OnPaint`/`OnPaintBackground`, directly onto `this`'s own device context — and `this`'s own
-  client-area painting only succeeds while real Wine message-loop ticks are actively running (the
-  same class of Wine gap chased throughout this investigation), which is why content only ever
-  flashed into view during the brief Appearing/Disappearing tick bursts. The `layeredWindow`
-  drop-shadow companion window, by contrast, receives its `backgroundBitmap` via a genuine, always-
-  forced native `UpdateLayeredWindow` blit — reliable from the very first frame — but that bitmap
-  never contained the title/content text at all, only the background/border/avatar. Fixed with a
-  four-patch chain (`--patch-notification-text-in-bitmap`, `--patch-notification-refresh-on-
-  content-change`, `--patch-notification-periodic-reblit`, `--patch-notification-suppress-self-
-  text-only`): draws title/content directly into `backgroundBitmap` itself (reusing the real
-  `OnPaintTitle`/`OnPaintContent` methods against a `Graphics` built on the bitmap, so any subclass
-  override and the existing ellipsis/bounds/image-offset logic all still apply unchanged), forces
-  an immediate rebuild-and-blit through the already-reliable `layeredWindow` path the moment
-  `ShowNotification` sets new content (instead of relying on `this`'s own unreliable paint cycle to
-  ever pick it up), periodically re-asserts that same blit every 300ms while visible, and removes
-  the now-redundant (and ghost-prone — a faint, ~9px-offset duplicate could flash behind the real
-  text right at the fade transition) `OnPaintTitle`/`OnPaintContent` calls from `this`'s own
-  `OnPaintBackground`. User confirmed live ("I saw text the whole time... YAY") and against a
-  genuine incoming real email, with a video-frame-extraction re-confirmation later in the same
-  investigation. **This fix was lost for a time** — a later dev-testing session rebuilt its test
-  chain starting from the plain Stage-1-7 output and never re-applied these four patches, so the
-  bug silently reappeared in every build after that point until the user caught it live and this
-  was corrected; see `reports/notification-empty-until-fade-findings.md`'s twenty-first round for
-  the regression's own story. **Not yet folded into `releases/<version>/deploy.sh`** (same
-  standing gap as Stage 8 above) — apply the four flags manually via `~/tools/il-patcher` on top of
-  Stage 7's output (or Stage 8's, if also applying the click-dispatch fix, which is unrelated but
-  commonly wanted together) until it is. Full history, including every dead end ruled out before
-  landing on this fix: `reports/notification-empty-until-fade-findings.md`'s "Sixteenth/Seventeenth
-  round" sections.
-- **Notification close/settings icons (top-right) showing an empty box until fade, same root
-  cause and shape as the title/content text bug above** — the icons were still being drawn
-  directly by `OnPaint` onto `this`'s own unreliably-painted device context. Fixed the same way:
-  extended `--patch-notification-icon-bitmap` bakes `closeImage`/`closeImageOver`/`settingsImage`/
-  `settingsImageOver` directly into `backgroundBitmap` (reusing the same reliable
-  `layeredWindow`/`UpdateLayeredWindow` blit path proven for text) instead of building a second,
-  independent layered window from scratch — two architectural alternatives were explored first
-  (a plain, non-layered overlay window per the user's own "Option 2" idea, and this pragmatic
-  extension of the existing bitmap as "Option 1"); Option 2 hit a genuine, reproducible Wine
-  child-control paint gap that resisted four independent Z-order mitigations and was abandoned per
-  the user's own stated standard, fully documented (not deleted) as `MailClient.Notifications.
-  ButtonOverlay/` for reference. User confirmed live via video capture: both icons visible from
-  the earliest frame of the static hold period, well before fade, and the crash this patch's first
-  attempt introduced (`Graphics.DrawImage` on a not-yet-`OnLoad()`-populated `Image` field) is
-  fixed with null guards. Making the icons always-visible exposed a follow-on bug: the title text
-  ran underneath them, since `OnPaintTitle`'s existing icon-width allowance was only applied
-  `if (mouseOver)` (matching the icons' old hover-only visibility). Fixed with
-  `--patch-notification-title-icon-clip`, forcing that allowance to always apply. User confirmed
-  live via video capture: title now properly ellipsizes ("Jaguar Workshop Auto Re…") with a clean
-  gap before the icons. Full history: `reports/notification-empty-until-fade-
-  findings.md`'s twenty-third through twenty-seventh rounds.
-- **Notification reply/flag/delete/previous/next icons (bottom strip) had the exact same
-  invisible-until-fade bug** — confirmed live (user: "I could only see them as they faded out").
-  Unlike close/settings (plain `Image` fields drawn directly by `OnPaint`), these five are real
-  `MailClient.Common.UI.Controls.ControlToolStrip.ControlToolStripButton` child controls hosted in
-  `tableLayoutPanel1`, each with its own genuinely complex, theme/hover/tint-dependent paint logic
-  already built into its own `OnPaint` — confirmed via two diagnostic passes
-  (`--patch-diag-toolstrip-buttons`/`--patch-diag-toolstrip-controls`) that they're real
-  `Control`-derived instances (their own `Bounds`/`Visible` are public, directly callable), but
-  `OnPaint`/`OnMouseEnter`/`OnMouseLeave` are `protected`, declared on a class in a different
-  assembly (`MailClient.Common.UI.dll`) than `FormMailNotification` (`MailClient.dll`) — calling
-  them directly would violate CLR member accessibility. Fixed with a new
-  `--patch-notification-toolbar-icons` patch adding, all on `FormMailNotification`: a
-  `__toolbarButtonRect` helper (`tableLayoutPanel1.Bounds.Location` + `button.Bounds`, translated
-  into `this`-relative coordinates), an `updateBackgroundBitmap()` override that bakes all five
-  buttons' real rendered output into `backgroundBitmap` (the same reliable `layeredWindow` blit
-  path proven for text/close/settings) by calling each button's own real `OnPaint` through a new
-  `RaisePaint(PaintEventArgs)` public wrapper method added to `ControlToolStripButton` itself
-  (see mistake 1 below for how this settled — not reimplementing the theme/hover/tint logic by
-  hand), an `OnMouseMove` override forwarding into whichever real button the cursor is over via
-  matching `RaiseMouseEnter`/`RaiseMouseLeave` wrappers so each button's own hover-tint state
-  updates correctly, and a `performMouseClick` override checking all five buttons' rects FIRST —
-  priority matters here, since `contentRect`'s hit-test rectangle genuinely overlaps the toolbar
-  strip's Y range (confirmed via `--patch-notification-geometry-diag`: `content={Y=56,Height=64}`
-  vs. the toolbar's `Y=94..116`) — calling the real, unmodified click handlers
-  (`Replyaction`/`Flag`/`Delete`/`button_Previous_Click`/`button_Next_Click`) directly, only
-  falling through to `base.performMouseClick` if none matched. `button_Previous`/`button_Next`
-  are only `Visible` when multiple notifications are queued (`notifications.Count > 1`) and their
-  `Bounds` are stale/unreliable while hidden (confirmed via diagnostic) — both the paint and
-  click/hover overrides skip any button that isn't currently `Visible`.
-  **Three real mistakes/iterations on the way to the final design, all worth remembering:**
-  1. A first attempt widened `OnPaint`/`OnMouseEnter`/`OnMouseLeave`'s own visibility from
-     `protected` to `public` directly in `MailClient.Common.UI.dll` (the user's own suggestion,
-     since this is raw IL editing anyway — no reflection needed if the target methods are just
-     public). It decompiled clean and deployed without error, but broke icon rendering on **every
-     toolbar button across the entire app** (user: "The whole UI is broken now") —
-     `ControlToolStripButton` is the shared control behind every toolbar in eM Client, and an
-     override's accessibility mismatch against its base declaration (something the C# compiler
-     blocks at compile time) turned out to matter at the CLR level too, breaking the type broadly
-     rather than just the one call site being touched. Reverted immediately (screenshot-confirmed
-     both the break and the recovery). A second attempt used reflection
-     (`Type.GetMethod(NonPublic|Instance)` + `MethodBase.Invoke`) instead — zero blast radius, and
-     it worked, but with real ongoing cost: `object[]` boxing per call and a string-based method
-     lookup that could silently no-op on a typo, with no compiler to catch it. **The version that
-     actually shipped** (after the user asked for a holistic re-review before folding this into
-     `deploy.sh`, rather than settling for "it works"): three brand-new PUBLIC wrapper methods
-     added to `ControlToolStripButton` — `RaisePaint`/`RaiseMouseEnter`/`RaiseMouseLeave`, each
-     just calling the corresponding protected `On*` method from within the SAME class (legal —
-     protected access from the declaring type itself is always fine). These are NEW, ADDITIVE
-     members: nothing about any EXISTING method changes, so there's no override-accessibility
-     mismatch to trigger mistake 1's failure mode, and no existing call site anywhere else in the
-     app is affected — confirmed by re-running the exact blast-radius check mistake 1 skipped (a
-     normal, unrelated toolbar button, screenshot-verified unaffected) before calling this done.
-     **Lesson: editing a *shared library* type's own member metadata (visibility, and likely
-     anything else affecting its public contract) needs a blast-radius check across its OTHER
-     call sites before deploying, not just the one feature path being worked on** — unlike every
-     other patch in this project, which only ever touches methods specific to the one
-     type/feature being fixed. **When something outside the type you're extending needs access
-     you don't have, prefer adding a new, additive member over widening or otherwise mutating an
-     existing one — it gets you the same reach with none of the blast radius**, and (as this case
-     shows) it can beat reflection too: no runtime string lookup, no boxing, a normal `Callvirt`.
-  2. After switching to reflection (interim step, superseded by the wrapper methods above), the
-     first button drawn (Reply) rendered in the right place;
-     every button drawn after it (Flag/Delete/Previous/Next) rendered near the top-left corner,
-     overlapping the avatar — confirmed live via screenshot. Root cause: `ControlToolStripButton
-     .OnPaint`'s own image-drawing code calls `Graphics.ResetTransform()` internally (part of its
-     rotation-transform handling, unconditional whenever an image actually draws) — this wipes
-     ANY transform state applied before calling it, including a manual
-     `TranslateTransform(+X,+Y)` / `TranslateTransform(-X,-Y)` "undo" pair wrapped around the call
-     (the first draft here): the undo then applies to an already-reset (identity) matrix instead
-     of the intended baseline, corrupting the transform for every subsequent button drawn on the
-     same `Graphics`. Fixed by switching to `Graphics.Save()`/`Restore(GraphicsState)` instead of
-     manual translate math — `Restore()` puts the ENTIRE transform/clip state back to exactly what
-     `Save()` captured, regardless of what the reused paint code did with it in between (translate,
-     rotate, or reset), fully isolating each button's paint call from the others. **Lesson: when
-     reusing someone else's paint code you don't control via reflection or otherwise, assume it
-     may touch the `Graphics` transform/clip state in ways you can't predict — `Save()`/`Restore()`
-     around the call is the only reliably composable pattern, not a manual delta you apply and
-     undo yourself.** User confirmed live: all five icons visible in the correct positions, hover
-     working, click working on all five (including Previous/Next, tested with two queued
-     notifications), first with the reflection-based version and again after refining to the
-     wrapper-method version. Full history: `reports/notification-empty-until-fade-findings.md`'s
-     thirty-second and thirty-third rounds.
-- **Notification title/content text rendering visibly bolder under the Light theme than Dark**
-  (same font/size/weight in both — confirmed by decompile that font selection has no theme
-  dependency at all). Root cause: GDI's `TextRenderer.DrawText`'s transparent-background mode
-  needs to read back real destination pixels to blend anti-aliased edges correctly — works fine
-  against a live on-screen window (confirmed: the main mail list, also near-black-on-white,
-  renders with completely normal weight) but Wine's GDI apparently falls back to assuming a
-  *black* background when drawing into the OFFSCREEN bitmap this project's own text-in-bitmap fix
-  requires; Dark theme's real background is close enough to black that the wrong assumption
-  barely shows, Light theme's white background is about as far from black as possible. Fixed by
-  switching `OnPaintTitle`/`OnPaintContent`'s final draw call from `TextRenderer`/`TextRendererEx`
-  to GDI+'s `Graphics.DrawString` (`--patch-notification-text-drawstring`), which does its own
-  in-memory alpha compositing with no screen-read-back trick to go wrong — all upstream layout/
-  measurement (bounds, vertical centering, icon-width allowance) is untouched, still driven by the
-  same `TextRenderer.MeasureText`. A first fix attempt (passing an explicit `backColor` to force
-  GDI's opaque path instead) **crashed the app** — `NullReferenceException` deep in WinForms' own
-  `FontCache` internals, a separate Wine/.NET gap; reverted, documented as a dead end, do not
-  retry. Switching rendering engines surfaced five secondary regressions, all found via precise
-  pixel measurement against a confirmed-good reference screenshot (never eyeballed) and fixed in
-  the same round: content wrapping to 3 lines instead of 2 with an ellipsis (fixed with
-  `StringFormatFlags.LineLimit`); title losing its "…" truncation entirely, apparently another
-  Wine `gdiplus` gap (fixed with a hand-written manual measure-and-truncate helper,
-  `__truncateWithEllipsis`, reusing the same `TextRenderer.MeasureText` since measuring text never
-  renders pixels and was never implicated in the boldness bug); title rendering ~9px too low and
-  ~8px too far right, a genuine GDI-vs-GDI+ font-metrics discrepancy (internal leading and
-  left-side glyph bearing), fixed with empirically-measured pixel corrections applied only to the
-  value passed to `DrawString`, leaving the upstream rectangle computations untouched. **Content's
-  own X position took three attempts to get right** — first a "-16" correction from a measurement
-  bug (an automated scan latched onto a stray background pixel, not the real glyph), then an
-  overcorrection to "no adjustment needed" from comparing cross-session/cross-scale screenshots
-  (ambiguous, DPI-sensitive), both caught by the user pushing back and asking for a properly traced
-  measurement rather than accepting an assertion. **What actually resolved it**: a same-session,
-  same-DPI A/B deploy — the old, un-migrated `TextRenderer`-based build next to the new
-  `DrawString` one, both confirmed via `--patch-notification-geometry-diag` to compute identical
-  `contentRect`/`imageRect` values, isolating the entire visual difference to the rendering API
-  switch with no cross-session ambiguity at all. That comparison showed a genuine ~7px rightward
-  shift, fixed with a `-7` correction (mirroring title's own `-8`/`-9`). This same-session-A/B
-  technique is the one that should be reached for FIRST for any future "did switching rendering
-  mechanism X shift something by N pixels" question — not after two less rigorous comparisons have
-  already gone wrong. Final state confirmed via freshly-traced, native-resolution (no LANCZOS
-  smoothing) verification lines in both themes:
-  `supporting/notification-drawstring-fix-{light,dark}-theme.png`,
-  `supporting/notification-content-alignment-traced-proof.png`. Full history:
-  `reports/notification-empty-until-fade-findings.md`'s twenty-eighth through thirty-first rounds.
+**Fixed and confirmed working:**
+- Splash banner blurry — Wine's `gdiplus` doesn't implement `HighQualityBicubic`; forced to
+  `Bilinear`. `reports/gdiplus-interpolation-findings.md`
+- Splash tip showed tofu boxes — genuine emoji Wine can't render; replaced the glyph in the
+  resource string. `reports/splash-tip-icon-findings.md`
+- Settings category panel blank — `Load` event never fires under Wine; call it directly from the
+  constructor. `reports/settings-panel-clip-region-findings.md`
+- Settings category click crashed — Wine throws `NotImplementedException` for a COM API instead
+  of failing gracefully; catch it. `reports/default-mail-client-notimplemented-findings.md`
+- License activation failed silently — Wine's `bcrypt` RSA-OAEP decrypt is broken; replaced with
+  a BouncyCastle implementation. `reports/license-activation-oaep-findings.md`
+- License dialog button showed tofu boxes — literal bad bytes baked into the app's own resource,
+  not a Wine bug; fixed the bytes. `reports/license-icon-findings.md`
+- Docx attachments (and other extensions) wouldn't open — fresh bottle has no file-type
+  associations; import `.reg` files for the missing ones. `reports/office-file-associations-findings.md`
+- Settings grid occasionally didn't paint — Wine clip-region bug; added `AllPaintingInWmPaint`.
+  `reports/settings-panel-clip-region-findings.md`
 
-**Confirmed as a real, separate Wine bug, but not the cause of anything fixed above — patched
-anyway since it's a real bug and the fix is cheap:**
-- `ControlDataGrid`'s `WM_PAINT` could hit a Wine `BeginPaint`/`WM_NCPAINT` region-object-reuse
-  bug that collapses the client-area clip to `(0,0)-(0,0)`, silently discarding every draw call.
-  Worked around by adding `ControlStyles.AllPaintingInWmPaint` to `ControlDataGrid.initialize()`
-  (missing from the original code; WinForms recommends it for owner-drawn double-buffered
-  controls, and adding it changes the paint message sequence enough to avoid the bug). Confirmed
-  via trace: clip region and content-blit both correct after this patch. Detail in
-  `reports/settings-panel-clip-region-findings.md`.
+**Email notifications not displaying correctly until fade** — one root problem, several visible
+symptoms: `this` form's own window doesn't reliably paint or receive input under Wine, so content
+only ever appeared during the brief show/hide animation ticks. Fixed by baking everything into the
+reliably-blitted `layeredWindow` bitmap instead, and forwarding clicks/hover into `this` from
+`layeredWindow`. Full investigation, every dead end, every round: `reports/notification-empty-
+until-fade-findings.md`.
+  - Title/content text invisible until fade — baked into the bitmap
+    (`--patch-notification-text-in-bitmap` + 3 supporting flags, see deploy list below).
+  - A click fired its handler twice — missing unsubscribe before a re-subscribe
+    (`--patch-notification-click-resubscribe`).
+  - Close/settings icons invisible until fade — same bitmap-baking fix
+    (`--patch-notification-icon-bitmap`).
+  - Title overlapped the now-always-visible icons — width allowance was hover-gated
+    (`--patch-notification-title-icon-clip`).
+  - Text visibly bolder in Light theme — GDI's transparent-text blend assumes a black background
+    offscreen; switched to `Graphics.DrawString` (`--patch-notification-text-drawstring`).
+  - Hover didn't pause the auto-hide countdown, and didn't snap back to visible mid-fade —
+    forwarded mouse events from `layeredWindow` into `this`
+    (`--patch-notification-hover-forward`).
+  - Reply/flag/delete/previous/next icons invisible, not clickable, no hover — same
+    bitmap-baking + forwarding, extended to real `ControlToolStripButton` child controls
+    (`--patch-notification-toolbar-icons`).
 
-**Not started (scanned, not confirmed, not patched):**
-- Stage 2 of the interpolation fix — 7 more `HighQualityBicubic`(7) call sites, same pattern,
-  not yet trace-confirmed as user-visible bugs: `PictureBoxEx.OnPaint`,
-  `ControlDataGrid.DrawNoItems`, `formAbout.OnPaintBackground`,
-  `formDataAccounts.panel_Details_Paint`, `ControlItemCardsWithImage.DrawItemForeground`,
-  `DesktopAvatarManager.TryResizeAndSaveBitmap`, `ImageHandler.TryTranscodeAvatarAsPngOfOptimalSize`.
-  If pursued, fix value is **3 (Bilinear)**, confirmed by disassembly — not 6 or 2.
-- Stage 3 — 1 site in vendored `QRCoder.dll` (`QRCode.GetGraphic`), same pattern, optional
-  (only affects Settings → QR export).
-- Hold rows — `InterpolationMode.High` (2), 2 sites (`UIAvatar.GetImageSingleRes`,
-  `QRCoder.ArtQRCode.Resize`). Originally "no evidence either way"; now **confirmed broken** by
-  the same disassembly (High aliases to HighQualityBicubic internally). Promote to a stage if
-  pursued — don't leave as "Hold, no evidence", that reasoning is now stale.
+**Confirmed as a real, separate Wine bug, fixed opportunistically — unrelated to the above:**
+- `ControlDataGrid` could hit a Wine clip-region bug that silently discards paint calls; added
+  `AllPaintingInWmPaint`. `reports/settings-panel-clip-region-findings.md`
 
-**Not started (scanned, not confirmed, not patched):** Stage 2/3/Hold interpolation items above
-remain scanned-but-not-pursued if a future session wants to extend that work. The many dead
-ends ruled out on the way to the empty-box-until-fade fix (Invalidate() calls, forced
-SetLayeredWindowAttributes changes, opacity dip-and-recover sequences, the Cinnamon "Map"
-animation and X11 Sync-extension compositor hypotheses, a standalone repro app that never
-reproduced it, and more) remain fully documented in `reports/notification-empty-until-fade-
-findings.md` so none of them get re-tried — read that file's early rounds before starting any new
-notification-rendering investigation.
+**Not started (scanned, not confirmed):**
+- 7 more `HighQualityBicubic` call sites outside the splash screen — same fix (`Bilinear`) if
+  ever confirmed as user-visible.
+- 1 site in vendored `QRCoder.dll` (QR export only).
+- 2 `InterpolationMode.High` sites — confirmed broken by the same disassembly, not yet patched.
 
-- **Close/settings icon fix, previously paused then resumed and fully re-verified.** An apparent
-  freeze on hover/click was chased at length and traced entirely to the synthetic
-  `--patch-test-monogram-avatar` test trigger lacking a real backing mail item for its "open on
-  click" path, not a real bug — confirmed via a real incoming email that hover, close-click, and
-  settings-click all work correctly (settings menu itself opens and shows the expected items —
-  "Don't show popup for X" / "Customize notifications" / "Customize notifications for [account]",
-  matching `prepareContextMenu()`'s own logic exactly). Now deployed continuously as part of the
-  same base every later fix in this session built on. Full history: `reports/notification-empty-
-  until-fade-findings.md`'s twenty-eighth round.
-- **Hovering over the notification did not pause the auto-hide countdown**, and once paused by
-  any means, did not reliably resume it either (a real, intentional eM Client feature, confirmed
-  by the user from product knowledge, not a guess). Root-caused to the mechanism level: the
-  existing (unmodified) `timer_OnTimer`/`OnMouseEnter`/`OnMouseLeave` logic was correct, gated on
-  a `mouseOver` field that `this` form's own `OnMouseEnter`/`OnMouseLeave` need real Wine mouse
-  messages to maintain — which `this` doesn't reliably receive (the same underlying gap the
-  already-fixed click-routing bug, Stage 8, worked around specifically for *clicks* by forwarding
-  from `layeredWindow`, but no equivalent forwarding existed for hover events). Fixed with
-  `--patch-notification-hover-forward`: extends `LayeredForm.WndProc`'s existing WM_SETCURSOR-
-  based click-synthesis (Stage 8) to ALSO detect HIWORD=512 (`WM_MOUSEMOVE`'s own identity) and
-  synthesize `OnMouseMove()` on `layeredWindow`, then a new `layeredWindow_MouseMove` handler on
-  `FormGenericNotification` forwards that into `this`'s own `OnMouseEnter`/`OnMouseMove`/
-  `OnMouseLeave` — mirroring `layeredWindow_Click`'s already-proven forwarding pattern exactly.
-  Hovering during the static hold now correctly pauses the countdown, and moving off resumes it.
-  A second requirement — hovering during an ALREADY-STARTED fade should snap the notification
-  instantly back to fully visible, not gradually re-fade — was first implemented by calling the
-  existing public `Reshow()` method, which worked but visibly re-faded in slowly (user: "it fades
-  back in slowly.... it should snap striaght to fully visible") since `Reshow()` routes through
-  `Show()`'s `Disappearing` case (gradual `Appearing` re-fade), not its instant-snap
-  `Appearing`/`Visible` case. Fixed by bypassing `Show()`/`Reshow()` entirely and directly
-  replicating `OnShown`'s own instant-snap field manipulation
-  (`state = Visible; alphaIncrement = 0f; timer.Interval = timeToStay; Opacity = 1.0;`) —
-  deliberately not modifying the shared `Show()`/`Reshow()` methods themselves, since other
-  callers (e.g. advancing to a queued notification) may rely on their existing gradual-fade
-  behavior. User confirmed both behaviors live across multiple trigger cycles: "So that's those
-  two interim bugs fixed." Full history: `reports/notification-empty-until-fade-findings.md`'s
-  thirty-first(b)/hover-forward rounds.
-
-**None of the notification fixes above are folded into `releases/<version>/deploy.sh` yet**
-(same standing gap as Stage 8) — apply manually, in this order, on top of Stage 7's output (or
-Stage 8's, for the click-dispatch fix too): `--patch-notification-text-in-bitmap`,
+**Deploy status**: Stages 1–7 are in `releases/<version>/deploy.sh`. Everything else above is
+still applied manually via `~/tools/il-patcher`: Stage 8
+(`--patch-notification-click-resubscribe`), then in order `--patch-notification-text-in-bitmap`,
 `--patch-notification-refresh-on-content-change`, `--patch-notification-periodic-reblit`,
 `--patch-notification-suppress-self-text-only`, `--patch-notification-icon-bitmap`,
 `--patch-notification-title-icon-clip`, `--patch-notification-text-drawstring`,
-`--patch-notification-hover-forward`, `--patch-notification-toolbar-icons`. This is exactly the
-chain baked into this session's `il-patches/output-icons3/` → `output-toolbar5/` lineage
-(gitignored build output, regenerate via the flags above against a fresh `original/` rather than
-copying those directories).
+`--patch-notification-hover-forward`, `--patch-notification-toolbar-icons`. Folding these into
+`deploy.sh` is pending a fresh rebuild-and-diff verification pass from `original/`.
 
 ## Investigation method (what actually worked this round)
 
