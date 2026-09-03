@@ -4782,27 +4782,38 @@ static int RunPatchDiagToolstripControls(string[] args)
 // OnMouseEnter/OnMouseLeave, though, are `protected`, declared on a class in a different assembly
 // (MailClient.Common.UI.dll) than FormMailNotification (MailClient.dll) -- calling them directly
 // from an unrelated class would violate CLR member accessibility. Rather than reimplementing their
-// genuinely complex, theme/hover/tint-dependent paint logic by hand, this reuses them via
-// reflection (Type.GetMethod(NonPublic|Instance) + MethodBase.Invoke, via a small shared
-// __invokeProtected helper below).
+// genuinely complex, theme/hover/tint-dependent paint logic by hand, this reuses them.
 //
-// **A first attempt instead flipped OnPaint/OnMouseEnter/OnMouseLeave's own visibility from
-// protected to public directly in MailClient.Common.UI.dll** (the user's own suggestion, since
-// this is raw IL editing anyway -- no reflection, no object[] boxing, seemingly the cleaner fix).
-// It decompiled clean and deployed without error, but broke icon rendering on EVERY toolbar
-// button across the entire app (confirmed live via screenshot -- user: "The whole UI is broken
-// now"), not just the notification's own buttons: ControlToolStripButton is the shared control
-// behind every toolbar in eM Client, and the C# compiler's rule against widening an override's
-// accessibility beyond its base declaration turned out to matter at the CLR level too, not just
-// at compile time -- the mismatch broke the type broadly, not just the one call site being
-// touched. Reverted immediately (redeployed the pre-patch build, confirmed via screenshot the
-// whole UI was back to normal). Lesson for this project: editing a *shared library* type's own
-// member metadata (visibility, and likely anything else affecting its public contract) needs a
-// blast-radius check across its OTHER call sites before deploying, not just the one feature path
-// being worked on -- unlike every other patch in this file, which only ever touches methods
-// specific to the one type/feature being fixed. Reflection has real costs (more code, a
-// string-based method lookup that could silently no-op if the name's ever wrong) but has zero
-// blast radius outside the new methods that use it, which is worth the trade here.
+// **How this patch reaches across that accessibility boundary went through three iterations,
+// each worth remembering:**
+// 1. First attempt: WIDEN OnPaint/OnMouseEnter/OnMouseLeave's own visibility from protected to
+//    public directly in MailClient.Common.UI.dll (the user's own suggestion, since this is raw IL
+//    editing anyway). Decompiled clean, deployed without error -- but broke icon rendering on
+//    EVERY toolbar button across the entire app (confirmed live via screenshot -- user: "The
+//    whole UI is broken now"), not just this notification's own buttons: ControlToolStripButton
+//    is the shared control behind every toolbar in eM Client, and the C# compiler's rule against
+//    widening an override's accessibility beyond its base declaration turned out to matter at the
+//    CLR level too, not just at compile time -- the mismatch broke the type broadly. Reverted
+//    immediately (screenshot-confirmed the recovery). Lesson: editing a *shared library* type's
+//    own member metadata needs a blast-radius check across its OTHER call sites first.
+// 2. Second attempt: reflection (Type.GetMethod(NonPublic|Instance) + MethodBase.Invoke, via a
+//    shared __invokeProtected helper). Zero blast radius -- touches nothing outside
+//    FormMailNotification's own new methods -- and it worked. But it's real overhead: an
+//    object[]-boxing call site for every paint/hover event, and a string-based method-name lookup
+//    that could silently no-op if a name's ever mistyped, with no compiler to catch it.
+// 3. **This version**: adds three brand-new PUBLIC wrapper methods to ControlToolStripButton
+//    itself -- RaisePaint(PaintEventArgs)/RaiseMouseEnter(EventArgs)/RaiseMouseLeave(EventArgs),
+//    each just calling the corresponding protected On* method from within the SAME class (legal --
+//    protected access from the declaring type itself is always fine, no CLR accessibility issue).
+//    These are NEW, ADDITIVE members: nothing about any EXISTING method changes, so there's no
+//    override-accessibility mismatch to trigger attempt 1's failure mode, and no existing call
+//    site anywhere else in the app is affected -- confirmed by re-running the exact same
+//    blast-radius check attempt 1 skipped (a normal, unrelated toolbar button, screenshot-
+//    verified unaffected) before ever calling this "done". FormMailNotification then calls
+//    button.RaisePaint(...)/button.RaiseMouseEnter(...)/button.RaiseMouseLeave(...) directly, a
+//    normal Callvirt -- no reflection, no string lookup, no object[] boxing. Strictly better than
+//    both earlier attempts: the "no reflection" property attempt 1 was after, without its blast
+//    radius.
 //
 // Confirmed live (before this patch) that native click routing does NOT work on these controls
 // either, matching everything else in this project that lives on `this` form's own unreliable
@@ -4820,7 +4831,7 @@ static int RunPatchDiagToolstripControls(string[] args)
 //   - __toolbarButtonRect(ControlToolStripButton) -> Rectangle -- tableLayoutPanel1.Bounds.Location
 //     + button.Bounds, translated into `this`-relative coordinates
 //   - __drawToolbarButton(Graphics, ControlToolStripButton) -- translates to the button's rect,
-//     calls its real (protected) OnPaint via __invokeProtected, translates back
+//     calls its real OnPaint via the new RaisePaint wrapper, translates back
 //   - a NEW override of updateBackgroundBitmap() -- calls base (draws everything the existing
 //     chain already does, title/content/close/settings/border), then draws all 5 toolbar buttons
 //     on top via __drawToolbarButton (skipping any not currently Visible -- previous/next are only
@@ -4829,9 +4840,8 @@ static int RunPatchDiagToolstripControls(string[] args)
 //   - a NEW override of OnMouseMove(MouseEventArgs) -- calls base first (preserves existing close/
 //     settings hover, unaffected since it lives in a different Y range), then for each Visible
 //     button compares __toolbarButtonRect(button).Contains(e.Location) against its own mouseOverX
-//     field, forwarding OnMouseEnter/OnMouseLeave into the real (protected) button methods via __invokeProtected
-//     directly on change, and calling updateLayeredBackground(refreshBitmap: true) once if
-//     anything changed
+//     field, forwarding into the real button's RaiseMouseEnter/RaiseMouseLeave wrappers directly
+//     on change, and calling updateLayeredBackground(refreshBitmap: true) once if anything changed
 //   - a NEW override of performMouseClick(Point) -- checks all 5 toolbar rects FIRST (priority
 //     over contentRect's overlapping hit-test region -- see above), calling the real, unmodified,
 //     already-private click handlers (Replyaction/Flag/Delete/button_Previous_Click/
@@ -4855,15 +4865,75 @@ static int RunPatchNotificationToolbarIcons(string[] args)
     Directory.CreateDirectory(outDir);
 
     const string targetAssembly = "MailClient.dll";
+    const string commonUiAssembly = "MailClient.Common.UI.dll";
     const string targetType = "MailClient.UI.Forms.NotificationForms.FormMailNotification";
+    const string buttonTypeName = "MailClient.Common.UI.Controls.ControlToolStrip.ControlToolStripButton";
 
     var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
     bool patchedMailClient = false;
+    bool patchedCommonUi = false;
 
     foreach (var dllPath in allDlls)
     {
         string fileName = Path.GetFileName(dllPath);
         string destPath = Path.Combine(outDir, fileName);
+
+        // Adds three brand-new PUBLIC wrapper methods to ControlToolStripButton --
+        // RaisePaint/RaiseMouseEnter/RaiseMouseLeave, each just calling the corresponding
+        // PROTECTED OnPaint/OnMouseEnter/OnMouseLeave from within the SAME class (legal --
+        // protected access from the declaring type itself is always fine). This is the refined
+        // approach after a first attempt WIDENED OnPaint/OnMouseEnter/OnMouseLeave's own
+        // visibility from protected to public, which broke icon rendering app-wide (see
+        // IL-patching lesson 10) -- these are NEW, ADDITIVE members instead, so no existing
+        // method's accessibility changes and no existing call site anywhere else in the app is
+        // affected. FormMailNotification below calls these new wrappers directly (no reflection).
+        if (fileName == commonUiAssembly)
+        {
+            var resolver0 = new DefaultAssemblyResolver();
+            resolver0.AddSearchDirectory(inDir);
+            using var commonModule = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+            {
+                AssemblyResolver = resolver0,
+                ReadWrite = false
+            });
+
+            var buttonType = commonModule.GetType(buttonTypeName);
+            if (buttonType is null) { Console.Error.WriteLine($"FAIL: type not found: {buttonTypeName}"); return 1; }
+
+            var onPaintDef = buttonType.Methods.FirstOrDefault(m => m.Name == "OnPaint" && m.Parameters.Count == 1);
+            var onMouseEnterDef = buttonType.Methods.FirstOrDefault(m => m.Name == "OnMouseEnter" && m.Parameters.Count == 1);
+            var onMouseLeaveDef = buttonType.Methods.FirstOrDefault(m => m.Name == "OnMouseLeave" && m.Parameters.Count == 1);
+            if (onPaintDef is null || onMouseEnterDef is null || onMouseLeaveDef is null)
+            { Console.Error.WriteLine("FAIL: OnPaint/OnMouseEnter/OnMouseLeave not found on ControlToolStripButton"); return 1; }
+
+            string[] existingNames = { "RaisePaint", "RaiseMouseEnter", "RaiseMouseLeave" };
+            foreach (var n in existingNames)
+            {
+                if (buttonType.Methods.Any(m => m.Name == n))
+                { Console.Error.WriteLine($"FAIL: {buttonTypeName} already has a method named {n} -- naming collision, pick a different wrapper name"); return 1; }
+            }
+
+            MethodDefinition MakeWrapper(string name, MethodDefinition target)
+            {
+                var wrapper = new MethodDefinition(name, MethodAttributes.Public | MethodAttributes.HideBySig, commonModule.TypeSystem.Void);
+                wrapper.Parameters.Add(new ParameterDefinition("e", ParameterAttributes.None, target.Parameters[0].ParameterType));
+                var wil = wrapper.Body.GetILProcessor();
+                wil.Emit(OpCodes.Ldarg_0);
+                wil.Emit(OpCodes.Ldarg_1);
+                wil.Emit(OpCodes.Call, target);
+                wil.Emit(OpCodes.Ret);
+                return wrapper;
+            }
+
+            buttonType.Methods.Add(MakeWrapper("RaisePaint", onPaintDef));
+            buttonType.Methods.Add(MakeWrapper("RaiseMouseEnter", onMouseEnterDef));
+            buttonType.Methods.Add(MakeWrapper("RaiseMouseLeave", onMouseLeaveDef));
+
+            Console.WriteLine($"OK   {fileName}: {buttonTypeName} -- added RaisePaint/RaiseMouseEnter/RaiseMouseLeave public wrapper methods (OnPaint/OnMouseEnter/OnMouseLeave themselves untouched)");
+            patchedCommonUi = true;
+            commonModule.Write(destPath);
+            continue;
+        }
 
         if (fileName != targetAssembly)
         {
@@ -4993,21 +5063,32 @@ static int RunPatchNotificationToolbarIcons(string[] args)
             && m.Parameters[0].ParameterType.Name == "Graphics" && m.Parameters[1].ParameterType.Name == "Rectangle");
         if (paintEventArgsCtor is null) { Console.Error.WriteLine("FAIL: PaintEventArgs(Graphics, Rectangle) ctor not found"); return 1; }
         var paintEventArgsCtorRef = module.ImportReference(paintEventArgsCtor);
+        var paintEventArgsTypeRef = module.ImportReference(paintEventArgsTypeDef);
 
         // EventArgs.Empty -- a static READONLY FIELD (not a property -- GetProperty("Empty")
         // returns null, confirmed the hard way), for the click-handler and OnMouseEnter/Leave
         // calls. EventArgs is CoreLib-forwarded, lesson 5-safe.
         var eventArgsEmptyFieldRef = module.ImportReference(typeof(EventArgs).GetField("Empty")!);
+        var eventArgsTypeRef = eventArgsEmptyFieldRef.FieldType;
         var boolTypeRef = module.TypeSystem.Boolean;
-        var objectTypeRef = module.TypeSystem.Object;
 
-        // Reflection plumbing for __invokeProtected below -- all CoreLib-forwarded (Type,
-        // MethodBase, BindingFlags), lesson-5-safe to reflect on the patcher's own process for.
-        MethodReference Import(System.Reflection.MethodBase mb) => module.ImportReference(mb);
-        var objectGetType = Import(typeof(object).GetMethod("GetType", Type.EmptyTypes)!);
-        var typeGetMethod = Import(typeof(Type).GetMethod("GetMethod", new[] { typeof(string), typeof(System.Reflection.BindingFlags) })!);
-        var methodBaseInvoke = Import(typeof(System.Reflection.MethodBase).GetMethod("Invoke", new[] { typeof(object), typeof(object[]) })!);
-        int nonPublicInstanceFlags = (int)(System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        // RaisePaint/RaiseMouseEnter/RaiseMouseLeave -- new PUBLIC wrapper methods added to
+        // ControlToolStripButton by the commonUiAssembly branch above (same patch run, always
+        // applied together), each just calling the real protected OnPaint/OnMouseEnter/
+        // OnMouseLeave from within that class. Called directly here, no reflection needed. Built
+        // as plain MethodReferences (not resolved off buttonTypeDef, which was read from the
+        // INPUT directory's copy of MailClient.Common.UI.dll -- the wrapper methods only exist in
+        // the OUTPUT copy the commonUiAssembly branch above just wrote) -- their signature is
+        // already fully known (matches MakeWrapper's own shape above), so this is safe.
+        MethodReference MakeWrapperRef(string name, TypeReference paramType)
+        {
+            var r = new MethodReference(name, module.TypeSystem.Void, buttonTypeRef) { HasThis = true };
+            r.Parameters.Add(new ParameterDefinition(paramType));
+            return r;
+        }
+        var raisePaintRef = MakeWrapperRef("RaisePaint", paintEventArgsTypeRef);
+        var raiseMouseEnterRef = MakeWrapperRef("RaiseMouseEnter", eventArgsTypeRef);
+        var raiseMouseLeaveRef = MakeWrapperRef("RaiseMouseLeave", eventArgsTypeRef);
 
         // --- five new private bool fields ---
         var mouseOverFields = new FieldDefinition[5];
@@ -5017,42 +5098,6 @@ static int RunPatchNotificationToolbarIcons(string[] args)
             type.Fields.Add(f);
             mouseOverFields[i] = f;
         }
-
-        // --- __invokeProtected(object target, string methodName, object[] args) ---
-        // Calls a protected instance method on a foreign-assembly object via reflection, since a
-        // direct call would violate CLR member accessibility (see note above on why this isn't
-        // done by widening the target method's own visibility instead).
-        var invokeProtectedMethod = new MethodDefinition("__invokeProtected",
-            MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig,
-            module.TypeSystem.Void);
-        invokeProtectedMethod.Parameters.Add(new ParameterDefinition("target", ParameterAttributes.None, objectTypeRef));
-        invokeProtectedMethod.Parameters.Add(new ParameterDefinition("methodName", ParameterAttributes.None, module.TypeSystem.String));
-        invokeProtectedMethod.Parameters.Add(new ParameterDefinition("args", ParameterAttributes.None, new ArrayType(objectTypeRef)));
-        {
-            var body = invokeProtectedMethod.Body;
-            var il = body.GetILProcessor();
-            var miLocal = new VariableDefinition(module.ImportReference(typeof(System.Reflection.MethodInfo)));
-            body.Variables.Add(miLocal);
-            body.InitLocals = true;
-
-            var retInstr = Instruction.Create(OpCodes.Ret);
-
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Callvirt, objectGetType);
-            il.Emit(OpCodes.Ldarg_1);
-            il.Emit(OpCodes.Ldc_I4, nonPublicInstanceFlags);
-            il.Emit(OpCodes.Callvirt, typeGetMethod);
-            il.Emit(OpCodes.Stloc, miLocal);
-            il.Emit(OpCodes.Ldloc, miLocal);
-            il.Emit(OpCodes.Brfalse, retInstr);
-            il.Emit(OpCodes.Ldloc, miLocal);
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Ldarg_2);
-            il.Emit(OpCodes.Callvirt, methodBaseInvoke);
-            il.Emit(OpCodes.Pop);
-            il.Append(retInstr);
-        }
-        type.Methods.Add(invokeProtectedMethod);
 
         // --- __toolbarButtonRect(ControlToolStripButton button) -> Rectangle ---
         var toolbarRectMethod = new MethodDefinition("__toolbarButtonRect",
@@ -5119,10 +5164,8 @@ static int RunPatchNotificationToolbarIcons(string[] args)
             var body = drawToolbarButtonMethod.Body;
             var il = body.GetILProcessor();
             var rLocal = new VariableDefinition(rectangleTypeRef);
-            var argsLocal = new VariableDefinition(new ArrayType(objectTypeRef));
             var stateLocal = new VariableDefinition(graphicsStateTypeRef);
             body.Variables.Add(rLocal);
-            body.Variables.Add(argsLocal);
             body.Variables.Add(stateLocal);
             body.InitLocals = true;
 
@@ -5144,12 +5187,8 @@ static int RunPatchNotificationToolbarIcons(string[] args)
             il.Emit(OpCodes.Conv_R4);
             il.Emit(OpCodes.Callvirt, translateTransformRef);
 
-            // __invokeProtected(button, "OnPaint", new object[] { new PaintEventArgs(g, new Rectangle(0, 0, r.Width, r.Height)) });
-            il.Emit(OpCodes.Ldc_I4_1);
-            il.Emit(OpCodes.Newarr, objectTypeRef);
-            il.Emit(OpCodes.Stloc, argsLocal);
-            il.Emit(OpCodes.Ldloc, argsLocal);
-            il.Emit(OpCodes.Ldc_I4_0);
+            // button.RaisePaint(new PaintEventArgs(g, new Rectangle(0, 0, r.Width, r.Height)));
+            il.Emit(OpCodes.Ldarg_2);
             il.Emit(OpCodes.Ldarg_1);
             il.Emit(OpCodes.Ldc_I4_0);
             il.Emit(OpCodes.Ldc_I4_0);
@@ -5159,12 +5198,7 @@ static int RunPatchNotificationToolbarIcons(string[] args)
             il.Emit(OpCodes.Call, rectGetHeightRef);
             il.Emit(OpCodes.Newobj, rectCtor4Ref);
             il.Emit(OpCodes.Newobj, paintEventArgsCtorRef);
-            il.Emit(OpCodes.Stelem_Ref);
-
-            il.Emit(OpCodes.Ldarg_2);
-            il.Emit(OpCodes.Ldstr, "OnPaint");
-            il.Emit(OpCodes.Ldloc, argsLocal);
-            il.Emit(OpCodes.Call, invokeProtectedMethod);
+            il.Emit(OpCodes.Callvirt, raisePaintRef);
 
             il.Emit(OpCodes.Ldarg_1);
             il.Emit(OpCodes.Ldloc, stateLocal);
@@ -5219,27 +5253,9 @@ static int RunPatchNotificationToolbarIcons(string[] args)
             il.Emit(OpCodes.Callvirt, translateTransformRef);
             il.Append(afterShadow);
 
-            var appendAllTextRef = Import(typeof(File).GetMethod("AppendAllText", new[] { typeof(string), typeof(string) })!);
-            var stringConcat2Ref = Import(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) })!);
-            var diagRectLocal = new VariableDefinition(rectangleTypeRef);
-            body.Variables.Add(diagRectLocal);
             foreach (var bf in buttonFields)
             {
                 var skip = Instruction.Create(OpCodes.Nop);
-                // "TOOLBARPAINT <name> rect=" + __toolbarButtonRect(this.bf).ToString() + " begin\n"
-                il.Emit(OpCodes.Ldstr, @"Z:\tmp\claude-diag.log");
-                il.Emit(OpCodes.Ldstr, "TOOLBARPAINT " + bf.Name + " rect=");
-                il.Emit(OpCodes.Ldarg_0);
-                il.Emit(OpCodes.Ldarg_0);
-                il.Emit(OpCodes.Ldfld, bf);
-                il.Emit(OpCodes.Call, toolbarRectMethod);
-                il.Emit(OpCodes.Stloc, diagRectLocal);
-                il.Emit(OpCodes.Ldloca, diagRectLocal);
-                il.Emit(OpCodes.Call, rectToStringRef);
-                il.Emit(OpCodes.Call, stringConcat2Ref);
-                il.Emit(OpCodes.Ldstr, " begin\n");
-                il.Emit(OpCodes.Call, stringConcat2Ref);
-                il.Emit(OpCodes.Call, appendAllTextRef);
                 il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Ldfld, bf);
                 il.Emit(OpCodes.Callvirt, getVisibleRef);
@@ -5250,9 +5266,6 @@ static int RunPatchNotificationToolbarIcons(string[] args)
                 il.Emit(OpCodes.Ldfld, bf);
                 il.Emit(OpCodes.Call, drawToolbarButtonMethod);
                 il.Append(skip);
-                il.Emit(OpCodes.Ldstr, @"Z:\tmp\claude-diag.log");
-                il.Emit(OpCodes.Ldstr, "TOOLBARPAINT " + bf.Name + " end\n");
-                il.Emit(OpCodes.Call, appendAllTextRef);
             }
 
             il.Emit(OpCodes.Ldloc, gLocal);
@@ -5321,20 +5334,14 @@ static int RunPatchNotificationToolbarIcons(string[] args)
                 il.Emit(OpCodes.Call, rectContainsRef);
                 il.Emit(OpCodes.Brfalse, notContained);
 
-                // contained: if (!mouseOverX) { __invokeProtected(button, "OnMouseEnter", new object[]{EventArgs.Empty}); mouseOverX = true; anyChanged = true; }
+                // contained: if (!mouseOverX) { button.RaiseMouseEnter(EventArgs.Empty); mouseOverX = true; anyChanged = true; }
                 il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Ldfld, mf);
                 il.Emit(OpCodes.Brtrue, afterEnterCheck);
                 il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Ldfld, bf);
-                il.Emit(OpCodes.Ldstr, "OnMouseEnter");
-                il.Emit(OpCodes.Ldc_I4_1);
-                il.Emit(OpCodes.Newarr, objectTypeRef);
-                il.Emit(OpCodes.Dup);
-                il.Emit(OpCodes.Ldc_I4_0);
                 il.Emit(OpCodes.Ldsfld, eventArgsEmptyFieldRef);
-                il.Emit(OpCodes.Stelem_Ref);
-                il.Emit(OpCodes.Call, invokeProtectedMethod);
+                il.Emit(OpCodes.Callvirt, raiseMouseEnterRef);
                 il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Ldc_I4_1);
                 il.Emit(OpCodes.Stfld, mf);
@@ -5343,21 +5350,15 @@ static int RunPatchNotificationToolbarIcons(string[] args)
                 il.Append(afterEnterCheck);
                 il.Emit(OpCodes.Br, skipAll);
 
-                // not contained: if (mouseOverX) { __invokeProtected(button, "OnMouseLeave", new object[]{EventArgs.Empty}); mouseOverX = false; anyChanged = true; }
+                // not contained: if (mouseOverX) { button.RaiseMouseLeave(EventArgs.Empty); mouseOverX = false; anyChanged = true; }
                 il.Append(notContained);
                 il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Ldfld, mf);
                 il.Emit(OpCodes.Brfalse, afterLeaveCheck);
                 il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Ldfld, bf);
-                il.Emit(OpCodes.Ldstr, "OnMouseLeave");
-                il.Emit(OpCodes.Ldc_I4_1);
-                il.Emit(OpCodes.Newarr, objectTypeRef);
-                il.Emit(OpCodes.Dup);
-                il.Emit(OpCodes.Ldc_I4_0);
                 il.Emit(OpCodes.Ldsfld, eventArgsEmptyFieldRef);
-                il.Emit(OpCodes.Stelem_Ref);
-                il.Emit(OpCodes.Call, invokeProtectedMethod);
+                il.Emit(OpCodes.Callvirt, raiseMouseLeaveRef);
                 il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Ldc_I4_0);
                 il.Emit(OpCodes.Stfld, mf);
@@ -5430,13 +5431,14 @@ static int RunPatchNotificationToolbarIcons(string[] args)
         }
         type.Methods.Add(newPerformMouseClick);
 
-        Console.WriteLine($"OK   {fileName}: {targetType} -- added updateBackgroundBitmap/OnMouseMove/performMouseClick overrides (bitmap-baked paint + hover-forward + click hit-testing) for button_Reply/button_Flag/button_Delete/button_Previous/button_Next, reaching their real protected OnPaint/OnMouseEnter/OnMouseLeave via reflection (__invokeProtected) -- no changes to MailClient.Common.UI.dll");
+        Console.WriteLine($"OK   {fileName}: {targetType} -- added updateBackgroundBitmap/OnMouseMove/performMouseClick overrides (bitmap-baked paint + hover-forward + click hit-testing) for button_Reply/button_Flag/button_Delete/button_Previous/button_Next, calling their real OnPaint/OnMouseEnter/OnMouseLeave via the new RaisePaint/RaiseMouseEnter/RaiseMouseLeave wrapper methods (no reflection)");
         patchedMailClient = true;
 
         module.Write(destPath);
     }
 
     if (!patchedMailClient) { Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}"); return 1; }
+    if (!patchedCommonUi) { Console.Error.WriteLine($"FAIL: {commonUiAssembly} not found in {inDir}"); return 1; }
 
     return 0;
 

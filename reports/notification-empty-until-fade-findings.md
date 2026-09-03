@@ -2593,3 +2593,57 @@ User confirmed live, after the Save/Restore fix: "All icons appeared. hover work
 flag/delete worked. I sent two and got the arrows working as well and they appeard tow ork as
 well." -- all five icons (including Previous/Next, tested with two queued notifications) fully
 working: visible in the correct position, hover-tint correct, click correct.
+
+## Thirty-third round: refining reflection down to plain wrapper methods, before folding into
+## deploy.sh
+
+With the toolbar-icons fix confirmed working end to end, the user asked to pause before folding
+it into `deploy.sh` and review the whole thing holistically: "We tried reflection before we tried
+changing visibility modifiers, which in this case didn't work, but was a cleaner easier approach
+to have taken had it worked. Let's review what we've done and consider if it's the cleanest way
+to approach this all".
+
+Re-examining the shipped design: the actual problem with attempt 1 (widening
+`OnPaint`/`OnMouseEnter`/`OnMouseLeave`'s own visibility) wasn't that `ControlToolStripButton`
+needed a public entry point at all -- it was mutating the accessibility of EXISTING methods the
+whole app already depends on. There's a middle ground between that and reflection: add brand-new,
+purely ADDITIVE public wrapper methods to `ControlToolStripButton` instead --
+`RaisePaint(PaintEventArgs e) => OnPaint(e);`, `RaiseMouseEnter(EventArgs e) =>
+OnMouseEnter(e);`, `RaiseMouseLeave(EventArgs e) => OnMouseLeave(e);`. Calling a class's own
+protected members from a new method declared on that SAME class is always legal (protected access
+from the declaring type itself is unrestricted) -- no CLR accessibility issue, and since these are
+new members rather than edits to existing ones, there's no override-accessibility mismatch to
+trigger attempt 1's failure mode, and no existing call site anywhere else in the app can possibly
+be affected (nothing else calls a method that didn't exist before). `FormMailNotification` then
+calls `button.RaisePaint(pe)`/`button.RaiseMouseEnter(EventArgs.Empty)`/
+`button.RaiseMouseLeave(EventArgs.Empty)` directly -- a normal `Callvirt`, eliminating
+`__invokeProtected` and all the `Type.GetMethod`/`MethodBase.Invoke`/`object[]` plumbing entirely.
+
+Implementation: `--patch-notification-toolbar-icons` was extended to touch
+`MailClient.Common.UI.dll` again (its `MailClient.Common.UI.Controls.ControlToolStrip
+.ControlToolStripButton`), this time only ADDING three new methods (never touching
+`OnPaint`/`OnMouseEnter`/`OnMouseLeave`'s own `MethodAttributes` at all). One real construction
+bug hit and fixed before ever deploying: the new `RaisePaintRef`/etc. `MethodReference`s were
+initially resolved by searching `buttonTypeDef` (an already-resolved `TypeDefinition`) for a
+method named `RaisePaint` -- but `buttonTypeDef` was resolved from the INPUT directory's copy of
+`MailClient.Common.UI.dll`, which doesn't have the new methods (only the OUTPUT copy the
+`commonUiAssembly` branch had just written does) -- so the lookup always returned null. Fixed by
+building plain `MethodReference` objects by hand instead (name, return type `void`, declaring
+type = the already-imported `ControlToolStripButton` type reference, one parameter of the already-
+known `PaintEventArgs`/`EventArgs` type), since the new methods' full signature was already known
+at patch-authoring time -- no need to resolve them from a file at all.
+
+Verification repeated the full checklist, plus the specific blast-radius check attempt 1 skipped:
+decompiled `MailClient.Common.UI.dll`'s `ControlToolStripButton` and confirmed `OnPaint`/
+`OnMouseEnter`/`OnMouseLeave` were still `protected override`, completely untouched, with the
+three new methods `public` alongside them; decompiled `FormMailNotification`'s
+`__drawToolbarButton`/`OnMouseMove` and confirmed clean, direct `RaisePaint`/`RaiseMouseEnter`/
+`RaiseMouseLeave` calls with no reflection anywhere; `--dump-handlers` on every touched/new
+method; confirmed `QRCoder.dll` byte-identical to the pre-patch baseline (untouched by this patch
+at all, so no need to re-scan it for the interpolation-mode regression check, which hit repeated
+OOM kills this round from cumulative session memory pressure -- a resource issue, not a code
+issue); and, before ever testing the actual notification again, deployed and screenshotted the
+WHOLE app's toolbar UI to confirm it was unaffected -- the exact check that would have caught
+attempt 1's regression immediately, now made a standing step for any future patch that touches a
+shared type. User confirmed live: "test email seemed to work well" -- all five icons working
+exactly as they did with the reflection-based version, this time via direct calls.

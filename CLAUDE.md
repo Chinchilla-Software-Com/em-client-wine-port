@@ -435,21 +435,21 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   `__toolbarButtonRect` helper (`tableLayoutPanel1.Bounds.Location` + `button.Bounds`, translated
   into `this`-relative coordinates), an `updateBackgroundBitmap()` override that bakes all five
   buttons' real rendered output into `backgroundBitmap` (the same reliable `layeredWindow` blit
-  path proven for text/close/settings) by reusing each button's own real `OnPaint` via reflection
-  (`__invokeProtected`, a `Type.GetMethod(NonPublic|Instance)` + `MethodBase.Invoke` helper) rather
-  than reimplementing the theme/hover/tint logic by hand, an `OnMouseMove` override forwarding
-  synthetic `OnMouseEnter`/`OnMouseLeave` into whichever real button the cursor is over (same
-  reflection helper) so each button's own hover-tint state updates correctly, and a
-  `performMouseClick` override checking all five buttons' rects FIRST — priority matters here,
-  since `contentRect`'s hit-test rectangle genuinely overlaps the toolbar strip's Y range
-  (confirmed via `--patch-notification-geometry-diag`: `content={Y=56,Height=64}` vs. the
-  toolbar's `Y=94..116`) — calling the real, unmodified click handlers
+  path proven for text/close/settings) by calling each button's own real `OnPaint` through a new
+  `RaisePaint(PaintEventArgs)` public wrapper method added to `ControlToolStripButton` itself
+  (see mistake 1 below for how this settled — not reimplementing the theme/hover/tint logic by
+  hand), an `OnMouseMove` override forwarding into whichever real button the cursor is over via
+  matching `RaiseMouseEnter`/`RaiseMouseLeave` wrappers so each button's own hover-tint state
+  updates correctly, and a `performMouseClick` override checking all five buttons' rects FIRST —
+  priority matters here, since `contentRect`'s hit-test rectangle genuinely overlaps the toolbar
+  strip's Y range (confirmed via `--patch-notification-geometry-diag`: `content={Y=56,Height=64}`
+  vs. the toolbar's `Y=94..116`) — calling the real, unmodified click handlers
   (`Replyaction`/`Flag`/`Delete`/`button_Previous_Click`/`button_Next_Click`) directly, only
   falling through to `base.performMouseClick` if none matched. `button_Previous`/`button_Next`
   are only `Visible` when multiple notifications are queued (`notifications.Count > 1`) and their
   `Bounds` are stale/unreliable while hidden (confirmed via diagnostic) — both the paint and
   click/hover overrides skip any button that isn't currently `Visible`.
-  **Two real mistakes made and fixed along the way, both worth remembering:**
+  **Three real mistakes/iterations on the way to the final design, all worth remembering:**
   1. A first attempt widened `OnPaint`/`OnMouseEnter`/`OnMouseLeave`'s own visibility from
      `protected` to `public` directly in `MailClient.Common.UI.dll` (the user's own suggestion,
      since this is raw IL editing anyway — no reflection needed if the target methods are just
@@ -459,14 +459,29 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
      override's accessibility mismatch against its base declaration (something the C# compiler
      blocks at compile time) turned out to matter at the CLR level too, breaking the type broadly
      rather than just the one call site being touched. Reverted immediately (screenshot-confirmed
-     both the break and the recovery). **Lesson: editing a *shared library* type's own member
-     metadata (visibility, and likely anything else affecting its public contract) needs a
-     blast-radius check across its OTHER call sites before deploying, not just the one feature
-     path being worked on** — unlike every other patch in this project, which only ever touches
-     methods specific to the one type/feature being fixed. Reflection has real costs (more code, a
-     string-based method lookup that could silently no-op if the name's ever wrong) but has zero
-     blast radius outside the new methods that use it, which is worth the trade.
-  2. After switching to reflection, the first button drawn (Reply) rendered in the right place;
+     both the break and the recovery). A second attempt used reflection
+     (`Type.GetMethod(NonPublic|Instance)` + `MethodBase.Invoke`) instead — zero blast radius, and
+     it worked, but with real ongoing cost: `object[]` boxing per call and a string-based method
+     lookup that could silently no-op on a typo, with no compiler to catch it. **The version that
+     actually shipped** (after the user asked for a holistic re-review before folding this into
+     `deploy.sh`, rather than settling for "it works"): three brand-new PUBLIC wrapper methods
+     added to `ControlToolStripButton` — `RaisePaint`/`RaiseMouseEnter`/`RaiseMouseLeave`, each
+     just calling the corresponding protected `On*` method from within the SAME class (legal —
+     protected access from the declaring type itself is always fine). These are NEW, ADDITIVE
+     members: nothing about any EXISTING method changes, so there's no override-accessibility
+     mismatch to trigger mistake 1's failure mode, and no existing call site anywhere else in the
+     app is affected — confirmed by re-running the exact blast-radius check mistake 1 skipped (a
+     normal, unrelated toolbar button, screenshot-verified unaffected) before calling this done.
+     **Lesson: editing a *shared library* type's own member metadata (visibility, and likely
+     anything else affecting its public contract) needs a blast-radius check across its OTHER
+     call sites before deploying, not just the one feature path being worked on** — unlike every
+     other patch in this project, which only ever touches methods specific to the one
+     type/feature being fixed. **When something outside the type you're extending needs access
+     you don't have, prefer adding a new, additive member over widening or otherwise mutating an
+     existing one — it gets you the same reach with none of the blast radius**, and (as this case
+     shows) it can beat reflection too: no runtime string lookup, no boxing, a normal `Callvirt`.
+  2. After switching to reflection (interim step, superseded by the wrapper methods above), the
+     first button drawn (Reply) rendered in the right place;
      every button drawn after it (Flag/Delete/Previous/Next) rendered near the top-left corner,
      overlapping the avatar — confirmed live via screenshot. Root cause: `ControlToolStripButton
      .OnPaint`'s own image-drawing code calls `Graphics.ResetTransform()` internally (part of its
@@ -484,8 +499,9 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
      around the call is the only reliably composable pattern, not a manual delta you apply and
      undo yourself.** User confirmed live: all five icons visible in the correct positions, hover
      working, click working on all five (including Previous/Next, tested with two queued
-     notifications). Full history: `reports/notification-empty-until-fade-findings.md`'s
-     thirty-second round.
+     notifications), first with the reflection-based version and again after refining to the
+     wrapper-method version. Full history: `reports/notification-empty-until-fade-findings.md`'s
+     thirty-second and thirty-third rounds.
 - **Notification title/content text rendering visibly bolder under the Light theme than Dark**
   (same font/size/weight in both — confirmed by decompile that font selection has no theme
   dependency at all). Root cause: GDI's `TextRenderer.DrawText`'s transparent-background mode
@@ -789,23 +805,32 @@ session, all worth guarding against explicitly next time:
    isn't a real risk (`--patch-notification-icon-bitmap`'s `OnPaint` block-removal search).
 10. **Widening a *shared library* type's own member visibility (e.g. `protected` → `public`) to
     let one new call site reach it directly has a much larger blast radius than editing a method
-    body — it can break every OTHER existing call site too, silently.** Changing
-    `ControlToolStripButton.OnPaint`/`OnMouseEnter`/`OnMouseLeave` (`MailClient.Common.UI.dll`)
-    from `protected` to `public` (clearing `MethodAttributes.MemberAccessMask` and setting
-    `Public`) so `FormMailNotification` (`MailClient.dll`) could call them directly, instead of
-    through reflection, decompiled clean and deployed without any error — but broke icon
-    rendering on **every toolbar button across the entire app** (confirmed live via screenshot:
-    New/Refresh/Save/Reply/etc. all reduced to text-only, no icons), since
+    body — it can break every OTHER existing call site too, silently. When you need to reach
+    across an accessibility boundary into a shared type, add a new, purely ADDITIVE member instead
+    of mutating an existing one's metadata.** Changing `ControlToolStripButton.OnPaint`/
+    `OnMouseEnter`/`OnMouseLeave` (`MailClient.Common.UI.dll`) from `protected` to `public`
+    (clearing `MethodAttributes.MemberAccessMask` and setting `Public`) so `FormMailNotification`
+    (`MailClient.dll`) could call them directly decompiled clean and deployed without any error —
+    but broke icon rendering on **every toolbar button across the entire app** (confirmed live via
+    screenshot: New/Refresh/Save/Reply/etc. all reduced to text-only, no icons), since
     `ControlToolStripButton` is the shared control behind every toolbar in the app, and an
     override's accessibility mismatch against its base declaration — something the C# compiler
     blocks at compile time — turned out to matter at the CLR level too, corrupting the type
-    broadly rather than just the one call site being touched. Reverted immediately. Fix: reflection
-    (`Type.GetMethod(BindingFlags.NonPublic | BindingFlags.Instance)` + `MethodBase.Invoke`) has
-    real costs (more IL, a string-based method-name lookup that could silently no-op if ever
-    wrong) but touches nothing outside the new caller's own code — zero blast radius on the shared
-    type. Never widen a shared type's own member accessibility for the sake of one new caller;
-    reach across the accessibility boundary from the caller's side instead
-    (`--patch-notification-toolbar-icons`).
+    broadly rather than just the one call site being touched. Reverted immediately. An interim fix
+    used reflection (`Type.GetMethod(BindingFlags.NonPublic | BindingFlags.Instance)` +
+    `MethodBase.Invoke`) — zero blast radius, and it worked, but real ongoing cost (`object[]`
+    boxing per call, a string-based method-name lookup that could silently no-op if ever wrong,
+    with no compiler to catch it). **The version that actually shipped**, after the user asked for
+    a holistic re-review before folding this into `deploy.sh` rather than settling for "it works":
+    three brand-new `public` wrapper methods added to `ControlToolStripButton` itself
+    (`RaisePaint(PaintEventArgs e) => OnPaint(e);` and two more for `OnMouseEnter`/
+    `OnMouseLeave`) — calling a class's own protected members from a NEW method declared on that
+    SAME class is always legal (protected access from the declaring type itself is unrestricted),
+    and since these are new members rather than edits to existing ones, no existing call site
+    anywhere else in the app can possibly be affected. Gets reflection's "zero blast radius"
+    property AND plain-`Callvirt` simplicity, strictly better than either earlier attempt. Never
+    widen or otherwise mutate a shared type's own existing member metadata for the sake of one new
+    caller — add alongside it instead (`--patch-notification-toolbar-icons`).
 11. **Reusing someone else's paint code (via reflection or otherwise) that touches the `Graphics`
     transform/clip state can silently corrupt whatever you had applied before calling it — assume
     it might reset, not just add to, that state.** `ControlToolStripButton.OnPaint`'s own
@@ -824,6 +849,24 @@ session, all worth guarding against explicitly next time:
     rotate, reset, whatever), fully isolating each call from the others. Reach for `Save()`/
     `Restore()` by default around any reused paint call, not just when a manual undo is later
     proven wrong.
+12. **When a single patch invocation adds a new member to one assembly and needs a second
+    assembly (processed in the same pass) to call it, resolve that member as a hand-built
+    `MethodReference` — not by re-reading/searching the first assembly's `TypeDefinition`, which
+    was resolved from the INPUT directory's copy and won't see anything written to the OUTPUT
+    directory during this same run.** `--patch-notification-toolbar-icons` adds
+    `RaisePaint`/`RaiseMouseEnter`/`RaiseMouseLeave` to `ControlToolStripButton`
+    (`MailClient.Common.UI.dll`) and then needs `FormMailNotification` (`MailClient.dll`,
+    processed later in the same `foreach` over the input directory's files) to call them. A first
+    attempt looked them up via `buttonTypeDef.Methods.FirstOrDefault(m => m.Name == "RaisePaint")`
+    — `buttonTypeDef` had been resolved earlier by reading `MailClient.Common.UI.dll` from the
+    INPUT directory (via the shared `AssemblyResolver`), which is the ORIGINAL, unmodified file;
+    the new methods only exist in the modified copy already written out to the OUTPUT directory
+    moments earlier in this same function. The lookup silently returned null every time. Fix:
+    since the new methods' full signature is known at patch-authoring time anyway (name, return
+    type, one parameter of an already-resolved type), build a plain `MethodReference` by hand
+    (`new MethodReference(name, module.TypeSystem.Void, buttonTypeRef) { HasThis = true }` plus
+    one `Parameters.Add(...)`) instead of trying to resolve one from a file — sidesteps the
+    input/output split entirely.
 
 **A new `--dump-il <dll> <type> <method>` utility mode** (same rationale as `--dump-handlers`)
 prints a method's real instruction stream with offsets — use it before writing any patch that
