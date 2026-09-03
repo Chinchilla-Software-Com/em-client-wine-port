@@ -418,12 +418,74 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   `if (mouseOver)` (matching the icons' old hover-only visibility). Fixed with
   `--patch-notification-title-icon-clip`, forcing that allowance to always apply. User confirmed
   live via video capture: title now properly ellipsizes ("Jaguar Workshop Auto Re…") with a clean
-  gap before the icons. **Reply/flag/delete icons are separately confirmed to have the exact
-  same bug but are not yet fixed** — scoped as a harder second pass (real `ControlToolStripButton`
-  instances backed by `MultiResImageList` resources, not simple `Image` fields) and not started.
-  Hover-state icon swap is decompile-verified but not live-tested (no mouse-automation tooling
-  available in this environment). Full history: `reports/notification-empty-until-fade-
+  gap before the icons. Full history: `reports/notification-empty-until-fade-
   findings.md`'s twenty-third through twenty-seventh rounds.
+- **Notification reply/flag/delete/previous/next icons (bottom strip) had the exact same
+  invisible-until-fade bug** — confirmed live (user: "I could only see them as they faded out").
+  Unlike close/settings (plain `Image` fields drawn directly by `OnPaint`), these five are real
+  `MailClient.Common.UI.Controls.ControlToolStrip.ControlToolStripButton` child controls hosted in
+  `tableLayoutPanel1`, each with its own genuinely complex, theme/hover/tint-dependent paint logic
+  already built into its own `OnPaint` — confirmed via two diagnostic passes
+  (`--patch-diag-toolstrip-buttons`/`--patch-diag-toolstrip-controls`) that they're real
+  `Control`-derived instances (their own `Bounds`/`Visible` are public, directly callable), but
+  `OnPaint`/`OnMouseEnter`/`OnMouseLeave` are `protected`, declared on a class in a different
+  assembly (`MailClient.Common.UI.dll`) than `FormMailNotification` (`MailClient.dll`) — calling
+  them directly would violate CLR member accessibility. Fixed with a new
+  `--patch-notification-toolbar-icons` patch adding, all on `FormMailNotification`: a
+  `__toolbarButtonRect` helper (`tableLayoutPanel1.Bounds.Location` + `button.Bounds`, translated
+  into `this`-relative coordinates), an `updateBackgroundBitmap()` override that bakes all five
+  buttons' real rendered output into `backgroundBitmap` (the same reliable `layeredWindow` blit
+  path proven for text/close/settings) by reusing each button's own real `OnPaint` via reflection
+  (`__invokeProtected`, a `Type.GetMethod(NonPublic|Instance)` + `MethodBase.Invoke` helper) rather
+  than reimplementing the theme/hover/tint logic by hand, an `OnMouseMove` override forwarding
+  synthetic `OnMouseEnter`/`OnMouseLeave` into whichever real button the cursor is over (same
+  reflection helper) so each button's own hover-tint state updates correctly, and a
+  `performMouseClick` override checking all five buttons' rects FIRST — priority matters here,
+  since `contentRect`'s hit-test rectangle genuinely overlaps the toolbar strip's Y range
+  (confirmed via `--patch-notification-geometry-diag`: `content={Y=56,Height=64}` vs. the
+  toolbar's `Y=94..116`) — calling the real, unmodified click handlers
+  (`Replyaction`/`Flag`/`Delete`/`button_Previous_Click`/`button_Next_Click`) directly, only
+  falling through to `base.performMouseClick` if none matched. `button_Previous`/`button_Next`
+  are only `Visible` when multiple notifications are queued (`notifications.Count > 1`) and their
+  `Bounds` are stale/unreliable while hidden (confirmed via diagnostic) — both the paint and
+  click/hover overrides skip any button that isn't currently `Visible`.
+  **Two real mistakes made and fixed along the way, both worth remembering:**
+  1. A first attempt widened `OnPaint`/`OnMouseEnter`/`OnMouseLeave`'s own visibility from
+     `protected` to `public` directly in `MailClient.Common.UI.dll` (the user's own suggestion,
+     since this is raw IL editing anyway — no reflection needed if the target methods are just
+     public). It decompiled clean and deployed without error, but broke icon rendering on **every
+     toolbar button across the entire app** (user: "The whole UI is broken now") —
+     `ControlToolStripButton` is the shared control behind every toolbar in eM Client, and an
+     override's accessibility mismatch against its base declaration (something the C# compiler
+     blocks at compile time) turned out to matter at the CLR level too, breaking the type broadly
+     rather than just the one call site being touched. Reverted immediately (screenshot-confirmed
+     both the break and the recovery). **Lesson: editing a *shared library* type's own member
+     metadata (visibility, and likely anything else affecting its public contract) needs a
+     blast-radius check across its OTHER call sites before deploying, not just the one feature
+     path being worked on** — unlike every other patch in this project, which only ever touches
+     methods specific to the one type/feature being fixed. Reflection has real costs (more code, a
+     string-based method lookup that could silently no-op if the name's ever wrong) but has zero
+     blast radius outside the new methods that use it, which is worth the trade.
+  2. After switching to reflection, the first button drawn (Reply) rendered in the right place;
+     every button drawn after it (Flag/Delete/Previous/Next) rendered near the top-left corner,
+     overlapping the avatar — confirmed live via screenshot. Root cause: `ControlToolStripButton
+     .OnPaint`'s own image-drawing code calls `Graphics.ResetTransform()` internally (part of its
+     rotation-transform handling, unconditional whenever an image actually draws) — this wipes
+     ANY transform state applied before calling it, including a manual
+     `TranslateTransform(+X,+Y)` / `TranslateTransform(-X,-Y)` "undo" pair wrapped around the call
+     (the first draft here): the undo then applies to an already-reset (identity) matrix instead
+     of the intended baseline, corrupting the transform for every subsequent button drawn on the
+     same `Graphics`. Fixed by switching to `Graphics.Save()`/`Restore(GraphicsState)` instead of
+     manual translate math — `Restore()` puts the ENTIRE transform/clip state back to exactly what
+     `Save()` captured, regardless of what the reused paint code did with it in between (translate,
+     rotate, or reset), fully isolating each button's paint call from the others. **Lesson: when
+     reusing someone else's paint code you don't control via reflection or otherwise, assume it
+     may touch the `Graphics` transform/clip state in ways you can't predict — `Save()`/`Restore()`
+     around the call is the only reliably composable pattern, not a manual delta you apply and
+     undo yourself.** User confirmed live: all five icons visible in the correct positions, hover
+     working, click working on all five (including Previous/Next, tested with two queued
+     notifications). Full history: `reports/notification-empty-until-fade-findings.md`'s
+     thirty-second round.
 - **Notification title/content text rendering visibly bolder under the Light theme than Dark**
   (same font/size/weight in both — confirmed by decompile that font selection has no theme
   dependency at all). Root cause: GDI's `TextRenderer.DrawText`'s transparent-background mode
@@ -501,32 +563,53 @@ reproduced it, and more) remain fully documented in `reports/notification-empty-
 findings.md` so none of them get re-tried — read that file's early rounds before starting any new
 notification-rendering investigation.
 
-**Currently paused, deliberately backed out of the deployed bottle (per explicit user
-instruction), though fully committed in git and confirmed working — resume when ready:**
-- **Close/settings icon fix** (`--patch-notification-icon-bitmap` +
-  `--patch-notification-title-icon-clip`, see the "Fixed and confirmed" bullet above for the
-  mechanism). An apparent freeze on hover/click was chased at length and traced entirely to the
-  synthetic `--patch-test-monogram-avatar` test trigger lacking a real backing mail item for its
-  "open on click" path — confirmed via a real incoming email that hover, close-click, and
-  settings-click (settings shows nothing yet, a separate minor bug, but doesn't freeze) all work
-  correctly. Not re-verified specifically for icon-hover against a real notification (only the
-  freeze itself was re-tested that way) — do that once before resuming reply/flag/delete work.
-  Deployed build currently sits one step earlier (`il-patches/output-theme/`, no icon-bitmap, no
-  title-icon-clip) so the two bugs below can be investigated with fewer moving parts. Full
-  history: `reports/notification-empty-until-fade-findings.md`'s twenty-eighth round.
+- **Close/settings icon fix, previously paused then resumed and fully re-verified.** An apparent
+  freeze on hover/click was chased at length and traced entirely to the synthetic
+  `--patch-test-monogram-avatar` test trigger lacking a real backing mail item for its "open on
+  click" path, not a real bug — confirmed via a real incoming email that hover, close-click, and
+  settings-click all work correctly (settings menu itself opens and shows the expected items —
+  "Don't show popup for X" / "Customize notifications" / "Customize notifications for [account]",
+  matching `prepareContextMenu()`'s own logic exactly). Now deployed continuously as part of the
+  same base every later fix in this session built on. Full history: `reports/notification-empty-
+  until-fade-findings.md`'s twenty-eighth round.
+- **Hovering over the notification did not pause the auto-hide countdown**, and once paused by
+  any means, did not reliably resume it either (a real, intentional eM Client feature, confirmed
+  by the user from product knowledge, not a guess). Root-caused to the mechanism level: the
+  existing (unmodified) `timer_OnTimer`/`OnMouseEnter`/`OnMouseLeave` logic was correct, gated on
+  a `mouseOver` field that `this` form's own `OnMouseEnter`/`OnMouseLeave` need real Wine mouse
+  messages to maintain — which `this` doesn't reliably receive (the same underlying gap the
+  already-fixed click-routing bug, Stage 8, worked around specifically for *clicks* by forwarding
+  from `layeredWindow`, but no equivalent forwarding existed for hover events). Fixed with
+  `--patch-notification-hover-forward`: extends `LayeredForm.WndProc`'s existing WM_SETCURSOR-
+  based click-synthesis (Stage 8) to ALSO detect HIWORD=512 (`WM_MOUSEMOVE`'s own identity) and
+  synthesize `OnMouseMove()` on `layeredWindow`, then a new `layeredWindow_MouseMove` handler on
+  `FormGenericNotification` forwards that into `this`'s own `OnMouseEnter`/`OnMouseMove`/
+  `OnMouseLeave` — mirroring `layeredWindow_Click`'s already-proven forwarding pattern exactly.
+  Hovering during the static hold now correctly pauses the countdown, and moving off resumes it.
+  A second requirement — hovering during an ALREADY-STARTED fade should snap the notification
+  instantly back to fully visible, not gradually re-fade — was first implemented by calling the
+  existing public `Reshow()` method, which worked but visibly re-faded in slowly (user: "it fades
+  back in slowly.... it should snap striaght to fully visible") since `Reshow()` routes through
+  `Show()`'s `Disappearing` case (gradual `Appearing` re-fade), not its instant-snap
+  `Appearing`/`Visible` case. Fixed by bypassing `Show()`/`Reshow()` entirely and directly
+  replicating `OnShown`'s own instant-snap field manipulation
+  (`state = Visible; alphaIncrement = 0f; timer.Interval = timeToStay; Opacity = 1.0;`) —
+  deliberately not modifying the shared `Show()`/`Reshow()` methods themselves, since other
+  callers (e.g. advancing to a queued notification) may rely on their existing gradual-fade
+  behavior. User confirmed both behaviors live across multiple trigger cycles: "So that's those
+  two interim bugs fixed." Full history: `reports/notification-empty-until-fade-findings.md`'s
+  thirty-first(b)/hover-forward rounds.
 
-**Investigated, unresolved — the one remaining open item:**
-- **Hovering over the notification does not pause the auto-hide countdown** (a real, intentional
-  eM Client feature, confirmed by the user from product knowledge, not a guess) **and once
-  paused by any means, does not reliably resume it either.** Root-caused to the mechanism level:
-  the existing (unmodified) `timer_OnTimer`/`OnMouseEnter`/`OnMouseLeave` logic is correct, gated
-  on a `mouseOver` field that `this` form's own `OnMouseEnter`/`OnMouseLeave` need real Wine
-  mouse messages to maintain — which `this` doesn't reliably receive (the same underlying gap
-  the already-fixed click-routing bug, Stage 8, worked around specifically for *clicks* by
-  forwarding from `layeredWindow`, but no equivalent forwarding exists for hover events). Not
-  fixed yet — likely shape: hook `layeredWindow`'s own mouse-enter/move/leave (if it exposes
-  them) and forward into `this`, mirroring `layeredWindow_Click`'s existing forwarding. Full
-  history: twenty-eighth round.
+**None of the notification fixes above are folded into `releases/<version>/deploy.sh` yet**
+(same standing gap as Stage 8) — apply manually, in this order, on top of Stage 7's output (or
+Stage 8's, for the click-dispatch fix too): `--patch-notification-text-in-bitmap`,
+`--patch-notification-refresh-on-content-change`, `--patch-notification-periodic-reblit`,
+`--patch-notification-suppress-self-text-only`, `--patch-notification-icon-bitmap`,
+`--patch-notification-title-icon-clip`, `--patch-notification-text-drawstring`,
+`--patch-notification-hover-forward`, `--patch-notification-toolbar-icons`. This is exactly the
+chain baked into this session's `il-patches/output-icons3/` → `output-toolbar5/` lineage
+(gitignored build output, regenerate via the flags above against a fresh `original/` rather than
+copying those directories).
 
 ## Investigation method (what actually worked this round)
 
@@ -704,6 +787,43 @@ session, all worth guarding against explicitly next time:
    strings instead (`instrs[i+1].Operand is FieldReference fr && fr.Name == mouseOverField.Name`) —
    safe here because the search is already scoped to a single known method/type, so name collision
    isn't a real risk (`--patch-notification-icon-bitmap`'s `OnPaint` block-removal search).
+10. **Widening a *shared library* type's own member visibility (e.g. `protected` → `public`) to
+    let one new call site reach it directly has a much larger blast radius than editing a method
+    body — it can break every OTHER existing call site too, silently.** Changing
+    `ControlToolStripButton.OnPaint`/`OnMouseEnter`/`OnMouseLeave` (`MailClient.Common.UI.dll`)
+    from `protected` to `public` (clearing `MethodAttributes.MemberAccessMask` and setting
+    `Public`) so `FormMailNotification` (`MailClient.dll`) could call them directly, instead of
+    through reflection, decompiled clean and deployed without any error — but broke icon
+    rendering on **every toolbar button across the entire app** (confirmed live via screenshot:
+    New/Refresh/Save/Reply/etc. all reduced to text-only, no icons), since
+    `ControlToolStripButton` is the shared control behind every toolbar in the app, and an
+    override's accessibility mismatch against its base declaration — something the C# compiler
+    blocks at compile time — turned out to matter at the CLR level too, corrupting the type
+    broadly rather than just the one call site being touched. Reverted immediately. Fix: reflection
+    (`Type.GetMethod(BindingFlags.NonPublic | BindingFlags.Instance)` + `MethodBase.Invoke`) has
+    real costs (more IL, a string-based method-name lookup that could silently no-op if ever
+    wrong) but touches nothing outside the new caller's own code — zero blast radius on the shared
+    type. Never widen a shared type's own member accessibility for the sake of one new caller;
+    reach across the accessibility boundary from the caller's side instead
+    (`--patch-notification-toolbar-icons`).
+11. **Reusing someone else's paint code (via reflection or otherwise) that touches the `Graphics`
+    transform/clip state can silently corrupt whatever you had applied before calling it — assume
+    it might reset, not just add to, that state.** `ControlToolStripButton.OnPaint`'s own
+    image-drawing branch calls `Graphics.ResetTransform()` internally (part of its rotation-
+    transform handling, unconditional whenever an image actually draws). A first draft wrapped
+    each button's `OnPaint` call in a manual `TranslateTransform(+X,+Y)` / `TranslateTransform
+    (-X,-Y)` pair to position it and then "undo" the position afterward — but `ResetTransform()`
+    wipes the `+X,+Y` translation (and anything applied before it, including an outer shadow
+    offset) before the manual undo ever runs, so the undo's `-X,-Y` applies to an already-reset
+    identity matrix instead of the intended baseline, corrupting the transform for every
+    subsequent button drawn on the same `Graphics` object. Confirmed live: the first button drawn
+    landed correctly, every button drawn after it rendered near the top-left corner instead of its
+    intended position. Fix: `Graphics.Save()` / `Restore(GraphicsState)` instead of manual
+    translate math — `Restore()` puts the ENTIRE transform/clip state back to exactly what
+    `Save()` captured, regardless of what the reused code did with it in between (translate,
+    rotate, reset, whatever), fully isolating each call from the others. Reach for `Save()`/
+    `Restore()` by default around any reused paint call, not just when a manual undo is later
+    proven wrong.
 
 **A new `--dump-il <dll> <type> <method>` utility mode** (same rationale as `--dump-handlers`)
 prints a method's real instruction stream with offsets — use it before writing any patch that

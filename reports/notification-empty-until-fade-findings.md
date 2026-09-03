@@ -2425,3 +2425,171 @@ pre-change build is strictly better evidence than any cross-session screenshot c
 regardless of how carefully the cross-session comparison tries to normalize for scale -- prefer it
 from the start next time, rather than reaching for it only after two cross-session-based fixes
 already turned out wrong.
+
+## Thirty-first(b) round: hover-pause and hover-during-fade-snap fixed via WM_SETCURSOR-based
+## OnMouseMove synthesis, mirroring the existing click fix
+
+With Bug 1 (bold text) fully resolved, moved to the last item in the "Investigated, unresolved"
+list: hovering over a notification doesn't pause the auto-hide countdown, and hovering during an
+active fade doesn't reset it back to fully visible either. Both are real, intentional eM Client
+behaviors (confirmed by the user from product knowledge), not guesses.
+
+Root cause, confirmed by re-reading the existing (unmodified) `timer_OnTimer`/`OnMouseEnter`/
+`OnMouseLeave` logic: it's already correct, gated on a `mouseOver` field that `this` form's own
+`OnMouseEnter`/`OnMouseLeave` need real Wine mouse messages to maintain -- exactly the same
+underlying gap Stage 8's click-routing fix worked around, but Stage 8 only forwards *clicks* from
+`layeredWindow` into `this`; no equivalent forwarding exists for hover/move events.
+
+Fix (`--patch-notification-hover-forward`): extends `LayeredForm.WndProc`'s existing WM_SETCURSOR
+interception (which already detects click messages via `(int)m.LParam >> 16` matching
+513/516/519/523, Stage 8's own mechanism) to ALSO detect HIWORD 512 (`WM_MOUSEMOVE`'s own
+identity -- WM_SETCURSOR fires for movement too, not just clicks) and synthesize `OnMouseMove()`
+on `layeredWindow` itself. A new `layeredWindow_MouseMove` handler on `FormGenericNotification`
+(subscribed the same unsubscribe-then-subscribe way `OnShown` already handles `Click`) then
+forwards that into `this`'s own `OnMouseEnter`/`OnMouseMove`/`OnMouseLeave`, computing
+`PointToClient(Control.MousePosition)` and `ClientRectangle.Contains(pt)` exactly the way
+`layeredWindow_Click`'s existing forwarding computes its own click location.
+
+First version of the "snap back on hover during fade" half called the existing public `Reshow()`
+method (`if (state == Disappearing || state == Visible) Show();`). This worked -- the notification
+did come back -- but visibly faded back in *slowly* rather than snapping instantly. User: "Close.
+it fades back in slowly.... it should snap striaght to fully visible". Root cause: `Reshow()`
+routes through `Show()`'s `switch(state)`, and the `Disappearing` case there sets
+`state = Appearing; alphaIncrement = 25f / timeToShow;` -- the same GRADUAL re-fade `OnShown` uses
+for a fresh appear-from-hidden, not the INSTANT snap `OnShown`'s `Appearing`/`Visible` case uses
+(`alphaIncrement = 0f; Opacity = 1.0;`). Fixed by bypassing `Show()`/`Reshow()` entirely inside
+`layeredWindow_MouseMove` and directly replicating that instant-snap case's own field
+manipulation (`state = Visible; alphaIncrement = 0f; timer.Interval = timeToStay; Opacity = 1.0;
+updateLayeredBackground(refreshBitmap: false); if (autoHide) timer.Start();`) -- deliberately not
+touching `Show()`/`Reshow()` themselves, since other callers (e.g. advancing to the next queued
+notification) may depend on their existing gradual-fade behavior for THOSE cases.
+
+Several IL-correctness bugs were caught and fixed before ever deploying (all previously-documented
+lessons, each hit fresh this round): `layeredWindow` field not found directly on
+`FormGenericNotification` (it's declared on base `LayeredBaseForm` -- fixed with a base-chain
+fallback lookup); `Rectangle.Contains(Point)` called on `get_ClientRectangle()`'s raw return value
+without an address (lesson 6 -- fixed by storing to a local first, `Ldloca`); foreign-module
+`Point`/`Rectangle` `TypeReference`s used as local-variable types without `module.ImportReference`
+first (crashed `module.Write()` with "declared in another module and needs to be imported" --
+fixed by importing both); `MouseEventHandler`'s ctor resolved via `.Module` on a `TypeReference`
+(unreliable) instead of `.Resolve()` on the parameter type; and a `skipTimerStart` branch-target
+label mistakenly created as `Ldloc isOverLocal` (a real stack-effecting load) instead of `Nop` --
+lesson 8's exact mistake, repeated and self-caught before building, via manual stack-tracing.
+
+User confirmed both behaviors live, across multiple trigger/retrigger cycles: "So that's those two
+interim bugs fixed."
+
+## Thirty-second round: reply/flag/delete/previous/next icons fixed -- same invisible-until-fade
+## bug, harder mechanism, two real mistakes on the way to the fix
+
+With both interim bugs (bold text, hover-pause) confirmed fixed, the user asked to resume the
+previously-paused reply/flag/delete/previous/next icon work: "Now back to the icons. They need to
+change colour on hover..., and they need to be clickable and also not interfer in the hover/reset
+fade timer".
+
+**Ground-truth investigation first**, per the user's own instruction to keep all relevant
+decompiled code in view rather than guess. Two new diagnostic patches
+(`--patch-diag-toolstrip-buttons`, `--patch-diag-toolstrip-controls`) confirmed via a real
+notification: the five fields (`button_Reply`/`button_Flag`/`button_Delete`/`button_Previous`/
+`button_Next`) are genuinely `Control`-derived `ControlToolStripButton` instances (their own
+`Bounds`/`Visible` are public, directly callable -- confirmed by calling them successfully via a
+reference typed as the base `Control` from `tableLayoutPanel1.Controls[i]`), positioned at
+`tableLayoutPanel1.Bounds = {X=8,Y=91,W=294,H=28}` with individual offsets `{213,3}`/`{241,3}`/
+`{269,3}` for Reply/Flag/Delete (i.e. on-screen `{221,94}`/`{249,94}`/`{277,94}`, all 22x22).
+`button_Previous`/`button_Next` reported identical, clearly-stale `{3,3}` bounds -- confirmed to
+be because they're only `Visible` when `notifications.Count > 1` (multiple queued notifications),
+and WinForms apparently doesn't lay out invisible items at all.
+
+Two diagnostic-patch crashes were hit and fixed before reaching this data, both instructive:
+1. First diagnostic version tried to also log each button's `Bounds` via `Callvirt` on a
+   `get_Bounds` resolved from `ToolStripItem` (a base type reached through TWO foreign modules) --
+   crashed live with `InvalidProgramException` ("Common Language Runtime detected an invalid
+   program"), decompiling perfectly clean beforehand (the exact "decompiling clean is not
+   sufficient proof" shape this project has hit before). Root cause, found on the SECOND crash
+   after simplifying away the Bounds call and it STILL crashed: a branch-target placeholder
+   instruction (`newFirst`) was created as `Ldstr "BUTTONDIAG\n"` -- a real push -- intended purely
+   as a jump-target label for retargeted branches/early-rets, but never actually consumed by
+   anything (each per-button log line started its own fresh `Ldstr`), leaving that string
+   permanently on the evaluation stack through to the method's final `ret`. Exactly lesson 8's
+   mistake (a branch-target label must be a stack-neutral `Nop`, never a real load), REPEATED in
+   this same session despite already being self-caught once earlier (in the hover-forward work)
+   and documented in CLAUDE.md. Fixed by switching the placeholder to `OpCodes.Nop`.
+2. Separately, `EventArgs.Empty` was initially resolved via
+   `typeof(EventArgs).GetProperty("Empty")!.GetGetMethod()!` -- `GetProperty` returned `null`
+   (`EventArgs.Empty` is a static readonly FIELD, not a property), crashing the *patcher itself*
+   with a `NullReferenceException` at build time (safe -- caught before any deploy). Fixed with
+   `typeof(EventArgs).GetField("Empty")!` and `Ldsfld` instead of `Call`.
+
+**The actual fix** (`--patch-notification-toolbar-icons`): reply/flag/delete are real
+`ControlToolStripButton` children with genuinely complex, theme/hover/tint-dependent paint logic
+already built into their own `OnPaint` (image-list selection, invert-tint math via
+`MakeTintedImage`, dark/light-theme-conditional behavior for Previous/Next's arrow-color swap) --
+reimplementing that by hand was rejected as too error-prone; the whole point was to REUSE it, the
+same philosophy behind every other fix in this project. `OnPaint`/`OnMouseEnter`/`OnMouseLeave`
+are `protected`, declared on `ControlToolStripButton` in a different assembly
+(`MailClient.Common.UI.dll`) than `FormMailNotification` (`MailClient.dll`) -- calling them
+directly would violate CLR accessibility.
+
+**First attempt, and the mistake that broke the whole app**: since this is raw IL/metadata editing
+anyway, the user's own suggestion was to just widen `OnPaint`/`OnMouseEnter`/`OnMouseLeave`'s own
+visibility from `protected` to `public` directly in `MailClient.Common.UI.dll` (clearing
+`MethodAttributes.MemberAccessMask`, setting `Public`) -- no reflection needed if the target
+methods are simply public. This decompiled clean and deployed with no error of any kind. But
+`ControlToolStripButton` is the shared control behind EVERY toolbar button in the entire app, not
+just this notification's five icons -- and the change broke icon rendering EVERYWHERE (confirmed
+via screenshot: New/Refresh/Save/Reply/Reply All/Forward/Mark/Archive, all reduced to text-only,
+no icons at all). User: "The whole UI is broken now. Take a screenshot and see how bad it is...
+You'll need to revet and figure out what you broke for it to get that bad". Reverted immediately
+(redeployed the pre-patch build, re-confirmed via a second screenshot that the whole UI was back
+to normal). Root cause, best understood: an override's accessibility mismatch against its base
+declaration -- something the C# compiler blocks at compile time -- turned out to matter at the CLR
+level too, corrupting the type broadly rather than just the one call site being touched.
+**Lesson, now in CLAUDE.md's IL-patching lessons as #10**: editing a *shared library* type's own
+member metadata for the sake of one new caller needs a blast-radius check across its OTHER call
+sites before deploying -- unlike every other patch in this project, which only ever touches
+methods specific to the one type/feature being fixed.
+
+**Second attempt, reverted to reflection** (`Type.GetMethod(BindingFlags.NonPublic |
+BindingFlags.Instance)` + `MethodBase.Invoke`, via a small shared `__invokeProtected` helper) --
+touches nothing outside `FormMailNotification`'s own new methods, zero blast radius on the shared
+library. Confirmed via `md5sum` that `MailClient.Common.UI.dll` was byte-identical to the
+pre-patch baseline before deploying this version. Deployed and tested: Reply rendered correctly,
+visible, hover working, click opening a reply window -- but Flag and Delete were NOT visible at
+all. A diagnostic pass (before/after logging around each button's draw call) confirmed all five
+buttons' `OnPaint` calls completed without exception or hang (28/28 begin+end pairs logged for
+each), ruling out a crash -- something was drawing wrong, not failing to draw.
+
+**The actual bug, confirmed live via a second screenshot** (a stray icon rendering near the
+avatar, top-left of the notification, instead of the bottom-right toolbar strip): each button was
+drawn by translating the shared `Graphics` object to the button's position, calling its real
+`OnPaint`, then translating back by the negative amount to "undo" the position for the next
+button. But `ControlToolStripButton.OnPaint`'s own image-drawing branch calls
+`Graphics.ResetTransform()` internally (part of its rotation-transform handling, unconditional
+whenever an image actually draws) -- this wipes ANY transform state applied before it runs,
+including the manual translate. The subsequent "undo" then applies to an already-reset identity
+matrix instead of the intended baseline, corrupting the transform for every button drawn
+afterward. Reply (drawn first) landed correctly since nothing had corrupted the baseline yet by
+the time it drew; Flag/Delete/Previous/Next (drawn after) all inherited progressively wrong
+offsets. Fixed by switching to `Graphics.Save()` / `Restore(GraphicsState)` instead of manual
+translate math around each button's `OnPaint` call -- `Restore()` unconditionally puts the ENTIRE
+transform/clip state back to exactly what `Save()` captured, regardless of what the reused code
+did with it in between, fully isolating each button's paint call from the others. **Lesson, now
+in CLAUDE.md's IL-patching lessons as #11**: assume reused paint code you don't control may reset,
+not just add to, the `Graphics` transform/clip state -- `Save()`/`Restore()` is the only reliably
+composable pattern around a reused paint call, not a manual delta you apply and undo yourself.
+
+Also added, same patch: an `OnMouseMove` override forwarding synthetic `OnMouseEnter`/
+`OnMouseLeave` into whichever real button the cursor is over (same `__invokeProtected` helper,
+reusing the just-fixed hover-forward architecture from the thirty-first(b) round) so each button's
+own internal hover-tint state updates correctly; and a `performMouseClick` override checking all
+five toolbar rects FIRST, before falling through to the base implementation -- necessary because
+`contentRect`'s hit-test rectangle genuinely overlaps the toolbar strip's Y range (`content=
+{Y=56,Height=64}` vs. the toolbar's `Y=94..116}`, confirmed via `--patch-notification-geometry-
+diag`), so without this priority ordering a click on Reply would have been swallowed by
+`OnContentClick` (opening the mail) instead. Both hover and click also skip any button not
+currently `Visible`, matching the paint override's own handling of Previous/Next.
+
+User confirmed live, after the Save/Restore fix: "All icons appeared. hover worked, clicking
+flag/delete worked. I sent two and got the arrows working as well and they appeard tow ork as
+well." -- all five icons (including Previous/Next, tested with two queued notifications) fully
+working: visible in the correct position, hover-tint correct, click correct.

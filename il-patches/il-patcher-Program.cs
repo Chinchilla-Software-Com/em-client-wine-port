@@ -53,6 +53,21 @@ if (args.Length > 0 && args[0] == "--patch-notification-geometry-diag")
     return RunPatchNotificationGeometryDiag(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-diag-toolstrip-buttons")
+{
+    return RunPatchDiagToolstripButtons(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-diag-toolstrip-controls")
+{
+    return RunPatchDiagToolstripControls(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-notification-toolbar-icons")
+{
+    return RunPatchNotificationToolbarIcons(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-settings-refresh")
 {
     return RunPatchSettingsRefresh(args);
@@ -156,6 +171,11 @@ if (args.Length > 0 && args[0] == "--patch-notification-no-fading")
 if (args.Length > 0 && args[0] == "--patch-notification-click-resubscribe")
 {
     return RunPatchNotificationClickResubscribe(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-notification-hover-forward")
+{
+    return RunPatchNotificationHoverForward(args);
 }
 
 if (args.Length > 0 && args[0] == "--patch-notification-timer-kick")
@@ -4355,6 +4375,1092 @@ static int RunPatchNotificationGeometryDiag(string[] args)
     return 0;
 }
 
+// --patch-diag-toolstrip-buttons <input-dir> <output-dir>
+//
+// One-off diagnostic for the reply/flag/delete/previous/next icon fix: these five fields
+// (button_Reply/button_Flag/button_Delete/button_Previous/button_Next on FormMailNotification)
+// are declared as MailClient.Common.UI.Controls.ControlToolStrip.ControlToolStripButton, which
+// (confirmed via decompile) extends ToolStripItem, not Control -- yet InitializeComponent adds
+// them to tableLayoutPanel1.Controls (a real Control.ControlCollection, TableLayoutPanelEx :
+// TableLayoutPanel) via what must be an extension method, since ToolStripItem doesn't convert to
+// Control. Static analysis couldn't settle what actually ends up hosting/positioning them at
+// runtime -- this logs each button's real runtime type name and its own Bounds (a genuine public
+// property on ToolStripItem, low-risk to call directly) the moment real notification content is
+// set, which is ground truth no more decompiling was going to produce. Dev-only, strip before
+// release, same as --patch-diag.
+//
+// Touches MailClient.dll only (FormMailNotification.OnDisplayedNotificationChanged). Same
+// insertion pattern as --patch-notification-geometry-diag: insert before the method's single
+// converging final `ret`, retargeting any branch operand or exception-handler boundary that
+// pointed at the old final ret to the new first inserted instruction instead (IL-patching
+// lessons 2 and 3).
+static int RunPatchDiagToolstripButtons(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-diag-toolstrip-buttons <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+    const string logPath = @"Z:\tmp\claude-diag.log";
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormMailNotification";
+    const string targetMethod = "OnDisplayedNotificationChanged";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var method = type.Methods.FirstOrDefault(m => m.Name == targetMethod && m.HasBody);
+        if (method is null) { Console.Error.WriteLine($"FAIL: {targetMethod} not found"); return 1; }
+
+        string[] fieldNames = { "button_Reply", "button_Flag", "button_Delete", "button_Previous", "button_Next" };
+        var buttonFields = new FieldDefinition[fieldNames.Length];
+        for (int i = 0; i < fieldNames.Length; i++)
+        {
+            var f = type.Fields.FirstOrDefault(f => f.Name == fieldNames[i]);
+            if (f is null) { Console.Error.WriteLine($"FAIL: field not found: {fieldNames[i]}"); return 1; }
+            buttonFields[i] = f;
+        }
+
+        // First pass crashed at runtime with "Common Language Runtime detected an invalid
+        // program" (decompiled clean -- ilspycmd doesn't catch this class of bug, same lesson-3
+        // shape as the exception-handler bugs elsewhere in this file) when it also tried to call
+        // get_Bounds (resolved from ToolStripItem, a base type in a THIRD assembly,
+        // System.Windows.Forms.dll, reached by walking two levels of foreign-module base types).
+        // Simplified to just GetType().FullName per button -- lower-risk, still tells us the real
+        // runtime type, which is the actual open question here.
+        MethodReference Import(System.Reflection.MethodBase mb) => module.ImportReference(mb);
+        var objectGetType = Import(typeof(object).GetMethod("GetType", Type.EmptyTypes)!);
+        var typeGetFullName = Import(typeof(Type).GetProperty("FullName")!.GetGetMethod()!);
+        var stringConcat2 = Import(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) })!);
+        var appendAllText = Import(typeof(File).GetMethod("AppendAllText", new[] { typeof(string), typeof(string) })!);
+
+        var body = method.Body;
+        body.SimplifyMacros();
+        var il = body.GetILProcessor();
+        var instrs = body.Instructions;
+        var lastInstr = instrs[instrs.Count - 1];
+        if (lastInstr.OpCode != OpCodes.Ret) { Console.Error.WriteLine($"FAIL: {targetMethod}'s last instruction isn't Ret (got {lastInstr.OpCode}) -- method shape changed, review needed"); return 1; }
+
+        // IL-patching lesson 8, hit again here: this must be a stack-neutral label, not a real
+        // push -- Ldstr here (unconsumed by anything, since each button's own block below starts
+        // fresh with its own Ldstr) would leave a string permanently on the stack through to the
+        // final ret, which is invalid IL despite decompiling clean (confirmed: this exact bug
+        // shipped and crashed live as InvalidProgramException before being caught here).
+        var newFirst = Instruction.Create(OpCodes.Nop);
+        il.InsertBefore(lastInstr, newFirst);
+        int retargetedBranches = 0;
+        foreach (var instr in instrs)
+        {
+            if (instr != newFirst && instr.Operand == lastInstr) { instr.Operand = newFirst; retargetedBranches++; }
+        }
+        int retargetedRets = 0;
+        foreach (var instr in instrs.ToList())
+        {
+            if (instr != lastInstr && instr.OpCode == OpCodes.Ret)
+            {
+                instr.OpCode = OpCodes.Br;
+                instr.Operand = newFirst;
+                retargetedRets++;
+            }
+        }
+        int retargetedHandlerBounds = 0;
+        foreach (var handler in body.ExceptionHandlers)
+        {
+            if (handler.TryStart == lastInstr) { handler.TryStart = newFirst; retargetedHandlerBounds++; }
+            if (handler.TryEnd == lastInstr) { handler.TryEnd = newFirst; retargetedHandlerBounds++; }
+            if (handler.HandlerStart == lastInstr) { handler.HandlerStart = newFirst; retargetedHandlerBounds++; }
+            if (handler.HandlerEnd == lastInstr) { handler.HandlerEnd = newFirst; retargetedHandlerBounds++; }
+        }
+        Console.WriteLine($"     ({retargetedBranches} branch operand(s), {retargetedRets} standalone early-ret instruction(s), {retargetedHandlerBounds} handler boundary field(s) retargeted from the old final ret to the new pre-ret logging)");
+
+        body.InitLocals = true;
+
+        // Builds, per button: "<fieldName> type=<TypeFullName>\n" -- inserted immediately before
+        // lastInstr (the (now-unconditionally-reached) diag ldstr placeholder stays as the very
+        // first thing written, one AppendAllText per button).
+        foreach (var field in buttonFields)
+        {
+            var tmpMsg = new VariableDefinition(module.TypeSystem.String);
+            body.Variables.Add(tmpMsg);
+
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, field.Name + " type="));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldarg_0));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldfld, field));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Callvirt, module.ImportReference(objectGetType)));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Callvirt, module.ImportReference(typeGetFullName)));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, "\n"));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Stloc, tmpMsg));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, logPath));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldloc, tmpMsg));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, appendAllText));
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::{targetMethod} -- now logs each of the 5 button fields' runtime type to {logPath}");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-diag-toolstrip-controls <input-dir> <output-dir>
+//
+// Follow-up to --patch-diag-toolstrip-buttons: that confirmed the five button FIELDS are
+// genuinely ControlToolStripButton (ToolStripItem-derived) instances, not some wrapper -- but
+// didn't explain how InitializeComponent's `tableLayoutPanel1.Controls.Add(button_Previous, 0,
+// 0)` compiles at all, since ToolStripItem doesn't convert to Control and TableLayoutPanelEx
+// doesn't override Controls. This instead enumerates tableLayoutPanel1.Controls itself (a real
+// Control.ControlCollection -- whatever ACTUALLY ended up in there, by construction, must be
+// Control-typed) by index 0..5 (six Add calls in InitializeComponent: button_Previous, lblCount,
+// button_Next, button_Reply, button_Flag, button_Delete), logging each entry's real runtime type
+// and Bounds (both genuine Control members, no cross-assembly ambiguity). Ground truth for
+// whatever hosting mechanism is really in play. Dev-only, strip before release.
+//
+// Touches MailClient.dll only (same insertion point as --patch-diag-toolstrip-buttons:
+// FormMailNotification.OnDisplayedNotificationChanged, before its single converging final ret,
+// same branch/handler-boundary retargeting). Learned the hard way on the sibling patch: the
+// branch-target placeholder MUST be a stack-neutral Nop, never a real push (IL-patching lesson
+// 8) -- decompiles clean either way, only a real push crashes at runtime (InvalidProgramException,
+// confirmed live twice before catching it).
+static int RunPatchDiagToolstripControls(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-diag-toolstrip-controls <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+    const string logPath = @"Z:\tmp\claude-diag.log";
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormMailNotification";
+    const string targetMethod = "OnDisplayedNotificationChanged";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var method = type.Methods.FirstOrDefault(m => m.Name == targetMethod && m.HasBody);
+        if (method is null) { Console.Error.WriteLine($"FAIL: {targetMethod} not found"); return 1; }
+
+        var tlpField = type.Fields.FirstOrDefault(f => f.Name == "tableLayoutPanel1");
+        if (tlpField is null) { Console.Error.WriteLine("FAIL: tableLayoutPanel1 field not found"); return 1; }
+
+        var tlpTypeDef = tlpField.FieldType.Resolve();
+        if (tlpTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve TableLayoutPanelEx"); return 1; }
+
+        MethodDefinition? getControlsDef = null;
+        for (var t = tlpTypeDef; t is not null; t = t.BaseType?.Resolve())
+        {
+            getControlsDef = t.Methods.FirstOrDefault(m => m.Name == "get_Controls" && m.Parameters.Count == 0);
+            if (getControlsDef is not null) break;
+        }
+        if (getControlsDef is null) { Console.Error.WriteLine("FAIL: get_Controls not found in TableLayoutPanelEx's base chain"); return 1; }
+        var getControlsRef = module.ImportReference(getControlsDef);
+
+        var collectionTypeDef = getControlsDef.ReturnType.Resolve();
+        if (collectionTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Controls' return type"); return 1; }
+
+        MethodDefinition? getItemDef = null;
+        for (var t = collectionTypeDef; t is not null; t = t.BaseType?.Resolve())
+        {
+            getItemDef = t.Methods.FirstOrDefault(m => m.Name == "get_Item" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.Int32");
+            if (getItemDef is not null) break;
+        }
+        if (getItemDef is null) { Console.Error.WriteLine("FAIL: get_Item(int32) not found in the Controls collection's base chain"); return 1; }
+        var getItemRef = module.ImportReference(getItemDef);
+
+        var controlTypeDef = getItemDef.ReturnType.Resolve();
+        if (controlTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Control from get_Item's ReturnType"); return 1; }
+        var controlTypeRef = module.ImportReference(controlTypeDef);
+
+        MethodDefinition? getBoundsDef = null;
+        for (var t = controlTypeDef; t is not null; t = t.BaseType?.Resolve())
+        {
+            getBoundsDef = t.Methods.FirstOrDefault(m => m.Name == "get_Bounds" && m.Parameters.Count == 0);
+            if (getBoundsDef is not null) break;
+        }
+        if (getBoundsDef is null) { Console.Error.WriteLine("FAIL: get_Bounds not found in Control's base chain"); return 1; }
+        var getBoundsRef = module.ImportReference(getBoundsDef);
+
+        var rectangleTypeDef = getBoundsDef.ReturnType.Resolve();
+        if (rectangleTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Rectangle from get_Bounds' ReturnType"); return 1; }
+        var rectangleToStringDef = rectangleTypeDef.Methods.FirstOrDefault(m => m.Name == "ToString" && m.Parameters.Count == 0);
+        if (rectangleToStringDef is null) { Console.Error.WriteLine("FAIL: Rectangle.ToString() not found"); return 1; }
+        var rectangleToStringRef = module.ImportReference(rectangleToStringDef);
+        var rectangleTypeRef = module.ImportReference(rectangleTypeDef);
+
+        MethodReference Import(System.Reflection.MethodBase mb) => module.ImportReference(mb);
+        var objectGetType = Import(typeof(object).GetMethod("GetType", Type.EmptyTypes)!);
+        var typeGetFullName = Import(typeof(Type).GetProperty("FullName")!.GetGetMethod()!);
+        var stringConcat2 = Import(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) })!);
+        var appendAllText = Import(typeof(File).GetMethod("AppendAllText", new[] { typeof(string), typeof(string) })!);
+
+        var body = method.Body;
+        body.SimplifyMacros();
+        var il = body.GetILProcessor();
+        var instrs = body.Instructions;
+        var lastInstr = instrs[instrs.Count - 1];
+        if (lastInstr.OpCode != OpCodes.Ret) { Console.Error.WriteLine($"FAIL: {targetMethod}'s last instruction isn't Ret (got {lastInstr.OpCode}) -- method shape changed, review needed"); return 1; }
+
+        var newFirst = Instruction.Create(OpCodes.Nop);
+        il.InsertBefore(lastInstr, newFirst);
+        int retargetedBranches = 0;
+        foreach (var instr in instrs)
+        {
+            if (instr != newFirst && instr.Operand == lastInstr) { instr.Operand = newFirst; retargetedBranches++; }
+        }
+        int retargetedRets = 0;
+        foreach (var instr in instrs.ToList())
+        {
+            if (instr != lastInstr && instr.OpCode == OpCodes.Ret)
+            {
+                instr.OpCode = OpCodes.Br;
+                instr.Operand = newFirst;
+                retargetedRets++;
+            }
+        }
+        int retargetedHandlerBounds = 0;
+        foreach (var handler in body.ExceptionHandlers)
+        {
+            if (handler.TryStart == lastInstr) { handler.TryStart = newFirst; retargetedHandlerBounds++; }
+            if (handler.TryEnd == lastInstr) { handler.TryEnd = newFirst; retargetedHandlerBounds++; }
+            if (handler.HandlerStart == lastInstr) { handler.HandlerStart = newFirst; retargetedHandlerBounds++; }
+            if (handler.HandlerEnd == lastInstr) { handler.HandlerEnd = newFirst; retargetedHandlerBounds++; }
+        }
+        Console.WriteLine($"     ({retargetedBranches} branch operand(s), {retargetedRets} standalone early-ret instruction(s), {retargetedHandlerBounds} handler boundary field(s) retargeted from the old final ret to the new pre-ret logging)");
+
+        var controlLocal = new VariableDefinition(controlTypeRef);
+        var rectLocal = new VariableDefinition(rectangleTypeRef);
+        body.Variables.Add(controlLocal);
+        body.Variables.Add(rectLocal);
+        body.InitLocals = true;
+
+        for (int i = 0; i < 6; i++)
+        {
+            var tmpMsg = new VariableDefinition(module.TypeSystem.String);
+            body.Variables.Add(tmpMsg);
+
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldarg_0));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldfld, tlpField));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Callvirt, getControlsRef));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldc_I4, i));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Callvirt, getItemRef));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Stloc, controlLocal));
+
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, $"tlp[{i}] type="));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldloc, controlLocal));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Callvirt, module.ImportReference(objectGetType)));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Callvirt, module.ImportReference(typeGetFullName)));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, " bounds="));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldloc, controlLocal));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Callvirt, getBoundsRef));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Stloc, rectLocal));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldloca, rectLocal));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, rectangleToStringRef));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, "\n"));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Stloc, tmpMsg));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, logPath));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldloc, tmpMsg));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, appendAllText));
+        }
+
+        // tableLayoutPanel1's own Bounds, relative to `this` (a genuine direct child of the
+        // form, per InitializeComponent's base.Controls.Add(tableLayoutPanel1)) -- needed to
+        // translate the per-button Bounds above (relative to tableLayoutPanel1's own client area)
+        // into final on-screen-within-the-form coordinates.
+        {
+            var tmpMsg = new VariableDefinition(module.TypeSystem.String);
+            body.Variables.Add(tmpMsg);
+
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, "tableLayoutPanel1 bounds="));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldarg_0));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldfld, tlpField));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Callvirt, getBoundsRef));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Stloc, rectLocal));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldloca, rectLocal));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, rectangleToStringRef));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, "\n"));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, stringConcat2));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Stloc, tmpMsg));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldstr, logPath));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Ldloc, tmpMsg));
+            il.InsertBefore(lastInstr, Instruction.Create(OpCodes.Call, appendAllText));
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::{targetMethod} -- now logs tableLayoutPanel1.Controls[0..5]'s runtime type + Bounds, plus tableLayoutPanel1's own Bounds, to {logPath}");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-toolbar-icons <input-dir> <output-dir>
+//
+// Fixes the reply/flag/delete/previous/next row (bottom strip of a mail notification) having the
+// exact same invisible-until-fade bug as everything else in this project -- confirmed live (user:
+// "I could only see them as they faded out"). Unlike close/settings (--patch-notification-icon-
+// bitmap, simple Image fields drawn directly by OnPaint), these five are REAL child controls
+// (MailClient.Common.UI.Controls.ControlToolStrip.ControlToolStripButton, hosted in
+// tableLayoutPanel1), each with real image-list/tint-based hover rendering already built into
+// their own OnPaint -- confirmed via --patch-diag-toolstrip-buttons/--patch-diag-toolstrip-
+// controls (see reports/notification-empty-until-fade-findings.md) that they're genuinely Control-
+// derived (their own `Bounds`/`Visible` are public, directly-callable properties). OnPaint/
+// OnMouseEnter/OnMouseLeave, though, are `protected`, declared on a class in a different assembly
+// (MailClient.Common.UI.dll) than FormMailNotification (MailClient.dll) -- calling them directly
+// from an unrelated class would violate CLR member accessibility. Rather than reimplementing their
+// genuinely complex, theme/hover/tint-dependent paint logic by hand, this reuses them via
+// reflection (Type.GetMethod(NonPublic|Instance) + MethodBase.Invoke, via a small shared
+// __invokeProtected helper below).
+//
+// **A first attempt instead flipped OnPaint/OnMouseEnter/OnMouseLeave's own visibility from
+// protected to public directly in MailClient.Common.UI.dll** (the user's own suggestion, since
+// this is raw IL editing anyway -- no reflection, no object[] boxing, seemingly the cleaner fix).
+// It decompiled clean and deployed without error, but broke icon rendering on EVERY toolbar
+// button across the entire app (confirmed live via screenshot -- user: "The whole UI is broken
+// now"), not just the notification's own buttons: ControlToolStripButton is the shared control
+// behind every toolbar in eM Client, and the C# compiler's rule against widening an override's
+// accessibility beyond its base declaration turned out to matter at the CLR level too, not just
+// at compile time -- the mismatch broke the type broadly, not just the one call site being
+// touched. Reverted immediately (redeployed the pre-patch build, confirmed via screenshot the
+// whole UI was back to normal). Lesson for this project: editing a *shared library* type's own
+// member metadata (visibility, and likely anything else affecting its public contract) needs a
+// blast-radius check across its OTHER call sites before deploying, not just the one feature path
+// being worked on -- unlike every other patch in this file, which only ever touches methods
+// specific to the one type/feature being fixed. Reflection has real costs (more code, a
+// string-based method lookup that could silently no-op if the name's ever wrong) but has zero
+// blast radius outside the new methods that use it, which is worth the trade here.
+//
+// Confirmed live (before this patch) that native click routing does NOT work on these controls
+// either, matching everything else in this project that lives on `this` form's own unreliable
+// window -- user: "Any click across the button had no effect". So this also needs its own click
+// hit-testing, layered on top of (and checked BEFORE, since contentRect's hit-test rectangle
+// genuinely overlaps the toolbar strip's Y range -- confirmed via --patch-notification-geometry-
+// diag's content={Y=56,Height=64} vs. the toolbar's Y=94..116) the existing performMouseClick.
+//
+// Adds, all on FormMailNotification (MailClient.dll) -- a derived class of FormGenericNotification
+// with its own reply/flag/delete/previous/next fields the shared base class doesn't have, so this
+// can't just extend FormGenericNotification's existing updateBackgroundBitmap/OnMouseMove/
+// performMouseClick in place the way earlier patches did for close/settings:
+//   - five new private bool fields: mouseOverReply/mouseOverFlag/mouseOverDelete/
+//     mouseOverPrevious/mouseOverNext
+//   - __toolbarButtonRect(ControlToolStripButton) -> Rectangle -- tableLayoutPanel1.Bounds.Location
+//     + button.Bounds, translated into `this`-relative coordinates
+//   - __drawToolbarButton(Graphics, ControlToolStripButton) -- translates to the button's rect,
+//     calls its real (protected) OnPaint via __invokeProtected, translates back
+//   - a NEW override of updateBackgroundBitmap() -- calls base (draws everything the existing
+//     chain already does, title/content/close/settings/border), then draws all 5 toolbar buttons
+//     on top via __drawToolbarButton (skipping any not currently Visible -- previous/next are only
+//     Visible when multiple notifications are queued, and their Bounds are stale/unreliable while
+//     hidden, confirmed via --patch-diag-toolstrip-controls)
+//   - a NEW override of OnMouseMove(MouseEventArgs) -- calls base first (preserves existing close/
+//     settings hover, unaffected since it lives in a different Y range), then for each Visible
+//     button compares __toolbarButtonRect(button).Contains(e.Location) against its own mouseOverX
+//     field, forwarding OnMouseEnter/OnMouseLeave into the real (protected) button methods via __invokeProtected
+//     directly on change, and calling updateLayeredBackground(refreshBitmap: true) once if
+//     anything changed
+//   - a NEW override of performMouseClick(Point) -- checks all 5 toolbar rects FIRST (priority
+//     over contentRect's overlapping hit-test region -- see above), calling the real, unmodified,
+//     already-private click handlers (Replyaction/Flag/Delete/button_Previous_Click/
+//     button_Next_Click) directly with (this, EventArgs.Empty) on a hit, only falling through to
+//     base.performMouseClick(location) if none matched
+//
+// Since every new method above is written from scratch (not inserted into an existing method's
+// body), none of the branch-retargeting/exception-handler-boundary concerns from IL-patching
+// lessons 2/3 apply here -- full control over control flow from the start, multiple early `ret`s
+// are simply fine in a method with no try/catch regions.
+static int RunPatchNotificationToolbarIcons(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-toolbar-icons <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Forms.NotificationForms.FormMailNotification";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patchedMailClient = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var baseType = type.BaseType?.Resolve();
+        if (baseType is null) { Console.Error.WriteLine("FAIL: couldn't resolve FormGenericNotification (base type)"); return 1; }
+
+        string[] buttonFieldNames = { "button_Reply", "button_Flag", "button_Delete", "button_Previous", "button_Next" };
+        string[] mouseOverFieldNames = { "mouseOverReply", "mouseOverFlag", "mouseOverDelete", "mouseOverPrevious", "mouseOverNext" };
+        string[] clickHandlerNames = { "Replyaction", "Flag", "Delete", "button_Previous_Click", "button_Next_Click" };
+
+        var buttonFields = new FieldDefinition[5];
+        for (int i = 0; i < 5; i++)
+        {
+            var f = type.Fields.FirstOrDefault(f => f.Name == buttonFieldNames[i]);
+            if (f is null) { Console.Error.WriteLine($"FAIL: field not found: {buttonFieldNames[i]}"); return 1; }
+            buttonFields[i] = f;
+        }
+        var tlpField = type.Fields.FirstOrDefault(f => f.Name == "tableLayoutPanel1");
+        if (tlpField is null) { Console.Error.WriteLine("FAIL: tableLayoutPanel1 field not found"); return 1; }
+
+        var clickHandlerDefs = new MethodDefinition[5];
+        for (int i = 0; i < 5; i++)
+        {
+            var m = type.Methods.FirstOrDefault(m => m.Name == clickHandlerNames[i] && m.HasBody);
+            if (m is null) { Console.Error.WriteLine($"FAIL: click handler method not found: {clickHandlerNames[i]}"); return 1; }
+            clickHandlerDefs[i] = m;
+        }
+
+        var buttonTypeDef = buttonFields[0].FieldType.Resolve();
+        if (buttonTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve ControlToolStripButton"); return 1; }
+        var buttonTypeRef = module.ImportReference(buttonTypeDef);
+
+        // Bounds/Visible are PUBLIC (confirmed via --patch-diag-toolstrip-controls: calling
+        // get_Bounds directly on a Controls-collection-typed reference worked at runtime without
+        // any access violation) -- found by walking ControlToolStripButton's own base chain, same
+        // technique as everywhere else in this file for a foreign-assembly member.
+        MethodDefinition? FindInBaseChain(TypeDefinition start, string name, int paramCount)
+        {
+            for (var t = start; t is not null; t = t.BaseType?.Resolve())
+            {
+                var m = t.Methods.FirstOrDefault(m => m.Name == name && m.Parameters.Count == paramCount);
+                if (m is not null) return m;
+            }
+            return null;
+        }
+
+        var getBoundsDef = FindInBaseChain(buttonTypeDef, "get_Bounds", 0);
+        if (getBoundsDef is null) { Console.Error.WriteLine("FAIL: get_Bounds not found in ControlToolStripButton's base chain"); return 1; }
+        var getBoundsRef = module.ImportReference(getBoundsDef);
+        var getVisibleDef = FindInBaseChain(buttonTypeDef, "get_Visible", 0);
+        if (getVisibleDef is null) { Console.Error.WriteLine("FAIL: get_Visible not found in ControlToolStripButton's base chain"); return 1; }
+        var getVisibleRef = module.ImportReference(getVisibleDef);
+
+        // OnPaint/OnMouseEnter/OnMouseLeave are `protected`, declared on ControlToolStripButton
+        // (MailClient.Common.UI.dll) -- an unrelated class relative to FormMailNotification
+        // (MailClient.dll), so calling them directly would violate CLR member accessibility.
+        // A first attempt instead flipped their visibility to public via raw IL/metadata editing
+        // (the C# compiler would block widening an override's accessibility, but this bypasses the
+        // compiler entirely) -- deployed fine in isolation, but ControlToolStripButton is the
+        // shared control behind EVERY toolbar button in the whole app, and the visibility change
+        // broke icon rendering app-wide (confirmed live via screenshot: every toolbar button
+        // reduced to text-only, no icons -- user: "The whole UI is broken now"). Reverted
+        // immediately. This uses reflection instead (Type.GetMethod(NonPublic|Instance) +
+        // MethodBase.Invoke, via a small shared helper below) -- more code, but touches nothing
+        // outside FormMailNotification's own new methods, zero blast radius on the shared library.
+        var rectangleTypeDef = getBoundsDef.ReturnType.Resolve();
+        if (rectangleTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Rectangle"); return 1; }
+        var rectangleTypeRef = module.ImportReference(rectangleTypeDef);
+        MethodDefinition? RectMethod(string name, int paramCount) => rectangleTypeDef.Methods.FirstOrDefault(m => m.Name == name && m.Parameters.Count == paramCount);
+        var rectGetX = RectMethod("get_X", 0); var rectGetY = RectMethod("get_Y", 0);
+        var rectGetWidth = RectMethod("get_Width", 0); var rectGetHeight = RectMethod("get_Height", 0);
+        var rectCtor4 = rectangleTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 4);
+        var rectContains = rectangleTypeDef.Methods.FirstOrDefault(m => m.Name == "Contains" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "Point");
+        var rectToString = RectMethod("ToString", 0);
+        if (rectGetX is null || rectGetY is null || rectGetWidth is null || rectGetHeight is null || rectCtor4 is null || rectContains is null || rectToString is null)
+        { Console.Error.WriteLine("FAIL: one or more Rectangle members (get_X/get_Y/get_Width/get_Height/.ctor(4)/Contains(Point)/ToString) not found"); return 1; }
+        var rectGetXRef = module.ImportReference(rectGetX); var rectGetYRef = module.ImportReference(rectGetY);
+        var rectGetWidthRef = module.ImportReference(rectGetWidth); var rectGetHeightRef = module.ImportReference(rectGetHeight);
+        var rectCtor4Ref = module.ImportReference(rectCtor4); var rectContainsRef = module.ImportReference(rectContains);
+        var rectToStringRef = module.ImportReference(rectToString);
+
+        var pointTypeDef = rectContains.Parameters[0].ParameterType.Resolve();
+        if (pointTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Point from Rectangle.Contains' parameter"); return 1; }
+        var pointTypeRef = module.ImportReference(pointTypeDef);
+
+        // TranslateTransform -- reuse the exact already-in-module reference updateBackgroundBitmap
+        // itself uses (Graphics.TranslateTransform(Single,Single)), confirmed present via
+        // --dump-il, rather than resolving System.Drawing.Common.dll fresh.
+        var updateBackgroundBitmapDef = baseType.Methods.FirstOrDefault(m => m.Name == "updateBackgroundBitmap" && m.HasBody);
+        if (updateBackgroundBitmapDef is null) { Console.Error.WriteLine("FAIL: FormGenericNotification.updateBackgroundBitmap not found"); return 1; }
+        var translateTransformInstr = updateBackgroundBitmapDef.Body.Instructions.FirstOrDefault(i => i.Operand is MethodReference mr && mr.Name == "TranslateTransform");
+        if (translateTransformInstr is null) { Console.Error.WriteLine("FAIL: TranslateTransform call not found in updateBackgroundBitmap"); return 1; }
+        var translateTransformRef = (MethodReference)translateTransformInstr.Operand;
+        var graphicsTypeDef = translateTransformRef.DeclaringType.Resolve();
+        if (graphicsTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Graphics from TranslateTransform's DeclaringType"); return 1; }
+        var graphicsTypeRef = module.ImportReference(graphicsTypeDef);
+        var graphicsSaveDef = graphicsTypeDef.Methods.FirstOrDefault(m => m.Name == "Save" && m.Parameters.Count == 0);
+        if (graphicsSaveDef is null) { Console.Error.WriteLine("FAIL: Graphics.Save() not found"); return 1; }
+        var graphicsStateTypeRef = module.ImportReference(graphicsSaveDef.ReturnType);
+        var graphicsRestoreDef = graphicsTypeDef.Methods.FirstOrDefault(m => m.Name == "Restore" && m.Parameters.Count == 1);
+        if (graphicsRestoreDef is null) { Console.Error.WriteLine("FAIL: Graphics.Restore(GraphicsState) not found"); return 1; }
+        var graphicsSaveRef = module.ImportReference(graphicsSaveDef);
+        var graphicsRestoreRef = module.ImportReference(graphicsRestoreDef);
+
+        // PaintEventArgs -- same assembly as Control/ControlToolStripButton's base chain
+        // (System.Windows.Forms.dll), reached sideways from that already-correctly-resolved
+        // module rather than typeof() on the patcher's own net10 process (lesson 5).
+        var winFormsModule = getVisibleDef.DeclaringType.Module;
+        var paintEventArgsTypeDef = winFormsModule.GetType("System.Windows.Forms.PaintEventArgs");
+        if (paintEventArgsTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't find System.Windows.Forms.PaintEventArgs in System.Windows.Forms.dll"); return 1; }
+        var paintEventArgsCtor = paintEventArgsTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 2
+            && m.Parameters[0].ParameterType.Name == "Graphics" && m.Parameters[1].ParameterType.Name == "Rectangle");
+        if (paintEventArgsCtor is null) { Console.Error.WriteLine("FAIL: PaintEventArgs(Graphics, Rectangle) ctor not found"); return 1; }
+        var paintEventArgsCtorRef = module.ImportReference(paintEventArgsCtor);
+
+        // EventArgs.Empty -- a static READONLY FIELD (not a property -- GetProperty("Empty")
+        // returns null, confirmed the hard way), for the click-handler and OnMouseEnter/Leave
+        // calls. EventArgs is CoreLib-forwarded, lesson 5-safe.
+        var eventArgsEmptyFieldRef = module.ImportReference(typeof(EventArgs).GetField("Empty")!);
+        var boolTypeRef = module.TypeSystem.Boolean;
+        var objectTypeRef = module.TypeSystem.Object;
+
+        // Reflection plumbing for __invokeProtected below -- all CoreLib-forwarded (Type,
+        // MethodBase, BindingFlags), lesson-5-safe to reflect on the patcher's own process for.
+        MethodReference Import(System.Reflection.MethodBase mb) => module.ImportReference(mb);
+        var objectGetType = Import(typeof(object).GetMethod("GetType", Type.EmptyTypes)!);
+        var typeGetMethod = Import(typeof(Type).GetMethod("GetMethod", new[] { typeof(string), typeof(System.Reflection.BindingFlags) })!);
+        var methodBaseInvoke = Import(typeof(System.Reflection.MethodBase).GetMethod("Invoke", new[] { typeof(object), typeof(object[]) })!);
+        int nonPublicInstanceFlags = (int)(System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+        // --- five new private bool fields ---
+        var mouseOverFields = new FieldDefinition[5];
+        for (int i = 0; i < 5; i++)
+        {
+            var f = new FieldDefinition(mouseOverFieldNames[i], FieldAttributes.Private, boolTypeRef);
+            type.Fields.Add(f);
+            mouseOverFields[i] = f;
+        }
+
+        // --- __invokeProtected(object target, string methodName, object[] args) ---
+        // Calls a protected instance method on a foreign-assembly object via reflection, since a
+        // direct call would violate CLR member accessibility (see note above on why this isn't
+        // done by widening the target method's own visibility instead).
+        var invokeProtectedMethod = new MethodDefinition("__invokeProtected",
+            MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        invokeProtectedMethod.Parameters.Add(new ParameterDefinition("target", ParameterAttributes.None, objectTypeRef));
+        invokeProtectedMethod.Parameters.Add(new ParameterDefinition("methodName", ParameterAttributes.None, module.TypeSystem.String));
+        invokeProtectedMethod.Parameters.Add(new ParameterDefinition("args", ParameterAttributes.None, new ArrayType(objectTypeRef)));
+        {
+            var body = invokeProtectedMethod.Body;
+            var il = body.GetILProcessor();
+            var miLocal = new VariableDefinition(module.ImportReference(typeof(System.Reflection.MethodInfo)));
+            body.Variables.Add(miLocal);
+            body.InitLocals = true;
+
+            var retInstr = Instruction.Create(OpCodes.Ret);
+
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Callvirt, objectGetType);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Ldc_I4, nonPublicInstanceFlags);
+            il.Emit(OpCodes.Callvirt, typeGetMethod);
+            il.Emit(OpCodes.Stloc, miLocal);
+            il.Emit(OpCodes.Ldloc, miLocal);
+            il.Emit(OpCodes.Brfalse, retInstr);
+            il.Emit(OpCodes.Ldloc, miLocal);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldarg_2);
+            il.Emit(OpCodes.Callvirt, methodBaseInvoke);
+            il.Emit(OpCodes.Pop);
+            il.Append(retInstr);
+        }
+        type.Methods.Add(invokeProtectedMethod);
+
+        // --- __toolbarButtonRect(ControlToolStripButton button) -> Rectangle ---
+        var toolbarRectMethod = new MethodDefinition("__toolbarButtonRect",
+            MethodAttributes.Private | MethodAttributes.HideBySig,
+            rectangleTypeRef);
+        toolbarRectMethod.Parameters.Add(new ParameterDefinition("button", ParameterAttributes.None, buttonTypeRef));
+        {
+            var body = toolbarRectMethod.Body;
+            var il = body.GetILProcessor();
+            var tLocal = new VariableDefinition(rectangleTypeRef);
+            var bLocal = new VariableDefinition(rectangleTypeRef);
+            body.Variables.Add(tLocal);
+            body.Variables.Add(bLocal);
+            body.InitLocals = true;
+
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, tlpField);
+            il.Emit(OpCodes.Callvirt, getBoundsRef);
+            il.Emit(OpCodes.Stloc, tLocal);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Callvirt, getBoundsRef);
+            il.Emit(OpCodes.Stloc, bLocal);
+
+            il.Emit(OpCodes.Ldloca, tLocal);
+            il.Emit(OpCodes.Call, rectGetXRef);
+            il.Emit(OpCodes.Ldloca, bLocal);
+            il.Emit(OpCodes.Call, rectGetXRef);
+            il.Emit(OpCodes.Add);
+            il.Emit(OpCodes.Ldloca, tLocal);
+            il.Emit(OpCodes.Call, rectGetYRef);
+            il.Emit(OpCodes.Ldloca, bLocal);
+            il.Emit(OpCodes.Call, rectGetYRef);
+            il.Emit(OpCodes.Add);
+            il.Emit(OpCodes.Ldloca, bLocal);
+            il.Emit(OpCodes.Call, rectGetWidthRef);
+            il.Emit(OpCodes.Ldloca, bLocal);
+            il.Emit(OpCodes.Call, rectGetHeightRef);
+            il.Emit(OpCodes.Newobj, rectCtor4Ref);
+            il.Emit(OpCodes.Ret);
+        }
+        type.Methods.Add(toolbarRectMethod);
+
+        // --- __drawToolbarButton(Graphics g, ControlToolStripButton button) ---
+        var drawToolbarButtonMethod = new MethodDefinition("__drawToolbarButton",
+            MethodAttributes.Private | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        drawToolbarButtonMethod.Parameters.Add(new ParameterDefinition("g", ParameterAttributes.None, graphicsTypeRef));
+        drawToolbarButtonMethod.Parameters.Add(new ParameterDefinition("button", ParameterAttributes.None, buttonTypeRef));
+        {
+            // ControlToolStripButton.OnPaint's own image-drawing branch calls
+            // Graphics.ResetTransform() internally (confirmed via decompile -- part of its
+            // rotation-transform handling, unconditional whenever an image actually draws), which
+            // wipes ANY transform applied before calling it -- including a naive manual
+            // TranslateTransform(+X,+Y) / TranslateTransform(-X,-Y) "undo" pair around the call
+            // (the first draft here). That undo then applies to an already-reset (identity)
+            // matrix instead of the intended baseline, corrupting the transform for every
+            // subsequent button drawn on the same Graphics -- confirmed live: the first button
+            // drawn (Reply) landed correctly, everything drawn after it did not (Delete/Flag
+            // observed rendering near the avatar instead of the toolbar strip). Graphics.Save()/
+            // Restore(GraphicsState) is immune to this: Restore() puts the ENTIRE transform/clip
+            // state back to exactly what Save() captured, regardless of what OnPaint did with it
+            // in between (translate, rotate, or reset), so each button's paint call is fully
+            // isolated from the others.
+            var body = drawToolbarButtonMethod.Body;
+            var il = body.GetILProcessor();
+            var rLocal = new VariableDefinition(rectangleTypeRef);
+            var argsLocal = new VariableDefinition(new ArrayType(objectTypeRef));
+            var stateLocal = new VariableDefinition(graphicsStateTypeRef);
+            body.Variables.Add(rLocal);
+            body.Variables.Add(argsLocal);
+            body.Variables.Add(stateLocal);
+            body.InitLocals = true;
+
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldarg_2);
+            il.Emit(OpCodes.Call, toolbarRectMethod);
+            il.Emit(OpCodes.Stloc, rLocal);
+
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Callvirt, graphicsSaveRef);
+            il.Emit(OpCodes.Stloc, stateLocal);
+
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Ldloca, rLocal);
+            il.Emit(OpCodes.Call, rectGetXRef);
+            il.Emit(OpCodes.Conv_R4);
+            il.Emit(OpCodes.Ldloca, rLocal);
+            il.Emit(OpCodes.Call, rectGetYRef);
+            il.Emit(OpCodes.Conv_R4);
+            il.Emit(OpCodes.Callvirt, translateTransformRef);
+
+            // __invokeProtected(button, "OnPaint", new object[] { new PaintEventArgs(g, new Rectangle(0, 0, r.Width, r.Height)) });
+            il.Emit(OpCodes.Ldc_I4_1);
+            il.Emit(OpCodes.Newarr, objectTypeRef);
+            il.Emit(OpCodes.Stloc, argsLocal);
+            il.Emit(OpCodes.Ldloc, argsLocal);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Ldloca, rLocal);
+            il.Emit(OpCodes.Call, rectGetWidthRef);
+            il.Emit(OpCodes.Ldloca, rLocal);
+            il.Emit(OpCodes.Call, rectGetHeightRef);
+            il.Emit(OpCodes.Newobj, rectCtor4Ref);
+            il.Emit(OpCodes.Newobj, paintEventArgsCtorRef);
+            il.Emit(OpCodes.Stelem_Ref);
+
+            il.Emit(OpCodes.Ldarg_2);
+            il.Emit(OpCodes.Ldstr, "OnPaint");
+            il.Emit(OpCodes.Ldloc, argsLocal);
+            il.Emit(OpCodes.Call, invokeProtectedMethod);
+
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Ldloc, stateLocal);
+            il.Emit(OpCodes.Callvirt, graphicsRestoreRef);
+            il.Emit(OpCodes.Ret);
+        }
+        type.Methods.Add(drawToolbarButtonMethod);
+
+        // --- override updateBackgroundBitmap() ---
+        var newUpdateBackgroundBitmap = new MethodDefinition("updateBackgroundBitmap",
+            MethodAttributes.Family | MethodAttributes.Virtual | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        {
+            var body = newUpdateBackgroundBitmap.Body;
+            var il = body.GetILProcessor();
+
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Call, module.ImportReference(updateBackgroundBitmapDef));
+
+            // if (backgroundBitmap == null) return;
+            var backgroundBitmapField = FindFieldInBaseChain(baseType, "backgroundBitmap");
+            if (backgroundBitmapField is null) { Console.Error.WriteLine("FAIL: backgroundBitmap field not found"); return 1; }
+            var retInstr = Instruction.Create(OpCodes.Ret);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, module.ImportReference(backgroundBitmapField));
+            il.Emit(OpCodes.Brfalse, retInstr);
+
+            // using Graphics g = Graphics.FromImage(backgroundBitmap);
+            var graphicsFromImage = graphicsTypeDef.Methods.FirstOrDefault(m => m.Name == "FromImage" && m.Parameters.Count == 1);
+            if (graphicsFromImage is null) { Console.Error.WriteLine("FAIL: Graphics.FromImage(Image) not found"); return 1; }
+            var graphicsDispose = FindInBaseChain(graphicsTypeDef, "Dispose", 0);
+            if (graphicsDispose is null) { Console.Error.WriteLine("FAIL: Graphics.Dispose() not found"); return 1; }
+            var gLocal = new VariableDefinition(graphicsTypeRef);
+            body.Variables.Add(gLocal);
+            body.InitLocals = true;
+
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, module.ImportReference(backgroundBitmapField));
+            il.Emit(OpCodes.Call, module.ImportReference(graphicsFromImage));
+            il.Emit(OpCodes.Stloc, gLocal);
+
+            // if (ShadowVisible) g.TranslateTransform(9f, 9f);
+            var shadowVisibleDef = FindPropertyGetterInBaseChain(baseType, "ShadowVisible");
+            if (shadowVisibleDef is null) { Console.Error.WriteLine("FAIL: get_ShadowVisible not found"); return 1; }
+            var afterShadow = Instruction.Create(OpCodes.Nop);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Call, module.ImportReference(shadowVisibleDef));
+            il.Emit(OpCodes.Brfalse, afterShadow);
+            il.Emit(OpCodes.Ldloc, gLocal);
+            il.Emit(OpCodes.Ldc_R4, 9f);
+            il.Emit(OpCodes.Ldc_R4, 9f);
+            il.Emit(OpCodes.Callvirt, translateTransformRef);
+            il.Append(afterShadow);
+
+            var appendAllTextRef = Import(typeof(File).GetMethod("AppendAllText", new[] { typeof(string), typeof(string) })!);
+            var stringConcat2Ref = Import(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) })!);
+            var diagRectLocal = new VariableDefinition(rectangleTypeRef);
+            body.Variables.Add(diagRectLocal);
+            foreach (var bf in buttonFields)
+            {
+                var skip = Instruction.Create(OpCodes.Nop);
+                // "TOOLBARPAINT <name> rect=" + __toolbarButtonRect(this.bf).ToString() + " begin\n"
+                il.Emit(OpCodes.Ldstr, @"Z:\tmp\claude-diag.log");
+                il.Emit(OpCodes.Ldstr, "TOOLBARPAINT " + bf.Name + " rect=");
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, bf);
+                il.Emit(OpCodes.Call, toolbarRectMethod);
+                il.Emit(OpCodes.Stloc, diagRectLocal);
+                il.Emit(OpCodes.Ldloca, diagRectLocal);
+                il.Emit(OpCodes.Call, rectToStringRef);
+                il.Emit(OpCodes.Call, stringConcat2Ref);
+                il.Emit(OpCodes.Ldstr, " begin\n");
+                il.Emit(OpCodes.Call, stringConcat2Ref);
+                il.Emit(OpCodes.Call, appendAllTextRef);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, bf);
+                il.Emit(OpCodes.Callvirt, getVisibleRef);
+                il.Emit(OpCodes.Brfalse, skip);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldloc, gLocal);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, bf);
+                il.Emit(OpCodes.Call, drawToolbarButtonMethod);
+                il.Append(skip);
+                il.Emit(OpCodes.Ldstr, @"Z:\tmp\claude-diag.log");
+                il.Emit(OpCodes.Ldstr, "TOOLBARPAINT " + bf.Name + " end\n");
+                il.Emit(OpCodes.Call, appendAllTextRef);
+            }
+
+            il.Emit(OpCodes.Ldloc, gLocal);
+            il.Emit(OpCodes.Callvirt, module.ImportReference(graphicsDispose));
+            il.Append(retInstr);
+        }
+        type.Methods.Add(newUpdateBackgroundBitmap);
+
+        // --- override OnMouseMove(MouseEventArgs e) ---
+        var baseOnMouseMove = FindInBaseChain(baseType, "OnMouseMove", 1);
+        if (baseOnMouseMove is null) { Console.Error.WriteLine("FAIL: OnMouseMove(MouseEventArgs) not found in base chain"); return 1; }
+        var mouseEventArgsTypeRef = module.ImportReference(baseOnMouseMove.Parameters[0].ParameterType);
+        var getLocationDef = FindInBaseChain(baseOnMouseMove.Parameters[0].ParameterType.Resolve(), "get_Location", 0);
+        if (getLocationDef is null) { Console.Error.WriteLine("FAIL: MouseEventArgs.get_Location not found"); return 1; }
+        var getLocationRef = module.ImportReference(getLocationDef);
+        var updateLayeredBackgroundDef = FindInBaseChain(baseType, "updateLayeredBackground", 1);
+        if (updateLayeredBackgroundDef is null) { Console.Error.WriteLine("FAIL: updateLayeredBackground(bool) not found in base chain"); return 1; }
+
+        var newOnMouseMove = new MethodDefinition("OnMouseMove",
+            MethodAttributes.Family | MethodAttributes.Virtual | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        newOnMouseMove.Parameters.Add(new ParameterDefinition("e", ParameterAttributes.None, mouseEventArgsTypeRef));
+        {
+            var body = newOnMouseMove.Body;
+            var il = body.GetILProcessor();
+            var ptLocal = new VariableDefinition(pointTypeRef);
+            var rLocal = new VariableDefinition(rectangleTypeRef);
+            var anyChangedLocal = new VariableDefinition(boolTypeRef);
+            body.Variables.Add(ptLocal);
+            body.Variables.Add(rLocal);
+            body.Variables.Add(anyChangedLocal);
+            body.InitLocals = true;
+
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Call, module.ImportReference(baseOnMouseMove));
+
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Callvirt, getLocationRef);
+            il.Emit(OpCodes.Stloc, ptLocal);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Stloc, anyChangedLocal);
+
+            for (int i = 0; i < 5; i++)
+            {
+                var bf = buttonFields[i];
+                var mf = mouseOverFields[i];
+                var skipAll = Instruction.Create(OpCodes.Nop);
+                var notContained = Instruction.Create(OpCodes.Nop);
+                var afterEnterCheck = Instruction.Create(OpCodes.Nop);
+                var afterLeaveCheck = Instruction.Create(OpCodes.Nop);
+
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, bf);
+                il.Emit(OpCodes.Callvirt, getVisibleRef);
+                il.Emit(OpCodes.Brfalse, skipAll);
+
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, bf);
+                il.Emit(OpCodes.Call, toolbarRectMethod);
+                il.Emit(OpCodes.Stloc, rLocal);
+
+                il.Emit(OpCodes.Ldloca, rLocal);
+                il.Emit(OpCodes.Ldloc, ptLocal);
+                il.Emit(OpCodes.Call, rectContainsRef);
+                il.Emit(OpCodes.Brfalse, notContained);
+
+                // contained: if (!mouseOverX) { __invokeProtected(button, "OnMouseEnter", new object[]{EventArgs.Empty}); mouseOverX = true; anyChanged = true; }
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, mf);
+                il.Emit(OpCodes.Brtrue, afterEnterCheck);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, bf);
+                il.Emit(OpCodes.Ldstr, "OnMouseEnter");
+                il.Emit(OpCodes.Ldc_I4_1);
+                il.Emit(OpCodes.Newarr, objectTypeRef);
+                il.Emit(OpCodes.Dup);
+                il.Emit(OpCodes.Ldc_I4_0);
+                il.Emit(OpCodes.Ldsfld, eventArgsEmptyFieldRef);
+                il.Emit(OpCodes.Stelem_Ref);
+                il.Emit(OpCodes.Call, invokeProtectedMethod);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldc_I4_1);
+                il.Emit(OpCodes.Stfld, mf);
+                il.Emit(OpCodes.Ldc_I4_1);
+                il.Emit(OpCodes.Stloc, anyChangedLocal);
+                il.Append(afterEnterCheck);
+                il.Emit(OpCodes.Br, skipAll);
+
+                // not contained: if (mouseOverX) { __invokeProtected(button, "OnMouseLeave", new object[]{EventArgs.Empty}); mouseOverX = false; anyChanged = true; }
+                il.Append(notContained);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, mf);
+                il.Emit(OpCodes.Brfalse, afterLeaveCheck);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, bf);
+                il.Emit(OpCodes.Ldstr, "OnMouseLeave");
+                il.Emit(OpCodes.Ldc_I4_1);
+                il.Emit(OpCodes.Newarr, objectTypeRef);
+                il.Emit(OpCodes.Dup);
+                il.Emit(OpCodes.Ldc_I4_0);
+                il.Emit(OpCodes.Ldsfld, eventArgsEmptyFieldRef);
+                il.Emit(OpCodes.Stelem_Ref);
+                il.Emit(OpCodes.Call, invokeProtectedMethod);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldc_I4_0);
+                il.Emit(OpCodes.Stfld, mf);
+                il.Emit(OpCodes.Ldc_I4_1);
+                il.Emit(OpCodes.Stloc, anyChangedLocal);
+                il.Append(afterLeaveCheck);
+
+                il.Append(skipAll);
+            }
+
+            var endInstr = Instruction.Create(OpCodes.Ret);
+            il.Emit(OpCodes.Ldloc, anyChangedLocal);
+            il.Emit(OpCodes.Brfalse, endInstr);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldc_I4_1);
+            il.Emit(OpCodes.Call, module.ImportReference(updateLayeredBackgroundDef));
+            il.Append(endInstr);
+        }
+        type.Methods.Add(newOnMouseMove);
+
+        // --- override performMouseClick(Point location) ---
+        var basePerformMouseClick = baseType.Methods.FirstOrDefault(m => m.Name == "performMouseClick" && m.HasBody);
+        if (basePerformMouseClick is null) { Console.Error.WriteLine("FAIL: FormGenericNotification.performMouseClick not found"); return 1; }
+
+        var newPerformMouseClick = new MethodDefinition("performMouseClick",
+            MethodAttributes.Family | MethodAttributes.Virtual | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        newPerformMouseClick.Parameters.Add(new ParameterDefinition("location", ParameterAttributes.None, pointTypeRef));
+        {
+            var body = newPerformMouseClick.Body;
+            var il = body.GetILProcessor();
+            var rLocal = new VariableDefinition(rectangleTypeRef);
+            body.Variables.Add(rLocal);
+            body.InitLocals = true;
+
+            for (int i = 0; i < 5; i++)
+            {
+                var bf = buttonFields[i];
+                var handler = clickHandlerDefs[i];
+                var skip = Instruction.Create(OpCodes.Nop);
+
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, bf);
+                il.Emit(OpCodes.Callvirt, getVisibleRef);
+                il.Emit(OpCodes.Brfalse, skip);
+
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, bf);
+                il.Emit(OpCodes.Call, toolbarRectMethod);
+                il.Emit(OpCodes.Stloc, rLocal);
+                il.Emit(OpCodes.Ldloca, rLocal);
+                il.Emit(OpCodes.Ldarg_1);
+                il.Emit(OpCodes.Call, rectContainsRef);
+                il.Emit(OpCodes.Brfalse, skip);
+
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldsfld, eventArgsEmptyFieldRef);
+                il.Emit(OpCodes.Call, module.ImportReference(handler));
+                il.Emit(OpCodes.Ret);
+
+                il.Append(skip);
+            }
+
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Call, module.ImportReference(basePerformMouseClick));
+            il.Emit(OpCodes.Ret);
+        }
+        type.Methods.Add(newPerformMouseClick);
+
+        Console.WriteLine($"OK   {fileName}: {targetType} -- added updateBackgroundBitmap/OnMouseMove/performMouseClick overrides (bitmap-baked paint + hover-forward + click hit-testing) for button_Reply/button_Flag/button_Delete/button_Previous/button_Next, reaching their real protected OnPaint/OnMouseEnter/OnMouseLeave via reflection (__invokeProtected) -- no changes to MailClient.Common.UI.dll");
+        patchedMailClient = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patchedMailClient) { Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}"); return 1; }
+
+    return 0;
+
+    static FieldDefinition? FindFieldInBaseChain(TypeDefinition start, string name)
+    {
+        for (var t = start; t is not null; t = t.BaseType?.Resolve())
+        {
+            var f = t.Fields.FirstOrDefault(f => f.Name == name);
+            if (f is not null) return f;
+        }
+        return null;
+    }
+
+    static MethodDefinition? FindPropertyGetterInBaseChain(TypeDefinition start, string propertyName)
+    {
+        for (var t = start; t is not null; t = t.BaseType?.Resolve())
+        {
+            var m = t.Methods.FirstOrDefault(m => m.Name == "get_" + propertyName && m.Parameters.Count == 0);
+            if (m is not null) return m;
+        }
+        return null;
+    }
+}
+
 // --patch-notification-invalidate <input-dir> <output-dir>
 //
 // Fixes notification toasts (FormMailNotification etc., via their shared base
@@ -5218,6 +6324,442 @@ static int RunPatchNotificationClickResubscribe(string[] args)
         il.InsertBefore(anchor, Instruction.Create(OpCodes.Callvirt, removeClickRef));
 
         Console.WriteLine($"OK   {fileName}: inserted `layeredWindow.Click -= layeredWindow_Click;` immediately before the existing += in {targetType}::OnShown");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-notification-hover-forward <input-dir> <output-dir>
+//
+// Fixes the "hovering over the notification doesn't pause the auto-hide countdown" bug (see
+// reports/notification-empty-until-fade-findings.md's twenty-eighth round for the original
+// root-cause investigation). `timer_OnTimer`'s own pre-existing logic already implements the
+// pause-while-hovering feature correctly, gated on a `mouseOver` field that only
+// `OnMouseEnter`/`OnMouseLeave` (both pre-existing, unmodified) ever set -- but `this`
+// (FormGenericNotification) does not reliably receive real Wine mouse-move/enter/leave messages,
+// the same underlying gap Stage 8's click-routing fix already worked around for *clicks*
+// specifically by forwarding from `layeredWindow` (the drop-shadow companion window, confirmed
+// elsewhere in this investigation to be the window that actually receives reliable input).
+//
+// Studied `layeredWindow`'s own class, `LayeredForm`, for how the EXISTING click forwarding
+// actually works under the hood (not just at the C# level) -- its `WndProc` override manually
+// intercepts `WM_SETCURSOR` (msg 32) and inspects the HIWORD of `lParam`, which Windows sets to
+// the identity of the mouse message that triggered the WM_SETCURSOR (`WM_LBUTTONDOWN`=513,
+// `WM_RBUTTONDOWN`=516, `WM_MBUTTONDOWN`=519, `WM_XBUTTONDOWN`=523) -- when one of those matches,
+// it calls `this.OnClick(EventArgs.Empty)` directly, synthesizing a reliable `Click` event
+// independent of whatever native click-dispatch quirk exists under Wine. `WM_SETCURSOR` is ALSO
+// sent for plain mouse movement (Windows sends it any time the cursor is over a window and could
+// need updating, not just on clicks), with `WM_MOUSEMOVE`=512 as the HIWORD in that case --
+// meaning the exact same already-proven-reliable trigger this project's own Stage 8 fix already
+// depends on can be extended to synthesize a `MouseMove` event too, with no new message-hooking
+// risk at all (the WM_SETCURSOR interception itself is unchanged, just one more HIWORD value
+// checked inside it).
+//
+// Two-part fix, both in MailClient.dll:
+// 1. `LayeredForm.WndProc`: add a HIWORD==512 (WM_MOUSEMOVE) case alongside the existing
+//    click-HIWORD switch, calling `this.OnMouseMove(new MouseEventArgs(MouseButtons.None, 0, 0,
+//    0, 0))` -- raises the base `Control.MouseMove` event (LayeredForm doesn't override it, so
+//    this is Control's own implementation) with placeholder coordinates; the actual client-space
+//    position is computed on the RECEIVING end instead (see below), matching how
+//    `layeredWindow_Click` already computes `PointToClient(Control.MousePosition)` itself rather
+//    than trusting any position carried by the triggering event. Inserted at the very top of the
+//    method (never a branch target, no exception handlers here -- the standard safe insertion
+//    point used throughout this file), independently re-deriving `m.Msg`/HIWORD rather than
+//    reusing the ORIGINAL branch's locals, so this addition is fully self-contained and doesn't
+//    touch the existing click-detection code path at all.
+// 2. `FormGenericNotification`: subscribes to `layeredWindow.MouseMove` in `OnShown` (same
+//    unsubscribe-then-subscribe idiom already used for `layeredWindow.Click`, prepended fresh at
+//    the top of `OnShown` rather than reusing the Click subscription's own exact anchor, since
+//    there's no existing MouseMove subscription instructions to model the insertion point on).
+//    New handler `layeredWindow_MouseMove(object, MouseEventArgs)`: computes
+//    `PointToClient(Control.MousePosition)` (the SAME technique `layeredWindow_Click` ->
+//    `performMouseClick` already uses successfully), compares it against `ClientRectangle` to
+//    detect a genuine enter/leave transition relative to the CURRENT `mouseOver` field value, and
+//    calls the EXISTING, unmodified `OnMouseEnter`/`OnMouseLeave`/`OnMouseMove` methods directly
+//    -- their own internal logic (pause-the-timer, icon-hover-swap, cursor-over-content-check) is
+//    entirely untouched; this patch only ensures they actually get CALLED when they should.
+static int RunPatchNotificationHoverForward(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-notification-hover-forward <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string notifType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
+    const string layeredFormType = "MailClient.UI.Forms.LayeredForm";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(notifType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {notifType}"); return 1; }
+        var layeredFormTypeDef = module.GetType(layeredFormType);
+        if (layeredFormTypeDef is null) { Console.Error.WriteLine($"FAIL: type not found: {layeredFormType}"); return 1; }
+
+        var onShownMethod = type.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody);
+        var onMouseMoveMethod = type.Methods.FirstOrDefault(m => m.Name == "OnMouseMove" && m.HasBody);
+        var onMouseEnterMethod = type.Methods.FirstOrDefault(m => m.Name == "OnMouseEnter" && m.HasBody);
+        var onMouseLeaveMethod = type.Methods.FirstOrDefault(m => m.Name == "OnMouseLeave" && m.HasBody);
+        // Cancel an in-progress fade-out on hover-enter. First attempt called the pre-existing
+        // public `Reshow()` (`if (state == Disappearing || state == Visible) Show();`) -- not
+        // currently called from anywhere hover-related in the original app (OnMouseEnter has its
+        // OWN narrower inline reshow check instead, gated on `reShowOnMouseOver &&
+        // notifications.Count > 0`, which never fires for a single non-queued notification, the
+        // exact scenario being fixed here). `Reshow()` DID trigger, confirmed live, but
+        // `Show()`/`OnShown()`'s own `Disappearing` case only resumes the SAME gradual fade-in
+        // animation from whatever opacity it's currently at (`state = Appearing; alphaIncrement =
+        // 25f / timeToShow;`) -- visibly "fades back in slowly" rather than snapping instantly, per
+        // live user feedback. Fixed by directly replicating `OnShown`'s OWN `Appearing`/`Visible`
+        // case branch instead (the one that actually snaps straight to opacity 1.0) -- `state =
+        // Visible; alphaIncrement = 0f; timer.Interval = timeToStay; Opacity = 1.0;
+        // updateLayeredBackground(refreshBitmap: false); if (autoHide) timer.Start();` -- rather
+        // than modifying the shared `Show()`/`Reshow()` methods themselves, which other callers
+        // (e.g. advancing to the next queued notification) may rely on fading in gradually.
+        var stateField = type.Fields.FirstOrDefault(f => f.Name == "state");
+        var alphaIncrementField = type.Fields.FirstOrDefault(f => f.Name == "alphaIncrement");
+        var timerField = type.Fields.FirstOrDefault(f => f.Name == "timer");
+        var timeToStayField = type.Fields.FirstOrDefault(f => f.Name == "timeToStay");
+        var autoHideField = type.Fields.FirstOrDefault(f => f.Name == "autoHide");
+        var updateLayeredBackgroundMethod = type.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground" && m.HasBody) ??
+            type.BaseType?.Resolve()?.Methods.FirstOrDefault(m => m.Name == "updateLayeredBackground");
+        if (stateField is null || alphaIncrementField is null || timerField is null || timeToStayField is null || autoHideField is null || updateLayeredBackgroundMethod is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't find state/alphaIncrement/timer/timeToStay/autoHide field(s) or updateLayeredBackground");
+            return 1;
+        }
+        var updateLayeredBackgroundRef = module.ImportReference(updateLayeredBackgroundMethod);
+        var timerSetIntervalRef = module.ImportReference(timerField.FieldType.Resolve().Methods.First(m => m.Name == "set_Interval"));
+        var timerStartRef = module.ImportReference(timerField.FieldType.Resolve().Methods.First(m => m.Name == "Start" && m.Parameters.Count == 0));
+
+        // Opacity -- a Form property (not all Controls have it), resolve by walking the base-type
+        // chain to System.Windows.Forms.Form (app-deployed assembly -- IL-patching lesson 5).
+        TypeDefinition? formType = type;
+        while (formType is not null && formType.FullName != "System.Windows.Forms.Form")
+        {
+            formType = formType.BaseType?.Resolve();
+        }
+        if (formType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Form in base-type chain"); return 1; }
+        var setOpacityDef = formType.Methods.FirstOrDefault(m => m.Name == "set_Opacity");
+        if (setOpacityDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Form.set_Opacity"); return 1; }
+        var setOpacityRef = module.ImportReference(setOpacityDef);
+
+        var mouseOverField = type.Fields.FirstOrDefault(f => f.Name == "mouseOver");
+        // layeredWindow is declared on the base class (LayeredBaseForm), not directly on
+        // FormGenericNotification -- type.Fields only lists directly-declared fields.
+        var layeredWindowField = type.Fields.FirstOrDefault(f => f.Name == "layeredWindow") ??
+            type.BaseType?.Resolve()?.Fields.FirstOrDefault(f => f.Name == "layeredWindow");
+        var disposedField = type.Fields.FirstOrDefault(f => f.Name == "disposed");
+        var disposingField = type.Fields.FirstOrDefault(f => f.Name == "disposing");
+        if (onShownMethod is null || onMouseMoveMethod is null || onMouseEnterMethod is null || onMouseLeaveMethod is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't find OnShown/OnMouseMove/OnMouseEnter/OnMouseLeave");
+            return 1;
+        }
+        if (mouseOverField is null || layeredWindowField is null || disposedField is null || disposingField is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't find mouseOver/layeredWindow/disposed/disposing field(s)");
+            return 1;
+        }
+
+        var wndProcMethod = layeredFormTypeDef.Methods.FirstOrDefault(m => m.Name == "WndProc" && m.HasBody);
+        if (wndProcMethod is null) { Console.Error.WriteLine($"FAIL: WndProc not found on {layeredFormType}"); return 1; }
+
+        // MouseEventArgs -- resolve from FormGenericNotification's own OnMouseMove parameter type
+        // (app-deployed System.Windows.Forms.dll -- IL-patching lesson 5), not typeof().
+        var mouseEventArgsTypeRef = onMouseMoveMethod.Parameters[0].ParameterType;
+        var mouseEventArgsTypeDef = mouseEventArgsTypeRef.Resolve();
+        if (mouseEventArgsTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve MouseEventArgs from OnMouseMove's own parameter type"); return 1; }
+        var mouseEventArgsCtorDef = mouseEventArgsTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 5);
+        if (mouseEventArgsCtorDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve MouseEventArgs(MouseButtons,int,int,int,int)"); return 1; }
+        var mouseEventArgsCtorRef = module.ImportReference(mouseEventArgsCtorDef);
+        var mouseButtonsTypeRef = mouseEventArgsCtorDef.Parameters[0].ParameterType;
+
+        // Message.get_Msg()/get_LParam() -- reuse the exact MethodReferences WndProc's own
+        // existing code already calls, rather than resolving fresh.
+        var existingGetMsgCall = wndProcMethod.Body.Instructions.FirstOrDefault(i => i.Operand is MethodReference mr && mr.Name == "get_Msg");
+        var existingGetLParamCall = wndProcMethod.Body.Instructions.FirstOrDefault(i => i.Operand is MethodReference mr2 && mr2.Name == "get_LParam");
+        if (existingGetMsgCall is null || existingGetLParamCall is null) { Console.Error.WriteLine("FAIL: couldn't find existing get_Msg()/get_LParam() calls in WndProc"); return 1; }
+        var getMsgRef = (MethodReference)existingGetMsgCall.Operand;
+        var getLParamRef = (MethodReference)existingGetLParamCall.Operand;
+        var messageParamRef = wndProcMethod.Parameters[0];
+
+        // Control.OnMouseMove(MouseEventArgs) / .MouseMove add/remove -- walk the base-type chain
+        // from LayeredForm (same technique used elsewhere in this file for Control members)
+        // rather than typeof(Control) reflection.
+        TypeDefinition? controlType = layeredFormTypeDef;
+        while (controlType is not null && controlType.FullName != "System.Windows.Forms.Control")
+        {
+            controlType = controlType.BaseType?.Resolve();
+        }
+        if (controlType is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control in LayeredForm's base-type chain"); return 1; }
+        var controlOnMouseMoveDef = controlType.Methods.FirstOrDefault(m => m.Name == "OnMouseMove" && m.Parameters.Count == 1);
+        var addMouseMoveDef = controlType.Methods.FirstOrDefault(m => m.Name == "add_MouseMove");
+        var removeMouseMoveDef = controlType.Methods.FirstOrDefault(m => m.Name == "remove_MouseMove");
+        var getMousePositionDef = controlType.Methods.FirstOrDefault(m => m.Name == "get_MousePosition" && m.Parameters.Count == 0 && m.IsStatic);
+        var pointToClientDef = controlType.Methods.FirstOrDefault(m => m.Name == "PointToClient");
+        var getClientRectangleDef = controlType.Methods.FirstOrDefault(m => m.Name == "get_ClientRectangle");
+        if (controlOnMouseMoveDef is null || addMouseMoveDef is null || removeMouseMoveDef is null || getMousePositionDef is null || pointToClientDef is null || getClientRectangleDef is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't resolve one of Control.OnMouseMove/add_MouseMove/remove_MouseMove/get_MousePosition/PointToClient/get_ClientRectangle");
+            return 1;
+        }
+        var controlOnMouseMoveRef = module.ImportReference(controlOnMouseMoveDef);
+        var addMouseMoveRef = module.ImportReference(addMouseMoveDef);
+        var removeMouseMoveRef = module.ImportReference(removeMouseMoveDef);
+        var getMousePositionRef = module.ImportReference(getMousePositionDef);
+        var pointToClientRef = module.ImportReference(pointToClientDef);
+        var getClientRectangleRef = module.ImportReference(getClientRectangleDef);
+
+        // MouseEventHandler -- resolve from add_MouseMove's own parameter type (guaranteed the
+        // correctly-versioned delegate type for this exact event), not typeof() reflection.
+        var mouseEventHandlerTypeRef = addMouseMoveDef.Parameters[0].ParameterType;
+        var mouseEventHandlerTypeDef = mouseEventHandlerTypeRef.Resolve();
+        if (mouseEventHandlerTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve MouseEventHandler from add_MouseMove's own parameter type"); return 1; }
+        var mouseEventHandlerCtorDef = mouseEventHandlerTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor");
+        if (mouseEventHandlerCtorDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve MouseEventHandler's constructor"); return 1; }
+        var mouseEventHandlerCtorRef = module.ImportReference(mouseEventHandlerCtorDef);
+
+        // Point/Rectangle -- resolve from PointToClient's own parameter/return types. Resolve()'d
+        // to a TypeDefinition for member lookups AND separately imported into `module` (these
+        // live in System.Drawing.Primitives.dll, a different module than the one being edited --
+        // using an un-imported foreign TypeReference as a local variable's type fails at
+        // module.Write() time with "declared in another module and needs to be imported", hit for
+        // real here).
+        var pointTypeDef = pointToClientDef.Parameters[0].ParameterType.Resolve();
+        var rectangleTypeDef = getClientRectangleDef.ReturnType.Resolve();
+        if (pointTypeDef is null || rectangleTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Point/Rectangle"); return 1; }
+        var pointTypeRef = module.ImportReference(pointTypeDef);
+        var rectangleTypeRef = module.ImportReference(rectangleTypeDef);
+        var rectangleContainsDef = rectangleTypeDef.Methods.FirstOrDefault(m => m.Name == "Contains" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.Drawing.Point");
+        var pointGetXDef = pointTypeDef.Methods.FirstOrDefault(m => m.Name == "get_X");
+        var pointGetYDef = pointTypeDef.Methods.FirstOrDefault(m => m.Name == "get_Y");
+        if (rectangleContainsDef is null || pointGetXDef is null || pointGetYDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Rectangle.Contains(Point)/Point.get_X/get_Y"); return 1; }
+        var rectangleContainsRef = module.ImportReference(rectangleContainsDef);
+        var pointGetXRef = module.ImportReference(pointGetXDef);
+        var pointGetYRef = module.ImportReference(pointGetYDef);
+
+        var eventArgsEmptyRef = module.ImportReference(typeof(EventArgs).GetField("Empty")!);
+
+        // --- Part 1: LayeredForm.WndProc, prepend a self-contained WM_MOUSEMOVE-via-WM_SETCURSOR
+        // check at the very top (never a branch target; this method has no exception handlers).
+        {
+            var body = wndProcMethod.Body;
+            body.SimplifyMacros();
+            var il = body.GetILProcessor();
+            var first = body.Instructions[0];
+
+            var skip = Instruction.Create(OpCodes.Nop);
+
+            il.InsertBefore(first, Instruction.Create(OpCodes.Ldarg, messageParamRef));
+            il.InsertBefore(first, Instruction.Create(OpCodes.Call, getMsgRef));
+            il.InsertBefore(first, Instruction.Create(OpCodes.Ldc_I4, 32)); // WM_SETCURSOR
+            il.InsertBefore(first, Instruction.Create(OpCodes.Bne_Un, skip));
+
+            il.InsertBefore(first, Instruction.Create(OpCodes.Ldarg, messageParamRef));
+            il.InsertBefore(first, Instruction.Create(OpCodes.Call, getLParamRef));
+            il.InsertBefore(first, Instruction.Create(OpCodes.Conv_I4));
+            il.InsertBefore(first, Instruction.Create(OpCodes.Ldc_I4, 16));
+            il.InsertBefore(first, Instruction.Create(OpCodes.Shr));
+            il.InsertBefore(first, Instruction.Create(OpCodes.Ldc_I4, 512)); // WM_MOUSEMOVE
+            il.InsertBefore(first, Instruction.Create(OpCodes.Bne_Un, skip));
+
+            il.InsertBefore(first, Instruction.Create(OpCodes.Ldarg_0));
+            il.InsertBefore(first, Instruction.Create(OpCodes.Ldc_I4_0)); // MouseButtons.None
+            il.InsertBefore(first, Instruction.Create(OpCodes.Ldc_I4_0)); // clicks
+            il.InsertBefore(first, Instruction.Create(OpCodes.Ldc_I4_0)); // x
+            il.InsertBefore(first, Instruction.Create(OpCodes.Ldc_I4_0)); // y
+            il.InsertBefore(first, Instruction.Create(OpCodes.Ldc_I4_0)); // delta
+            il.InsertBefore(first, Instruction.Create(OpCodes.Newobj, mouseEventArgsCtorRef));
+            il.InsertBefore(first, Instruction.Create(OpCodes.Callvirt, controlOnMouseMoveRef));
+
+            il.InsertBefore(first, skip);
+        }
+
+        // --- Part 2a: FormGenericNotification.OnShown, prepend the MouseMove resubscribe
+        // (unsubscribe-then-subscribe idiom, same as the existing Click one).
+        var handlerMethod = new MethodDefinition("layeredWindow_MouseMove", MethodAttributes.Private, module.TypeSystem.Void);
+        handlerMethod.Parameters.Add(new ParameterDefinition("sender", ParameterAttributes.None, module.TypeSystem.Object));
+        handlerMethod.Parameters.Add(new ParameterDefinition("e", ParameterAttributes.None, mouseEventArgsTypeRef));
+        type.Methods.Add(handlerMethod);
+
+        {
+            var body = onShownMethod.Body;
+            var il = body.GetILProcessor();
+            var first = body.Instructions[0];
+            void Emit(params Instruction[] instrs) { foreach (var i in instrs) il.InsertBefore(first, i); }
+
+            Emit(
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, layeredWindowField),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldftn, handlerMethod),
+                Instruction.Create(OpCodes.Newobj, mouseEventHandlerCtorRef),
+                Instruction.Create(OpCodes.Callvirt, removeMouseMoveRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, layeredWindowField),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldftn, handlerMethod),
+                Instruction.Create(OpCodes.Newobj, mouseEventHandlerCtorRef),
+                Instruction.Create(OpCodes.Callvirt, addMouseMoveRef)
+            );
+        }
+
+        // --- Part 2b: the new handler itself.
+        //   private void layeredWindow_MouseMove(object sender, MouseEventArgs e)
+        //   {
+        //       if (disposed || disposing) return;
+        //       Point p = PointToClient(Control.MousePosition);
+        //       bool isOver = ClientRectangle.Contains(p);
+        //       if (isOver && !mouseOver) OnMouseEnter(EventArgs.Empty);
+        //       else if (!isOver && mouseOver) OnMouseLeave(EventArgs.Empty);
+        //       if (isOver) OnMouseMove(new MouseEventArgs(MouseButtons.None, 0, p.X, p.Y, 0));
+        //   }
+        {
+            var hBody = handlerMethod.Body;
+            hBody.InitLocals = true;
+            var pointLocal = new VariableDefinition(pointTypeRef);
+            var isOverLocal = new VariableDefinition(module.TypeSystem.Boolean);
+            var rectLocal = new VariableDefinition(rectangleTypeRef);
+            hBody.Variables.Add(pointLocal);
+            hBody.Variables.Add(isOverLocal);
+            hBody.Variables.Add(rectLocal);
+            var il = hBody.GetILProcessor();
+            var ret = Instruction.Create(OpCodes.Ret);
+            var afterEnterLeave = Instruction.Create(OpCodes.Ldloc, isOverLocal);
+            var elseLeaveCheck = Instruction.Create(OpCodes.Ldloc, isOverLocal);
+            var afterMove = Instruction.Create(OpCodes.Ret);
+
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldfld, disposedField));
+            var checkDisposing = Instruction.Create(OpCodes.Ldarg_0);
+            il.Append(Instruction.Create(OpCodes.Brtrue, ret));
+            il.Append(checkDisposing);
+            il.Append(Instruction.Create(OpCodes.Ldfld, disposingField));
+            il.Append(Instruction.Create(OpCodes.Brtrue, ret));
+
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Call, getMousePositionRef));
+            il.Append(Instruction.Create(OpCodes.Callvirt, pointToClientRef));
+            il.Append(Instruction.Create(OpCodes.Stloc, pointLocal));
+
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Callvirt, getClientRectangleRef));
+            il.Append(Instruction.Create(OpCodes.Stloc, rectLocal));
+            // Rectangle.Contains(Point) is an instance method on a value type -- its receiver
+            // must be a managed pointer (Ldloca on an addressable local), not the raw struct
+            // value ClientRectangle's getter just returned directly on the stack (IL-patching
+            // lesson 6's class of bug: a struct instance call needs `this` pushed via Ldloca,
+            // caught here by tracing the stack by hand before building, not by a live failure).
+            il.Append(Instruction.Create(OpCodes.Ldloca, rectLocal));
+            il.Append(Instruction.Create(OpCodes.Ldloc, pointLocal));
+            il.Append(Instruction.Create(OpCodes.Call, rectangleContainsRef));
+            il.Append(Instruction.Create(OpCodes.Stloc, isOverLocal));
+
+            // if (isOver && !mouseOver) OnMouseEnter(...)
+            il.Append(Instruction.Create(OpCodes.Ldloc, isOverLocal));
+            il.Append(Instruction.Create(OpCodes.Brfalse, elseLeaveCheck));
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldfld, mouseOverField));
+            il.Append(Instruction.Create(OpCodes.Brtrue, afterEnterLeave));
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldsfld, eventArgsEmptyRef));
+            il.Append(Instruction.Create(OpCodes.Callvirt, module.ImportReference(onMouseEnterMethod)));
+            // Also cancel any in-progress fade-out on hover-enter, snapping straight to fully
+            // visible (see the field-resolution comment above for why this doesn't just call the
+            // existing Show()/Reshow(), which resume a gradual fade-in from wherever opacity
+            // currently is instead of snapping instantly).
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4_2)); // NotificationFormState.Visible
+            il.Append(Instruction.Create(OpCodes.Stfld, stateField));
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldc_R4, 0f));
+            il.Append(Instruction.Create(OpCodes.Stfld, alphaIncrementField));
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldfld, timerField));
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldfld, timeToStayField));
+            il.Append(Instruction.Create(OpCodes.Callvirt, timerSetIntervalRef));
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldc_R8, 1.0));
+            il.Append(Instruction.Create(OpCodes.Callvirt, setOpacityRef));
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+            il.Append(Instruction.Create(OpCodes.Callvirt, updateLayeredBackgroundRef));
+            // Nop, not a copy of some other real instruction: this is purely a branch-target
+            // marker for the `if (autoHide)` skip below and must have zero stack effect
+            // (IL-patching lesson 8 -- reusing a real load instruction here would leave a stray
+            // value on the stack for the skip-path).
+            var skipTimerStart = Instruction.Create(OpCodes.Nop);
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldfld, autoHideField));
+            il.Append(Instruction.Create(OpCodes.Brfalse, skipTimerStart));
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldfld, timerField));
+            il.Append(Instruction.Create(OpCodes.Callvirt, timerStartRef));
+            il.Append(skipTimerStart);
+            il.Append(Instruction.Create(OpCodes.Br, afterEnterLeave));
+            // else if (!isOver && mouseOver) OnMouseLeave(...)
+            il.Append(elseLeaveCheck);
+            il.Append(Instruction.Create(OpCodes.Brtrue, afterEnterLeave));
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldfld, mouseOverField));
+            il.Append(Instruction.Create(OpCodes.Brfalse, afterEnterLeave));
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldsfld, eventArgsEmptyRef));
+            il.Append(Instruction.Create(OpCodes.Callvirt, module.ImportReference(onMouseLeaveMethod)));
+
+            il.Append(afterEnterLeave);
+            il.Append(Instruction.Create(OpCodes.Brfalse, afterMove));
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+            il.Append(Instruction.Create(OpCodes.Ldloca, pointLocal));
+            il.Append(Instruction.Create(OpCodes.Call, pointGetXRef));
+            il.Append(Instruction.Create(OpCodes.Ldloca, pointLocal));
+            il.Append(Instruction.Create(OpCodes.Call, pointGetYRef));
+            il.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+            il.Append(Instruction.Create(OpCodes.Newobj, mouseEventArgsCtorRef));
+            il.Append(Instruction.Create(OpCodes.Callvirt, module.ImportReference(onMouseMoveMethod)));
+
+            il.Append(afterMove);
+            il.Append(ret);
+        }
+
+        Console.WriteLine($"OK   {fileName}: {layeredFormType}::WndProc now synthesizes a MouseMove event from WM_SETCURSOR's WM_MOUSEMOVE hint (same mechanism already used for Click); {notifType}::OnShown subscribes and forwards to the existing OnMouseEnter/OnMouseMove/OnMouseLeave, restoring hover-pause-the-auto-hide-timer behavior");
         patched = true;
 
         module.Write(destPath);
