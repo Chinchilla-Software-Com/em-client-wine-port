@@ -54,6 +54,19 @@ set -euo pipefail
 RELEASE_VERSION="10.4.5674"
 EXPECTED_FILE_VERSION="10.4.5674.0"
 
+# This project's own release number against RELEASE_VERSION (see
+# il-patches/MailClient.Wine/VersionMarker.cs) -- bump this, and add a row to
+# REVISION_LAST_STAGE below, every time a new release ships against the same eM Client version.
+# Tag as release/<RELEASE_VERSION>-<OUR_RELEASE_NUMBER> (release/10.4.5674-2 for this one).
+OUR_RELEASE_NUMBER=2
+
+# release number -> last stage number that release introduced. Drives the "resume mid-pipeline"
+# logic below: a bottle already at revision N only needs stages after REVISION_LAST_STAGE[N]
+# applied. 1 (release/10.4.5674, this project's first tagged release) predates
+# MailClient.Wine.dll entirely -- detected via the older BouncyCastlePatch-only marker instead,
+# see the revision-detection block below.
+declare -A REVISION_LAST_STAGE=( [0]=0 [1]=7 [2]=14 )
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 IL_PATCHES_DIR="$REPO_ROOT/il-patches"
@@ -242,32 +255,55 @@ BOTTLE_APP_DIR="$(dirname "$SELECTED_DLL")"
 log "target bottle: $BOTTLE_NAME ($BOTTLE_APP_DIR)"
 
 # ---------------------------------------------------------------------------
-# Already-patched check -- safe to re-run. Deliberately NOT a file-size or
-# byte-diff check: file size isn't a reliable "already patched" signal
-# across future eM Client releases (an unrelated app change could easily
-# land on the same size we produce, or a future version of these same
-# patches could land on a different size, independent of whether they're
-# applied). Instead checks whether MailClient.dll references the
-# MailClient.Licensing.BouncyCastlePatch assembly (il-patcher --check-patched)
-# -- an assembly reference that cannot exist unless this pipeline created
-# it, regardless of version or size. See that mode's doc comment in
-# il-patcher-Program.cs for the full reasoning, including its known
-# limitations: it doesn't independently verify every earlier stage is still
-# intact if someone hand-reverted just one of them, and a bottle patched by
-# an OLDER copy of this exact script (before the notification stages existed)
-# will also show as "already patched" and be skipped -- re-run with --force
-# to pick up stages added since.
+# Revision check -- safe to re-run, and now upgrade-aware: a bottle already patched by an
+# OLDER release of this same script gets only the stages it's missing applied on top of what's
+# already there, not a doomed re-run of the whole pipeline from scratch (Stage 1 in particular
+# would refuse -- it looks for the pristine InterpolationMode value and won't find it).
+#
+# Revision is read from MailClient.Wine.dll (il-patches/MailClient.Wine/VersionMarker.cs), a
+# tiny marker assembly with no code, never loaded by eM Client itself -- just dropped in the
+# install directory so this script can read its FileVersion back. That field's leading three
+# components are the eM Client version this marker was built for (must match RELEASE_VERSION);
+# the trailing component is OUR_RELEASE_NUMBER as of whichever deploy created it. Deliberately
+# not a file-size or byte-diff check: size isn't a reliable "already patched" signal across
+# future eM Client releases, and an assembly-reference check alone (the OLD approach, still used
+# as a fallback below) can only ever answer "is Stage 5 applied", not "which release is this".
 # ---------------------------------------------------------------------------
 
+CURRENT_REVISION=0
+MARKER_DLL="$BOTTLE_APP_DIR/MailClient.Wine.dll"
+if [[ -f "$MARKER_DLL" ]]; then
+    marker_line=$($ILP --version "$MARKER_DLL" 2>/dev/null || true)
+    marker_file_version=$(echo "$marker_line" | awk -F'\t' '{print $3}' | sed 's/FileVersion=//')
+    marker_emclient_version="${marker_file_version%.*}"
+    marker_revision="${marker_file_version##*.}"
+    if [[ "$marker_emclient_version" == "$RELEASE_VERSION" && "$marker_revision" =~ ^[0-9]+$ ]]; then
+        CURRENT_REVISION="$marker_revision"
+        log "found MailClient.Wine.dll: this install is at release $RELEASE_VERSION-$CURRENT_REVISION."
+    else
+        warn "MailClient.Wine.dll present but unreadable or for a different eM Client version"
+        warn "($marker_file_version, expected $RELEASE_VERSION.N) -- ignoring it."
+    fi
+elif $ILP --check-patched "$SELECTED_DLL" >/dev/null 2>&1; then
+    # Old marker (license fix applied) with no version-stamped MailClient.Wine.dll at all --
+    # predates this mechanism, i.e. this project's first tagged release (release/10.4.5674, no
+    # numeric suffix), treated as revision 1.
+    CURRENT_REVISION=1
+    log "found the pre-versioning license-fix marker only: this install is at release $RELEASE_VERSION-1 (legacy)."
+fi
+
 DLL_ALREADY_PATCHED=0
-if [[ $FORCE -eq 0 ]] && $ILP --check-patched "$SELECTED_DLL" >/dev/null 2>&1; then
+START_STAGE=1
+if [[ $FORCE -eq 0 && "$CURRENT_REVISION" -ge "$OUR_RELEASE_NUMBER" ]]; then
     DLL_ALREADY_PATCHED=1
-    log "already patched: $SELECTED_DLL references MailClient.Licensing.BouncyCastlePatch."
-    log "skipping the DLL patch pipeline (pass --force to attempt patching anyway -- will very"
-    log "likely fail cleanly at Stage 1's own shape-check, since the individual stages aren't"
-    log "self-reverting -- to genuinely re-patch, restore from a releases/*/backups/ backup"
-    log "first, then re-run). Still checking fonts/file-associations below, since those are"
+    log "already at release $RELEASE_VERSION-$CURRENT_REVISION (this script is release"
+    log "$RELEASE_VERSION-$OUR_RELEASE_NUMBER) -- skipping the DLL patch pipeline (pass --force to"
+    log "attempt patching anyway). Still checking fonts/file-associations below, since those are"
     log "independent of whether the DLL patches are applied."
+elif [[ "$CURRENT_REVISION" -gt 0 && $FORCE -eq 0 ]]; then
+    START_STAGE=$(( ${REVISION_LAST_STAGE[$CURRENT_REVISION]} + 1 ))
+    log "install is at release $RELEASE_VERSION-$CURRENT_REVISION -- resuming from Stage $START_STAGE"
+    log "(stages 1-$(( START_STAGE - 1 )) already applied, left as-is)."
 fi
 
 if [[ $DLL_ALREADY_PATCHED -eq 0 ]]; then
@@ -490,37 +526,66 @@ fi
 log "ilspycmd ready: $ILSPY"
 
 # ---------------------------------------------------------------------------
+# Build MailClient.Wine.dll -- the version marker (see il-patches/MailClient.Wine/
+# VersionMarker.cs and the revision-detection block above). Always built and deployed
+# regardless of START_STAGE, including on a fresh install, so every install this script
+# ever touches ends up with an accurate marker for next time.
+# ---------------------------------------------------------------------------
+
+log "building MailClient.Wine version marker (release $RELEASE_VERSION-$OUR_RELEASE_NUMBER)..."
+mkdir -p "$WORKDIR/tools/MailClient.Wine"
+cp "$IL_PATCHES_DIR/MailClient.Wine/MailClient.Wine.csproj" "$IL_PATCHES_DIR/MailClient.Wine/VersionMarker.cs" "$WORKDIR/tools/MailClient.Wine/"
+dotnet build -c Release \
+    -p:AssemblyVersion="$EXPECTED_FILE_VERSION" \
+    -p:FileVersion="$RELEASE_VERSION.$OUR_RELEASE_NUMBER" \
+    "$WORKDIR/tools/MailClient.Wine" >"$WORKDIR/build-mailclient-wine.log" 2>&1 \
+    || { cat "$WORKDIR/build-mailclient-wine.log" >&2; die "failed to build MailClient.Wine marker (log above)"; }
+MAILCLIENT_WINE_DLL="$WORKDIR/tools/MailClient.Wine/bin/Release/net8.0/MailClient.Wine.dll"
+log "MailClient.Wine marker built."
+
+# ---------------------------------------------------------------------------
 # Run the patch pipeline (mirrors CLAUDE.md's "Patch pipeline" section --
 # keep these two in sync if either changes)
 # ---------------------------------------------------------------------------
 
-log "Stage 1: interpolation mode..."
-$ILP --patch "$IL_PATCHES_DIR/stage1-interpolation-mode.json" "$WORKDIR/original" "$WORKDIR/output"
+if [[ $START_STAGE -le 1 ]]; then
+    log "Stage 1: interpolation mode..."
+    $ILP --patch "$IL_PATCHES_DIR/stage1-interpolation-mode.json" "$WORKDIR/original" "$WORKDIR/output"
 
-log "Stage 2: AllPaintingInWmPaint..."
-$ILP --patch-allpaintinginwmpaint "$WORKDIR/output" "$WORKDIR/output-stage2"
+    log "Stage 2: AllPaintingInWmPaint..."
+    $ILP --patch-allpaintinginwmpaint "$WORKDIR/output" "$WORKDIR/output-stage2"
 
-log "Stage 3: Settings panel Load-event fix..."
-$ILP --patch-settings-refresh "$WORKDIR/output-stage2" "$WORKDIR/output-stage3-final"
+    log "Stage 3: Settings panel Load-event fix..."
+    $ILP --patch-settings-refresh "$WORKDIR/output-stage2" "$WORKDIR/output-stage3-final"
 
-log "Stage 4: category-click crash fix..."
-$ILP --patch-default-client-notimpl "$WORKDIR/output-stage3-final" "$WORKDIR/output-stage4"
+    log "Stage 4: category-click crash fix..."
+    $ILP --patch-default-client-notimpl "$WORKDIR/output-stage3-final" "$WORKDIR/output-stage4"
 
-log "Stage 5: License Activate RSA-OAEP decrypt fix..."
-mkdir -p "$WORKDIR/output-stage5"
-$ILP2 "$WORKDIR/output-stage4/MailClient.dll" "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage5/MailClient.dll"
-# -n/--no-clobber: fill in the rest of the tree (everything Stage 5 doesn't touch) without
-# overwriting the MailClient.dll just patched above.
-cp -an "$WORKDIR/output-stage4"/. "$WORKDIR/output-stage5/"
-cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage5/"
+    log "Stage 5: License Activate RSA-OAEP decrypt fix..."
+    mkdir -p "$WORKDIR/output-stage5"
+    $ILP2 "$WORKDIR/output-stage4/MailClient.dll" "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage5/MailClient.dll"
+    # -n/--no-clobber: fill in the rest of the tree (everything Stage 5 doesn't touch) without
+    # overwriting the MailClient.dll just patched above.
+    cp -an "$WORKDIR/output-stage4"/. "$WORKDIR/output-stage5/"
+    cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage5/"
 
-log "Stage 6: license icon fix..."
-$ILP --patch-license-icon "$WORKDIR/output-stage5" "$WORKDIR/output-stage6"
-cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage6/"
+    log "Stage 6: license icon fix..."
+    $ILP --patch-license-icon "$WORKDIR/output-stage5" "$WORKDIR/output-stage6"
+    cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage6/"
 
-log "Stage 7: splash-screen tip icon fix..."
-$ILP --patch-splash-tip-icon "$WORKDIR/output-stage6" "$WORKDIR/output-stage7"
-cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage7/"
+    log "Stage 7: splash-screen tip icon fix..."
+    $ILP --patch-splash-tip-icon "$WORKDIR/output-stage6" "$WORKDIR/output-stage7"
+    cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage7/"
+
+    STAGE7_DIR="$WORKDIR/output-stage7"
+else
+    # Resuming past Stage 7: those stages are already baked into what's actually installed
+    # ($WORKDIR/original is already a full, complete copy of it, made above) -- re-running them
+    # would fail (Stage 1 in particular refuses when it doesn't find the pristine
+    # InterpolationMode value it expects) and would be redundant even if it didn't.
+    log "Stages 1-7 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+    STAGE7_DIR="$WORKDIR/original"
+fi
 
 # ---------------------------------------------------------------------------
 # Stages 8-15: new-mail notification toast fixes (see CLAUDE.md's Status
@@ -534,7 +599,7 @@ cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage7/"
 # ---------------------------------------------------------------------------
 
 log "Stage 8: notification click-dispatch fix (fired its handler twice per click)..."
-$ILP --patch-notification-click-resubscribe "$WORKDIR/output-stage7" "$WORKDIR/output-stage8"
+$ILP --patch-notification-click-resubscribe "$STAGE7_DIR" "$WORKDIR/output-stage8"
 
 log "Stage 9: notification layout fixes (content padding, avatar-title gap, title centering)..."
 $ILP --patch-notification-content-padding "$WORKDIR/output-stage8" "$WORKDIR/output-stage9a"
@@ -561,6 +626,7 @@ $ILP --patch-notification-hover-forward "$WORKDIR/output-stage12" "$WORKDIR/outp
 log "Stage 14: notification reply/flag/delete/previous/next icon fix..."
 $ILP --patch-notification-toolbar-icons "$WORKDIR/output-stage13" "$WORKDIR/output-final"
 cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-final/"
+cp "$MAILCLIENT_WINE_DLL" "$WORKDIR/output-final/"
 
 FINAL_DIR="$WORKDIR/output-final"
 
@@ -589,11 +655,14 @@ $ILP --dump-handlers "$FINAL_DIR/MailClient.dll" MailClient.Utils.Integration Is
 
 # Stages 6-7 are raw resource byte edits and must not change file size (see their own header
 # comments) -- checked against output-stage7 specifically, not FINAL_DIR, since the notification
-# stages after it are real IL insertions that legitimately grow the file.
-STAGE5_SIZE=$(stat -c%s "$WORKDIR/output-stage5/MailClient.dll")
-STAGE7_SIZE=$(stat -c%s "$WORKDIR/output-stage7/MailClient.dll")
-[[ "$STAGE5_SIZE" -eq "$STAGE7_SIZE" ]] \
-    || die "verification failed: Stages 6-7 should not change MailClient.dll's byte size (was $STAGE5_SIZE, now $STAGE7_SIZE) -- .resources offset table may be corrupted"
+# stages after it are real IL insertions that legitimately grow the file. Only meaningful (and
+# only ran) when Stages 1-7 actually ran this time -- skipped entirely when resuming past them.
+if [[ $START_STAGE -le 1 ]]; then
+    STAGE5_SIZE=$(stat -c%s "$WORKDIR/output-stage5/MailClient.dll")
+    STAGE7_SIZE=$(stat -c%s "$WORKDIR/output-stage7/MailClient.dll")
+    [[ "$STAGE5_SIZE" -eq "$STAGE7_SIZE" ]] \
+        || die "verification failed: Stages 6-7 should not change MailClient.dll's byte size (was $STAGE5_SIZE, now $STAGE7_SIZE) -- .resources offset table may be corrupted"
+fi
 
 $ILSPY -t "MailClient.UI.Forms.NotificationForms.FormGenericNotification" "$FINAL_DIR/MailClient.dll" | grep -q "__drawNotificationTextIntoBitmap" \
     || die "verification failed: __drawNotificationTextIntoBitmap not found -- notification text-in-bitmap fix missing"
@@ -615,7 +684,7 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="$BACKUPS_DIR/${BOTTLE_NAME}-${TIMESTAMP}"
 mkdir -p "$BACKUP_DIR"
 
-DEPLOY_FILES=(MailClient.dll MailClient.Common.UI.dll MailClient.Licensing.BouncyCastlePatch.dll)
+DEPLOY_FILES=(MailClient.dll MailClient.Common.UI.dll MailClient.Licensing.BouncyCastlePatch.dll MailClient.Wine.dll)
 
 log "backing up current files to $BACKUP_DIR ..."
 for f in "${DEPLOY_FILES[@]}" MailClient.deps.json; do

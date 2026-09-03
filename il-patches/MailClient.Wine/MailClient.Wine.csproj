@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>MailClient.Wine</RootNamespace>
+    <AssemblyName>MailClient.Wine</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- Placeholder versions for a local/dev build run directly from this folder. The real
+         values are always injected by releases/(version)/deploy.sh at build time via MSBuild
+         property overrides (AssemblyVersion / FileVersion) on the command line, which override
+         these. See VersionMarker.cs for what each field means and why. -->
+    <AssemblyVersion>0.0.0.0</AssemblyVersion>
+    <FileVersion>0.0.0.0</FileVersion>
+  </PropertyGroup>
+
+</Project>
