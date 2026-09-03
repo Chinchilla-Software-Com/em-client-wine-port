@@ -295,7 +295,7 @@ class ReproForm : Form
                 e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
                 using var avatarBrush = new SolidBrush(Color.FromArgb(80, 140, 200));
                 e.Graphics.FillEllipse(avatarBrush, 10, 32, 32, 32);
-                TextRenderer.DrawText(e.Graphics, "GA", new Font("Tahoma", 10, FontStyle.Bold), new Rectangle(10, 32, 32, 32), Color.White,
+                TextRenderer.DrawText(e.Graphics, "TS", new Font("Tahoma", 10, FontStyle.Bold), new Rectangle(10, 32, 32, 32), Color.White,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             }
             TextRenderer.DrawText(e.Graphics, "Test Sender", new Font("Tahoma", 11), new Point(52, 4), Color.White);
