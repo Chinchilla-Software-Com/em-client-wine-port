@@ -251,9 +251,12 @@ log "target bottle: $BOTTLE_NAME ($BOTTLE_APP_DIR)"
 # MailClient.Licensing.BouncyCastlePatch assembly (il-patcher --check-patched)
 # -- an assembly reference that cannot exist unless this pipeline created
 # it, regardless of version or size. See that mode's doc comment in
-# il-patcher-Program.cs for the full reasoning, including its one known
-# limitation (doesn't independently verify every earlier stage is still
-# intact if someone hand-reverted just one of them).
+# il-patcher-Program.cs for the full reasoning, including its known
+# limitations: it doesn't independently verify every earlier stage is still
+# intact if someone hand-reverted just one of them, and a bottle patched by
+# an OLDER copy of this exact script (before the notification stages existed)
+# will also show as "already patched" and be skipped -- re-run with --force
+# to pick up stages added since.
 # ---------------------------------------------------------------------------
 
 DLL_ALREADY_PATCHED=0
@@ -339,7 +342,28 @@ if [[ ${#RUNNING_PIDS[@]} -gt 0 ]]; then
             done < <(find_running_pids_for_bottle "$BOTTLE_NAME")
             [[ ${#RUNNING_PIDS[@]} -eq 0 ]] && break
         done
-        [[ ${#RUNNING_PIDS[@]} -eq 0 ]] || die "eM Client did not exit within 10s (still running: ${RUNNING_PIDS[*]}) -- close it manually and re-run."
+        if [[ ${#RUNNING_PIDS[@]} -gt 0 ]]; then
+            # A graceful close CAN succeed (window disappears, wmctrl reports success) without
+            # the process ever exiting -- confirmed hands-on: eM Client's own "Close application
+            # to tray" setting (Settings > General) turns a close request into a minimize-to-tray,
+            # not an exit. Already gave it a fair 10s chance above; fall back to kill now rather
+            # than dying, same DB-repair caveat as the no-window case above.
+            warn "eM Client is still running 10s after a graceful close request -- it may have"
+            warn "minimized to tray instead of exiting (e.g. its own 'Close application to tray'"
+            warn "setting). Falling back to kill (may trigger a DB-repair check on next launch)."
+            for pid in "${RUNNING_PIDS[@]}"; do
+                kill "$pid" 2>/dev/null || true
+            done
+            for _ in $(seq 1 10); do
+                sleep 1
+                RUNNING_PIDS=()
+                while IFS= read -r pid; do
+                    [[ -n "$pid" ]] && RUNNING_PIDS+=("$pid")
+                done < <(find_running_pids_for_bottle "$BOTTLE_NAME")
+                [[ ${#RUNNING_PIDS[@]} -eq 0 ]] && break
+            done
+            [[ ${#RUNNING_PIDS[@]} -eq 0 ]] || die "eM Client did not exit within 20s total (still running: ${RUNNING_PIDS[*]}) -- close it manually and re-run."
+        fi
         log "eM Client closed."
     else
         die "aborted -- close eM Client in this bottle and re-run."
@@ -495,7 +519,47 @@ $ILP --patch-license-icon "$WORKDIR/output-stage5" "$WORKDIR/output-stage6"
 cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage6/"
 
 log "Stage 7: splash-screen tip icon fix..."
-$ILP --patch-splash-tip-icon "$WORKDIR/output-stage6" "$WORKDIR/output-final"
+$ILP --patch-splash-tip-icon "$WORKDIR/output-stage6" "$WORKDIR/output-stage7"
+cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage7/"
+
+# ---------------------------------------------------------------------------
+# Stages 8-15: new-mail notification toast fixes (see CLAUDE.md's Status
+# section, "Email notifications not displaying correctly until fade" -- one
+# root problem, several visible symptoms, all fixed together as one chain).
+# Order matters and is enforced by the tool itself (fails loudly on the wrong
+# order rather than silently misapplying) -- this exact sequence was verified
+# by a fresh rebuild from original/ straight through, decompiled-output-
+# identical to what was live-tested end to end. Don't reorder without
+# re-verifying the same way.
+# ---------------------------------------------------------------------------
+
+log "Stage 8: notification click-dispatch fix (fired its handler twice per click)..."
+$ILP --patch-notification-click-resubscribe "$WORKDIR/output-stage7" "$WORKDIR/output-stage8"
+
+log "Stage 9: notification layout fixes (content padding, avatar-title gap, title centering)..."
+$ILP --patch-notification-content-padding "$WORKDIR/output-stage8" "$WORKDIR/output-stage9a"
+$ILP --patch-notification-avatar-title-gap "$WORKDIR/output-stage9a" "$WORKDIR/output-stage9b"
+$ILP --patch-notification-title-singleline "$WORKDIR/output-stage9b" "$WORKDIR/output-stage9c"
+$ILP --patch-notification-title-vcenter-fix "$WORKDIR/output-stage9c" "$WORKDIR/output-stage9"
+
+log "Stage 10: notification empty-box-until-fade fix (title/content invisible until the toast started fading out)..."
+$ILP --patch-notification-text-in-bitmap "$WORKDIR/output-stage9" "$WORKDIR/output-stage10a"
+$ILP --patch-notification-refresh-on-content-change "$WORKDIR/output-stage10a" "$WORKDIR/output-stage10b"
+$ILP --patch-notification-periodic-reblit "$WORKDIR/output-stage10b" "$WORKDIR/output-stage10c"
+$ILP --patch-notification-suppress-self-text-only "$WORKDIR/output-stage10c" "$WORKDIR/output-stage10"
+
+log "Stage 11: notification close/settings icon visibility fix..."
+$ILP --patch-notification-icon-bitmap "$WORKDIR/output-stage10" "$WORKDIR/output-stage11a"
+$ILP --patch-notification-title-icon-clip "$WORKDIR/output-stage11a" "$WORKDIR/output-stage11"
+
+log "Stage 12: notification Light-theme bold-text fix..."
+$ILP --patch-notification-text-drawstring "$WORKDIR/output-stage11" "$WORKDIR/output-stage12"
+
+log "Stage 13: notification hover-pause/resume-fade fix..."
+$ILP --patch-notification-hover-forward "$WORKDIR/output-stage12" "$WORKDIR/output-stage13"
+
+log "Stage 14: notification reply/flag/delete/previous/next icon fix..."
+$ILP --patch-notification-toolbar-icons "$WORKDIR/output-stage13" "$WORKDIR/output-final"
 cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-final/"
 
 FINAL_DIR="$WORKDIR/output-final"
@@ -523,10 +587,22 @@ oaep_hits=$($ILSPY -t "MailClient.Licensing.DecryptAndVerify" "$FINAL_DIR/MailCl
 $ILP --dump-handlers "$FINAL_DIR/MailClient.dll" MailClient.Utils.Integration IsDefaultClientVista | tail -1 | grep -q "^OK:" \
     || die "verification failed: --dump-handlers reported a handler-ordering violation"
 
-ORIG_SIZE=$(stat -c%s "$WORKDIR/output-stage5/MailClient.dll")
-FINAL_SIZE=$(stat -c%s "$FINAL_DIR/MailClient.dll")
-[[ "$ORIG_SIZE" -eq "$FINAL_SIZE" ]] \
-    || die "verification failed: Stages 6-7 should not change MailClient.dll's byte size (was $ORIG_SIZE, now $FINAL_SIZE) -- .resources offset table may be corrupted"
+# Stages 6-7 are raw resource byte edits and must not change file size (see their own header
+# comments) -- checked against output-stage7 specifically, not FINAL_DIR, since the notification
+# stages after it are real IL insertions that legitimately grow the file.
+STAGE5_SIZE=$(stat -c%s "$WORKDIR/output-stage5/MailClient.dll")
+STAGE7_SIZE=$(stat -c%s "$WORKDIR/output-stage7/MailClient.dll")
+[[ "$STAGE5_SIZE" -eq "$STAGE7_SIZE" ]] \
+    || die "verification failed: Stages 6-7 should not change MailClient.dll's byte size (was $STAGE5_SIZE, now $STAGE7_SIZE) -- .resources offset table may be corrupted"
+
+$ILSPY -t "MailClient.UI.Forms.NotificationForms.FormGenericNotification" "$FINAL_DIR/MailClient.dll" | grep -q "__drawNotificationTextIntoBitmap" \
+    || die "verification failed: __drawNotificationTextIntoBitmap not found -- notification text-in-bitmap fix missing"
+
+$ILSPY -t "MailClient.UI.Forms.NotificationForms.FormMailNotification" "$FINAL_DIR/MailClient.dll" | grep -q "RaisePaint" \
+    || die "verification failed: FormMailNotification doesn't reference RaisePaint -- notification toolbar-icons fix missing"
+
+$ILSPY -t "MailClient.Common.UI.Controls.ControlToolStrip.ControlToolStripButton" "$FINAL_DIR/MailClient.Common.UI.dll" | grep -q "public void RaisePaint" \
+    || die "verification failed: ControlToolStripButton.RaisePaint not found or not public -- notification toolbar-icons fix missing"
 
 log "all verification checks passed."
 

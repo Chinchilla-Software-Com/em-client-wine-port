@@ -41,9 +41,7 @@ for both and tells you how to install whichever is missing.
 | Docx attachments (and other extensions) wouldn't open — "no Windows program configured" | Fresh CrossOver bottles ship no file-type association for most attachment extensions (not an eM Client bug) | [office-file-associations-findings.md](reports/office-file-associations-findings.md) |
 | New-mail notification toast didn't display correctly until it faded out — invisible text/icons, no hover-pause, unclickable icons | `this` form's own window doesn't reliably paint or receive input under Wine; content only ever appeared during the fade animation ticks | [notification-empty-until-fade-findings.md](reports/notification-empty-until-fade-findings.md) |
 
-All eight confirmed fixed and working, tested across Windows 7/8/10/11 CrossOver bottles. The
-notification fix isn't in `deploy.sh` yet — see `CLAUDE.md`'s Status section for the manual
-patch chain in the meantime.
+All eight confirmed fixed and working, tested across Windows 7/8/10/11 CrossOver bottles.
 
 ## How it's built
 

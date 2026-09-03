@@ -330,26 +330,31 @@ until-fade-findings.md`.
 - 1 site in vendored `QRCoder.dll` (QR export only).
 - 2 `InterpolationMode.High` sites — confirmed broken by the same disassembly, not yet patched.
 
-**Deploy status**: Stages 1–7 are in `releases/<version>/deploy.sh`. Everything else above is
-still applied manually via `~/tools/il-patcher`, and MUST run in this exact order (verified via a
-fresh rebuild from `original/` straight through — two real ordering dependencies only surfaced
-during that rebuild, see below): `--patch-notification-click-resubscribe` (Stage 8), then
-`--patch-notification-content-padding`, `--patch-notification-avatar-title-gap`,
-`--patch-notification-title-singleline`, `--patch-notification-title-vcenter-fix`,
-`--patch-notification-text-in-bitmap`, `--patch-notification-refresh-on-content-change`,
-`--patch-notification-periodic-reblit`, `--patch-notification-suppress-self-text-only`,
-`--patch-notification-icon-bitmap`, `--patch-notification-title-icon-clip`,
-`--patch-notification-text-drawstring`, `--patch-notification-hover-forward`,
-`--patch-notification-toolbar-icons`. Two hard ordering requirements the tool itself enforces
-(fails loudly, doesn't silently misapply): `--patch-notification-title-singleline` before
-`--patch-notification-title-vcenter-fix` (the latter expects flags the former adds), and
-`--patch-notification-text-in-bitmap` before `--patch-notification-icon-bitmap` (the latter needs
-`__drawNotificationTextIntoBitmap`, which the former creates). This exact chain was rebuilt fresh
-from `original/8` and confirmed byte-for-byte equivalent (decompiled output identical) to the
-build already live-tested end to end — plus genuinely cleaner: the previously-live build had
-accumulated dev-only diagnostic logging (`--patch-diag` etc., now removed from the tool entirely)
-inside several notification methods, e.g. 8 stray `File.AppendAllText` calls inside `OnShown`
-alone, none of which exist in this fresh chain. Folding this into `deploy.sh` is the next step.
+**Deploy status**: all of it is in `releases/<version>/deploy.sh` now (Stages 1–14) — nothing left
+to apply manually. Stages 8–14 are the notification chain, which MUST run in this exact order
+(the tool itself enforces two of these orderings, failing loudly rather than silently
+misapplying if violated): `--patch-notification-click-resubscribe` (Stage 8), then Stage 9
+(`--patch-notification-content-padding`, `--patch-notification-avatar-title-gap`,
+`--patch-notification-title-singleline`, `--patch-notification-title-vcenter-fix` — singleline
+before vcenter-fix, the latter expects flags the former adds), Stage 10
+(`--patch-notification-text-in-bitmap`, `--patch-notification-refresh-on-content-change`,
+`--patch-notification-periodic-reblit`, `--patch-notification-suppress-self-text-only`), Stage 11
+(`--patch-notification-icon-bitmap`, `--patch-notification-title-icon-clip` — text-in-bitmap
+before icon-bitmap, the latter needs `__drawNotificationTextIntoBitmap`, which the former
+creates), Stage 12 (`--patch-notification-text-drawstring`), Stage 13
+(`--patch-notification-hover-forward`), Stage 14 (`--patch-notification-toolbar-icons`). Verified
+two ways before folding in: a fresh rebuild from `original/8` confirmed byte-for-byte equivalent
+(decompiled output identical) to the build already live-tested, and genuinely cleaner (the
+previously-live build had accumulated dev-only diagnostic logging — `--patch-diag` etc., now
+removed from the tool entirely — inside several notification methods, e.g. 8 stray
+`File.AppendAllText` calls inside `OnShown` alone, none of which exist in this chain); then a
+full real run of `deploy.sh` itself against a bottle restored to pristine (`cp -a original/8/.`
+over the live install, removing the stray `MailClient.Licensing.BouncyCastlePatch.dll` too) —
+all 14 stages, every verification check, backup, and deploy succeeded, and the user confirmed
+the result live. That run also caught a real gap in `deploy.sh`'s own close-handling: eM
+Client's own "Close application to tray" setting can make a graceful close request succeed
+(window disappears) without the process ever exiting, which the script didn't previously handle
+(would time out and `die` instead of falling back to `kill`) — fixed.
 
 ## Investigation method (what actually worked this round)
 
