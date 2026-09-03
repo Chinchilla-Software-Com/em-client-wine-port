@@ -38,9 +38,12 @@ for both and tells you how to install whichever is missing.
 | License Activation silently failed (spinner, then nothing) | RSA-OAEP decrypt fails inside Wine's `bcrypt.dll`/GnuTLS backend | [license-activation-oaep-findings.md](reports/license-activation-oaep-findings.md) |
 | License dialog's "Get a license" button showed two tofu boxes | Corrupted control characters baked into eM Client's own resource data (not a Wine bug) | [license-icon-findings.md](reports/license-icon-findings.md) |
 | Splash screen tip line showed two tofu boxes | A real emoji character Wine has no glyph for (a genuine Wine gap, investigated at length) | [splash-tip-icon-findings.md](reports/splash-tip-icon-findings.md) |
-| Attachments (office documents, images, archives, audio/video) wouldn't open — "no Windows program configured" | Fresh CrossOver bottles ship no file-type association for most attachment extensions (not an eM Client bug) | [office-file-associations-findings.md](reports/office-file-associations-findings.md) |
+| Docx attachments (and other extensions) wouldn't open — "no Windows program configured" | Fresh CrossOver bottles ship no file-type association for most attachment extensions (not an eM Client bug) | [office-file-associations-findings.md](reports/office-file-associations-findings.md) |
+| New-mail notification toast didn't display correctly until it faded out — invisible text/icons, no hover-pause, unclickable icons | `this` form's own window doesn't reliably paint or receive input under Wine; content only ever appeared during the fade animation ticks | [notification-empty-until-fade-findings.md](reports/notification-empty-until-fade-findings.md) |
 
-All seven confirmed fixed and working, tested across Windows 7/8/10/11 CrossOver bottles.
+All eight confirmed fixed and working, tested across Windows 7/8/10/11 CrossOver bottles. The
+notification fix isn't in `deploy.sh` yet — see `CLAUDE.md`'s Status section for the manual
+patch chain in the meantime.
 
 ## How it's built
 

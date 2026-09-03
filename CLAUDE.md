@@ -149,6 +149,20 @@ UI automation tooling exists in this environment (no xdotool/ydotool/xte) — a 
 actually click through the app. `xwininfo`, `wmctrl`, `xprop` (read-only X11 inspection) ARE
 available and useful for checking live window geometry without needing automation.
 
+**Dev-only tools removed from `il-patcher` for the release patch** (never in `deploy.sh`, no
+loss to recreate if needed again — each is a small, self-contained `RunPatchX` function):
+- `--patch-close-listener` — self-close on a `Z:\tmp\claude-close-signal` file, for fast
+  iteration without killing the process.
+- `--patch-auto-test-notification` / `--patch-test-monogram-avatar` / `--patch-test-monogram-repeat`
+  — synthetic test notification on a `Z:\tmp\claude-trigger-notification` file, no real email
+  needed.
+- `--patch-theme-switcher` — Light/Dark toggle via a file trigger, no OS theme change needed.
+- `--patch-diag`, `--patch-notification-layout-diag`, `--patch-notification-geometry-diag`,
+  `--patch-diag-toolstrip-buttons`, `--patch-diag-toolstrip-controls` — one-off diagnostic
+  instrumentation (`File.AppendAllText` calls into a method), used to root-cause a specific bug
+  and superseded once it was found. Write a new one the same way next time: same pattern as any
+  other patch in this file, insert `Ldstr`/`Call File.AppendAllText` before the point in question.
+
 ## Patch pipeline — regenerate everything from a fresh `original/`
 
 Run in order; each stage's output directory is the next stage's input. All commands assume
@@ -317,13 +331,25 @@ until-fade-findings.md`.
 - 2 `InterpolationMode.High` sites — confirmed broken by the same disassembly, not yet patched.
 
 **Deploy status**: Stages 1–7 are in `releases/<version>/deploy.sh`. Everything else above is
-still applied manually via `~/tools/il-patcher`: Stage 8
-(`--patch-notification-click-resubscribe`), then in order `--patch-notification-text-in-bitmap`,
-`--patch-notification-refresh-on-content-change`, `--patch-notification-periodic-reblit`,
-`--patch-notification-suppress-self-text-only`, `--patch-notification-icon-bitmap`,
-`--patch-notification-title-icon-clip`, `--patch-notification-text-drawstring`,
-`--patch-notification-hover-forward`, `--patch-notification-toolbar-icons`. Folding these into
-`deploy.sh` is pending a fresh rebuild-and-diff verification pass from `original/`.
+still applied manually via `~/tools/il-patcher`, and MUST run in this exact order (verified via a
+fresh rebuild from `original/` straight through — two real ordering dependencies only surfaced
+during that rebuild, see below): `--patch-notification-click-resubscribe` (Stage 8), then
+`--patch-notification-content-padding`, `--patch-notification-avatar-title-gap`,
+`--patch-notification-title-singleline`, `--patch-notification-title-vcenter-fix`,
+`--patch-notification-text-in-bitmap`, `--patch-notification-refresh-on-content-change`,
+`--patch-notification-periodic-reblit`, `--patch-notification-suppress-self-text-only`,
+`--patch-notification-icon-bitmap`, `--patch-notification-title-icon-clip`,
+`--patch-notification-text-drawstring`, `--patch-notification-hover-forward`,
+`--patch-notification-toolbar-icons`. Two hard ordering requirements the tool itself enforces
+(fails loudly, doesn't silently misapply): `--patch-notification-title-singleline` before
+`--patch-notification-title-vcenter-fix` (the latter expects flags the former adds), and
+`--patch-notification-text-in-bitmap` before `--patch-notification-icon-bitmap` (the latter needs
+`__drawNotificationTextIntoBitmap`, which the former creates). This exact chain was rebuilt fresh
+from `original/8` and confirmed byte-for-byte equivalent (decompiled output identical) to the
+build already live-tested end to end — plus genuinely cleaner: the previously-live build had
+accumulated dev-only diagnostic logging (`--patch-diag` etc., now removed from the tool entirely)
+inside several notification methods, e.g. 8 stray `File.AppendAllText` calls inside `OnShown`
+alone, none of which exist in this fresh chain. Folding this into `deploy.sh` is the next step.
 
 ## Investigation method (what actually worked this round)
 
