@@ -103,6 +103,11 @@ if (args.Length > 0 && args[0] == "--patch-account-manager-sync-async")
     return RunPatchAccountManagerSyncAsync(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-pbkdf2-instance-api")
+{
+    return RunPatchPbkdf2InstanceApi(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-folder-sync-async")
 {
     return RunPatchFolderSyncAsync(args);
@@ -8732,6 +8737,189 @@ static bool IsStloc(Instruction insn, MethodBody body, out VariableDefinition? v
 // so it's fixed once for all callers instead of needing every call site found and patched
 // individually.
 //
+// eM Client 11 beta: fixes a startup crash, not a rendering glitch. Wine's bcrypt.dll DOES
+// export BCryptDeriveKeyPBKDF2/BCryptKeyDerivation (confirmed via objdump -p), but .NET 10's
+// new static Rfc2898DeriveBytes.Pbkdf2(...) API -- which always routes through native CNG on
+// Windows -- throws CryptographicException("Unknown error (0xc1000008)") the instant it's
+// called, confirmed universally reproducible with a minimal win-x86/net10.0 repro exe run
+// directly in the target bottle (both SHA1 and SHA256, unrelated to any app-specific
+// password/salt/iteration values). AESEncryptor.EncryptStringAES/DecryptStringAES both call
+// this exact static overload to derive the local-cache/master-password AES key, and it's on
+// the InitOnBackground startup path (via MasterPasswordManager.Encrypt -> FileBasedCache
+// .Initialize), so the app never gets past its own splash screen.
+//
+// The same repro exe also confirmed the OLD, "obsolete" instance-based API --
+// `new Rfc2898DeriveBytes(password, salt, iterations, hashAlgorithmName).GetBytes(count)` --
+// works fine under the same Wine build, as does raw HMACSHA1/HMACSHA256 (so hashing/HMAC
+// itself isn't broken -- this is specifically the new static method's CNG-only dispatch path).
+// This makes the fix much simpler than the earlier RSA-OAEP bcrypt gap (which needed a whole
+// new BouncyCastle-backed helper assembly, see license-activation-oaep-findings.md): both the
+// static Pbkdf2 method and the instance ctor+GetBytes path live in the SAME already-referenced
+// System.Security.Cryptography assembly, so this just swaps one `call` instruction for a
+// `newobj`+`callvirt` pair -- no new assembly, no deps.json edit, no BouncyCastle involved.
+//
+// The new MethodReferences (ctor, GetBytes) are hand-built off the EXISTING Pbkdf2 call
+// instruction's own DeclaringType/parameter-type references (not typeof() reflection) -- same
+// technique as lesson 12 in CLAUDE.md, sidesteps any risk of baking in the patcher tool's own
+// runtime's assembly version for a type this app pins its own copy of.
+static int RunPatchPbkdf2InstanceApi(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-pbkdf2-instance-api <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    // Scan every MailClient*.dll (app code, never the BCL/vendor assemblies) rather than
+    // hardcoding specific type/method names: the first crash pointed at
+    // AESEncryptor.EncryptStringAES/DecryptStringAES, but getting past that surfaced a SECOND,
+    // independent call site (MailClient.UI.FileBasedCache`1.Initialize, in a different
+    // assembly, inside its own try/filter-catch region) that only runs once the first is fixed
+    // -- classic "each crash reveals the next one" shape. Scanning for the exact call
+    // signature everywhere in the app's own assemblies fixes all of them in one pass instead of
+    // continuing to whack-a-mole one crash at a time.
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    int totalPatched = 0;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (!fileName.StartsWith("MailClient", StringComparison.Ordinal))
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        // Not every "MailClient*.dll" is a .NET assembly -- MailClient.Mapi.dll (a native MAPI
+        // COM interop shim) is a plain native PE DLL, no CLR header, and Cecil can't parse it
+        // (BadImageFormatException, hard-crashing the whole batch the first time this was hit).
+        // Skip anything Cecil can't read as a module and copy it through verbatim instead.
+        ModuleDefinition? module;
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        try
+        {
+            module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+            {
+                AssemblyResolver = resolver,
+                ReadWrite = false
+            });
+        }
+        catch (BadImageFormatException)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+        using var _ = module;
+
+        int patchedInThisAssembly = 0;
+
+        foreach (var type in module.Types.SelectMany(FlattenNestedTypes))
+        {
+            foreach (var method in type.Methods.Where(m => m.HasBody))
+            {
+                var body = method.Body;
+
+                // Find (don't assume just one) every matching call in this method body --
+                // FileBasedCache<T>.Initialize turned out to have exactly one, but nothing
+                // guarantees that in general.
+                var targets = body.Instructions.Where(i =>
+                    i.OpCode == OpCodes.Call &&
+                    i.Operand is MethodReference mr &&
+                    mr.Name == "Pbkdf2" &&
+                    mr.DeclaringType.Name == "Rfc2898DeriveBytes" &&
+                    mr.Parameters.Count == 5 &&
+                    mr.Parameters[0].ParameterType.Name == "String" &&
+                    mr.Parameters[1].ParameterType.Name == "Byte[]").ToList();
+                if (targets.Count == 0) continue;
+
+                body.SimplifyMacros();
+                var il = body.GetILProcessor();
+
+                foreach (var target in targets)
+                {
+                    var pbkdf2Ref = (MethodReference)target.Operand;
+                    var rfc2898TypeRef = pbkdf2Ref.DeclaringType;
+                    var stringType = module.TypeSystem.String;
+                    var byteArrayType = pbkdf2Ref.Parameters[1].ParameterType;   // byte[] salt
+                    var int32Type = module.TypeSystem.Int32;
+                    var hashAlgorithmNameType = pbkdf2Ref.Parameters[3].ParameterType;
+
+                    var ctorRef = new MethodReference(".ctor", module.TypeSystem.Void, rfc2898TypeRef) { HasThis = true };
+                    ctorRef.Parameters.Add(new ParameterDefinition(stringType));
+                    ctorRef.Parameters.Add(new ParameterDefinition(byteArrayType));
+                    ctorRef.Parameters.Add(new ParameterDefinition(int32Type));
+                    ctorRef.Parameters.Add(new ParameterDefinition(hashAlgorithmNameType));
+
+                    var getBytesRef = new MethodReference("GetBytes", byteArrayType, rfc2898TypeRef) { HasThis = true };
+                    getBytesRef.Parameters.Add(new ParameterDefinition(int32Type));
+
+                    var outputLengthLocal = new VariableDefinition(int32Type);
+                    body.Variables.Add(outputLengthLocal);
+
+                    // Original stack just before `target`: [..., password, salt, iterations,
+                    // hashAlgorithmName, outputLength] (outputLength on top -- always the last
+                    // arg pushed for this overload). Stash it first so newobj's 4 args land
+                    // correctly; this insertion never touches a TryStart/TryEnd/HandlerStart/
+                    // HandlerEnd boundary or branch target (confirmed via --dump-handlers for
+                    // FileBasedCache.Initialize, whose call sits deep inside an existing
+                    // try/filter region, not at either edge) -- see IL-patching lesson 3.
+                    il.InsertBefore(target, il.Create(OpCodes.Stloc, outputLengthLocal));
+                    il.InsertBefore(target, il.Create(OpCodes.Newobj, ctorRef));
+                    il.InsertBefore(target, il.Create(OpCodes.Ldloc, outputLengthLocal));
+                    il.InsertBefore(target, il.Create(OpCodes.Callvirt, getBytesRef));
+                    il.Remove(target);
+
+                    patchedInThisAssembly++;
+                }
+            }
+        }
+
+        if (patchedInThisAssembly > 0)
+        {
+            module.Write(destPath);
+            Console.WriteLine($"OK: patched {patchedInThisAssembly} call site(s) in {fileName}");
+            totalPatched += patchedInThisAssembly;
+        }
+        else
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+        }
+    }
+
+    if (totalPatched == 0)
+    {
+        Console.Error.WriteLine("FAIL: no Rfc2898DeriveBytes.Pbkdf2(string, byte[], int, HashAlgorithmName, int) call sites found in any MailClient*.dll");
+        return 1;
+    }
+
+    Console.WriteLine($"OK: {totalPatched} total call site(s) patched.");
+
+    return 0;
+}
+
+// Yields a type plus every nested type beneath it (recursively) -- generic types like
+// FileBasedCache`1 are ordinary top-level TypeDefinitions here (not nested), but this still
+// covers any Pbkdf2 call site hidden inside a compiler-generated nested type (async state
+// machines, closures) that --patch-pbkdf2-instance-api's scan would otherwise miss.
+static IEnumerable<TypeDefinition> FlattenNestedTypes(TypeDefinition type)
+{
+    yield return type;
+    foreach (var nested in type.NestedTypes)
+    {
+        foreach (var t in FlattenNestedTypes(nested))
+        {
+            yield return t;
+        }
+    }
+}
+
 // To avoid hand-authoring a faithful copy of SendAndReceiveAll's own body (it has a couple of
 // null-conditional delegate/event invokes -- `logger?.Invoke(...)`, `SendingAndOrReceiving?.
 // Invoke(...)` -- that are easy to get subtly wrong by hand), this patch REUSES the existing,

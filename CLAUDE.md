@@ -137,6 +137,65 @@ case a later Windows version does differ.
 there's a specific reason to use another bottle (e.g. `emClient_win_7_x64_2`'s never-activated
 license state, kept available for licensing-related testing).
 
+## eM Client 11 (beta) — separate release line
+
+Everything above (`original/7,8,10,11`, `releases/10.4.5674/`, the "Status" section below) is
+for eM Client **10.4.5674**. eM Client **11.0.196-beta** is a genuinely different, still-changing
+product build (new assembly set, targets .NET 10 instead of .NET 8, different bugs) tracked
+completely separately, on purpose — never fold its fixes into `releases/10.4.5674/deploy.sh` or
+its Status section, and never run one version's `deploy.sh` against the other's bottle (each
+script's own version gate warns and asks before proceeding against an unexpected `FileVersion`,
+but don't rely on that alone).
+
+- **Bottle:** `emClient_11_beta_win_11` (`~/.cxoffice/emClient_11_beta_win_11/`), same classic
+  install path shape as the v10 bottles (`drive_c/Program Files (x86)/eM Client/MailClient.dll`).
+- **`original/em-11.0.196/`** — the pristine reference snapshot for this exact build
+  (`MailClient.dll` FileVersion `11.0.196.0`, InformationalVersion
+  `11.0.196-beta+b945a075a5`). Named by full eM Client version string, deliberately **not**
+  `original/11/` — that name is already taken by "Windows 11" in the v10 OS-version scheme above,
+  and reusing it here would silently collide/confuse the two axes (OS version vs. eM Client
+  version). `original/v1/` also exists in this repo and is **not** related to eM Client 11 at
+  all despite the name — it's an old, differently-named snapshot of eM Client 10.4.5674, a
+  leftover from before the current `original/<os-version>/` convention was adopted; ignore it.
+- **`releases/11.0.196-beta/deploy.sh`** — this version's own deploy script, same overall shape
+  (bottle discovery, running-instance check, version gate, backup, verify, deploy-with-rollback,
+  a `MailClient.Wine.dll` revision marker) as `releases/10.4.5674/deploy.sh` but much smaller —
+  two DLL-patch stages so far. Deliberately does not share the file-associations step (unrelated
+  to anything fixed here yet) or the license-OAEP BouncyCastle helper (neither DLL fix so far
+  needs a new sibling assembly). The `MailClient.Wine.dll` marker is built from the exact same
+  tracked source as v10's (`il-patches/MailClient.Wine/VersionMarker.cs`), just with this line's
+  own version numbers passed at build time — `AssemblyVersion=11.0.196.0` (this eM Client build),
+  `FileVersion=11.0.196.<our-release-number>` — so the same leading-three-components/trailing-
+  revision convention holds for both release lines without any code changes to the marker itself.
+  Fonts (same vendored `fonts/*.ttf` and same `--install-fonts`/`--no-fonts` prompt-or-flag
+  pattern as the v10 pipeline) ARE shared with v10 — reuses `il-patches/font-systemlink-writer/`'s
+  `Program.cs` verbatim, but builds it with its OWN inline csproj targeting **net10.0**, not the
+  shared file's net8.0: this bottle only has the .NET 10 desktop runtime installed (matching eM
+  Client 11's own target), so a net8.0 framework-dependent apphost would fail to launch here.
+  Independent of the DLL-patch pipeline (runs regardless of which stages applied this time), same
+  as v10. Verified live: fonts land in the bottle's `windows/Fonts`, registry SystemLink entries
+  read back correctly, `--no-fonts` skips cleanly on a re-run.
+- **Status:** two DLL fixes so far, plus fonts.
+  - `release/11.0.196-1` — a startup crash (PBKDF2 key derivation broken under Wine's
+    `bcrypt.dll`, blocking `InitOnBackground` before the main window ever appears). Full
+    root-cause and fix details: `reports/emclient11-pbkdf2-startup-crash-findings.md`. Fixed via
+    a NEW il-patcher flag, `--patch-pbkdf2-instance-api` (Stage 1), which scans every
+    `MailClient*.dll` for the exact broken call shape rather than hardcoding one type/method (a
+    second, independent call site turned up only after the first was fixed — see the findings
+    report).
+  - `release/11.0.196-2` — splash screen tip label tofu boxes (Stage 2), the **exact same bug**
+    as the already-fixed v10 issue (`reports/splash-tip-icon-findings.md`) — confirmed identical
+    root cause, not just a similar-looking symptom (same resource path, same exact
+    `F0 9F 92 A1` emoji bytes, same control, same mechanism — see
+    `reports/emclient11-splash-tip-icon-findings.md`). Fixed by reusing the existing
+    `--patch-splash-tip-icon` flag completely **unmodified** — no new patch code needed, just
+    wired into this release line's own Stage 2. Visually confirmed working by the user.
+  Both flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every v10 patch flag
+  (shared tooling, not duplicated per release line) — only the deploy scripts and release folders
+  are kept separate, not the patcher tool itself. Also added (not a DLL patch, so not part of the
+  `REVISION_LAST_STAGE`/stage-number scheme, same as v10): vendored font installation,
+  `--install-fonts`/`--no-fonts`, described above.
+
 git is available in this environment (it wasn't in earlier sessions — if CLAUDE.md you're
 reading elsewhere says otherwise, this note supersedes it). Local commit identity for this repo
 is set to `Claude Code <ai@cdmdotnet.com>` (`git config --local`, not global — never set global
