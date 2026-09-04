@@ -57,15 +57,15 @@ EXPECTED_FILE_VERSION="10.4.5674.0"
 # This project's own release number against RELEASE_VERSION (see
 # il-patches/MailClient.Wine/VersionMarker.cs) -- bump this, and add a row to
 # REVISION_LAST_STAGE below, every time a new release ships against the same eM Client version.
-# Tag as release/<RELEASE_VERSION>-<OUR_RELEASE_NUMBER> (release/10.4.5674-2 for this one).
-OUR_RELEASE_NUMBER=2
+# Tag as release/<RELEASE_VERSION>-<OUR_RELEASE_NUMBER> (release/10.4.5674-3 for this one).
+OUR_RELEASE_NUMBER=3
 
 # release number -> last stage number that release introduced. Drives the "resume mid-pipeline"
 # logic below: a bottle already at revision N only needs stages after REVISION_LAST_STAGE[N]
 # applied. 1 (release/10.4.5674, this project's first tagged release) predates
 # MailClient.Wine.dll entirely -- detected via the older BouncyCastlePatch-only marker instead,
 # see the revision-detection block below.
-declare -A REVISION_LAST_STAGE=( [0]=0 [1]=7 [2]=14 )
+declare -A REVISION_LAST_STAGE=( [0]=0 [1]=7 [2]=14 [3]=15 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -588,7 +588,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Stages 8-15: new-mail notification toast fixes (see CLAUDE.md's Status
+# Stages 8-14: new-mail notification toast fixes (see CLAUDE.md's Status
 # section, "Email notifications not displaying correctly until fade" -- one
 # root problem, several visible symptoms, all fixed together as one chain).
 # Order matters and is enforced by the tool itself (fails loudly on the wrong
@@ -596,35 +596,73 @@ fi
 # by a fresh rebuild from original/ straight through, decompiled-output-
 # identical to what was live-tested end to end. Don't reorder without
 # re-verifying the same way.
+#
+# Wrapped in the same START_STAGE guard as Stages 1-7, now that a revision 2
+# (release/10.4.5674-2, these stages already applied) can genuinely resume
+# straight to Stage 15 -- re-running an already-applied notification patch
+# against its own output is exactly the "expected pristine, found already-
+# patched, refuse" class of failure Stage 1 already guards against for
+# InterpolationMode, and these stages don't all have that same guard built
+# in, so skipping outright (not just risking a clean failure) is the safe
+# choice here.
 # ---------------------------------------------------------------------------
 
-log "Stage 8: notification click-dispatch fix (fired its handler twice per click)..."
-$ILP --patch-notification-click-resubscribe "$STAGE7_DIR" "$WORKDIR/output-stage8"
+if [[ $START_STAGE -le 8 ]]; then
+    log "Stage 8: notification click-dispatch fix (fired its handler twice per click)..."
+    $ILP --patch-notification-click-resubscribe "$STAGE7_DIR" "$WORKDIR/output-stage8"
 
-log "Stage 9: notification layout fixes (content padding, avatar-title gap, title centering)..."
-$ILP --patch-notification-content-padding "$WORKDIR/output-stage8" "$WORKDIR/output-stage9a"
-$ILP --patch-notification-avatar-title-gap "$WORKDIR/output-stage9a" "$WORKDIR/output-stage9b"
-$ILP --patch-notification-title-singleline "$WORKDIR/output-stage9b" "$WORKDIR/output-stage9c"
-$ILP --patch-notification-title-vcenter-fix "$WORKDIR/output-stage9c" "$WORKDIR/output-stage9"
+    log "Stage 9: notification layout fixes (content padding, avatar-title gap, title centering)..."
+    $ILP --patch-notification-content-padding "$WORKDIR/output-stage8" "$WORKDIR/output-stage9a"
+    $ILP --patch-notification-avatar-title-gap "$WORKDIR/output-stage9a" "$WORKDIR/output-stage9b"
+    $ILP --patch-notification-title-singleline "$WORKDIR/output-stage9b" "$WORKDIR/output-stage9c"
+    $ILP --patch-notification-title-vcenter-fix "$WORKDIR/output-stage9c" "$WORKDIR/output-stage9"
 
-log "Stage 10: notification empty-box-until-fade fix (title/content invisible until the toast started fading out)..."
-$ILP --patch-notification-text-in-bitmap "$WORKDIR/output-stage9" "$WORKDIR/output-stage10a"
-$ILP --patch-notification-refresh-on-content-change "$WORKDIR/output-stage10a" "$WORKDIR/output-stage10b"
-$ILP --patch-notification-periodic-reblit "$WORKDIR/output-stage10b" "$WORKDIR/output-stage10c"
-$ILP --patch-notification-suppress-self-text-only "$WORKDIR/output-stage10c" "$WORKDIR/output-stage10"
+    log "Stage 10: notification empty-box-until-fade fix (title/content invisible until the toast started fading out)..."
+    $ILP --patch-notification-text-in-bitmap "$WORKDIR/output-stage9" "$WORKDIR/output-stage10a"
+    $ILP --patch-notification-refresh-on-content-change "$WORKDIR/output-stage10a" "$WORKDIR/output-stage10b"
+    $ILP --patch-notification-periodic-reblit "$WORKDIR/output-stage10b" "$WORKDIR/output-stage10c"
+    $ILP --patch-notification-suppress-self-text-only "$WORKDIR/output-stage10c" "$WORKDIR/output-stage10"
 
-log "Stage 11: notification close/settings icon visibility fix..."
-$ILP --patch-notification-icon-bitmap "$WORKDIR/output-stage10" "$WORKDIR/output-stage11a"
-$ILP --patch-notification-title-icon-clip "$WORKDIR/output-stage11a" "$WORKDIR/output-stage11"
+    log "Stage 11: notification close/settings icon visibility fix..."
+    $ILP --patch-notification-icon-bitmap "$WORKDIR/output-stage10" "$WORKDIR/output-stage11a"
+    $ILP --patch-notification-title-icon-clip "$WORKDIR/output-stage11a" "$WORKDIR/output-stage11"
 
-log "Stage 12: notification Light-theme bold-text fix..."
-$ILP --patch-notification-text-drawstring "$WORKDIR/output-stage11" "$WORKDIR/output-stage12"
+    log "Stage 12: notification Light-theme bold-text fix..."
+    $ILP --patch-notification-text-drawstring "$WORKDIR/output-stage11" "$WORKDIR/output-stage12"
 
-log "Stage 13: notification hover-pause/resume-fade fix..."
-$ILP --patch-notification-hover-forward "$WORKDIR/output-stage12" "$WORKDIR/output-stage13"
+    log "Stage 13: notification hover-pause/resume-fade fix..."
+    $ILP --patch-notification-hover-forward "$WORKDIR/output-stage12" "$WORKDIR/output-stage13"
 
-log "Stage 14: notification reply/flag/delete/previous/next icon fix..."
-$ILP --patch-notification-toolbar-icons "$WORKDIR/output-stage13" "$WORKDIR/output-final"
+    log "Stage 14: notification reply/flag/delete/previous/next icon fix..."
+    $ILP --patch-notification-toolbar-icons "$WORKDIR/output-stage13" "$WORKDIR/output-stage14"
+    cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage14/"
+
+    STAGE14_DIR="$WORKDIR/output-stage14"
+else
+    # Resuming past Stage 14: already baked into what's actually installed, same reasoning as
+    # the Stage 1-7 skip above.
+    log "Stages 8-14 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+    STAGE14_DIR="$WORKDIR/original"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 15: sync freeze fix (see reports/exchange-sync-freeze-findings.md).
+# AccountManager.SendAndReceiveAll's own sequential per-account loop, and
+# Folder.Synchronize's own recursive per-folder walk, could each block
+# whatever thread calls them (very often the UI thread -- the once-a-minute
+# auto-sync timer, the "check for mail on startup" option, manual refresh,
+# and the "download for offline use" folder-tree walk all call one or the
+# other directly and synchronously) for up to 20 seconds per account/folder
+# on Wine's GetAddrInfoExW, which can't honor a connection-timeout
+# cancellation. Both patches touch MailClient.Accounts.dll only, dispatching
+# onto a dedicated background Thread instead (not Task.Run -- see either
+# patch's own doc comment for why: Task.Run's shared ThreadPool reintroduced
+# a different stutter under concurrent load).
+# ---------------------------------------------------------------------------
+
+log "Stage 15: sync freeze fix (account-level sync + folder-tree sync both now run off the UI thread)..."
+$ILP --patch-account-manager-sync-async "$STAGE14_DIR" "$WORKDIR/output-stage15a"
+$ILP --patch-folder-sync-async "$WORKDIR/output-stage15a" "$WORKDIR/output-final"
 cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-final/"
 cp "$MAILCLIENT_WINE_DLL" "$WORKDIR/output-final/"
 
@@ -673,6 +711,18 @@ $ILSPY -t "MailClient.UI.Forms.NotificationForms.FormMailNotification" "$FINAL_D
 $ILSPY -t "MailClient.Common.UI.Controls.ControlToolStrip.ControlToolStripButton" "$FINAL_DIR/MailClient.Common.UI.dll" | grep -q "public void RaisePaint" \
     || die "verification failed: ControlToolStripButton.RaisePaint not found or not public -- notification toolbar-icons fix missing"
 
+$ILSPY -t "MailClient.Accounts.AccountManager" "$FINAL_DIR/MailClient.Accounts.dll" | grep -q "__syncTaskEntry" \
+    || die "verification failed: AccountManager.__syncTaskEntry not found -- sync freeze fix missing"
+
+$ILSPY -t "MailClient.Storage.Application.Folder" "$FINAL_DIR/MailClient.Accounts.dll" | grep -q "__folderSyncTaskEntry" \
+    || die "verification failed: Folder.__folderSyncTaskEntry not found -- sync freeze fix missing"
+
+$ILP --dump-handlers "$FINAL_DIR/MailClient.Accounts.dll" MailClient.Accounts.AccountManager __syncTaskEntry 2>&1 | grep -q "^OK:" \
+    || die "verification failed: --dump-handlers reported a handler-ordering violation in AccountManager.__syncTaskEntry"
+
+$ILP --dump-handlers "$FINAL_DIR/MailClient.Accounts.dll" MailClient.Storage.Application.Folder __folderSyncTaskEntry 2>&1 | grep -q "^OK:" \
+    || die "verification failed: --dump-handlers reported a handler-ordering violation in Folder.__folderSyncTaskEntry"
+
 log "all verification checks passed."
 
 # ---------------------------------------------------------------------------
@@ -684,7 +734,7 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="$BACKUPS_DIR/${BOTTLE_NAME}-${TIMESTAMP}"
 mkdir -p "$BACKUP_DIR"
 
-DEPLOY_FILES=(MailClient.dll MailClient.Common.UI.dll MailClient.Licensing.BouncyCastlePatch.dll MailClient.Wine.dll)
+DEPLOY_FILES=(MailClient.dll MailClient.Common.UI.dll MailClient.Accounts.dll MailClient.Licensing.BouncyCastlePatch.dll MailClient.Wine.dll)
 
 log "backing up current files to $BACKUP_DIR ..."
 for f in "${DEPLOY_FILES[@]}" MailClient.deps.json; do
@@ -692,6 +742,19 @@ for f in "${DEPLOY_FILES[@]}" MailClient.deps.json; do
         cp -a "$BOTTLE_APP_DIR/$f" "$BACKUP_DIR/$f"
     fi
 done
+
+# cp -a preserves mode/ownership/timestamps -- fine for a normal same-machine bottle under
+# ~/.cxoffice/, but a bottle reached over a mounted/shared filesystem (e.g. a different
+# machine's bottle mounted read-write for remote debugging) can reject the timestamp-preserving
+# utime() call even with full read/write permission on the file's contents ("cp: preserving
+# times ... Operation not permitted"), since the mount may enforce ownership separately from the
+# permission bits it otherwise honors. The file content write itself isn't the problem -- only
+# the attribute-preservation step is -- so fall back to a plain content-only `cp` rather than
+# failing the whole deploy over a cosmetic timestamp.
+cp_deploy() {
+    cp -a "$1" "$2" 2>/dev/null && return 0
+    cp "$1" "$2"
+}
 
 WRITTEN_FILES=()
 rollback() {
@@ -702,7 +765,7 @@ rollback() {
             warn "  moved partially-deployed $f aside as $f.new"
         fi
         if [[ -f "$BACKUP_DIR/$f" ]]; then
-            cp -a "$BACKUP_DIR/$f" "$BOTTLE_APP_DIR/$f"
+            cp_deploy "$BACKUP_DIR/$f" "$BOTTLE_APP_DIR/$f"
             warn "  restored $f from backup"
         fi
     done
@@ -711,7 +774,7 @@ rollback() {
 
 log "deploying to $BOTTLE_APP_DIR ..."
 for f in "${DEPLOY_FILES[@]}"; do
-    if ! cp -a "$FINAL_DIR/$f" "$BOTTLE_APP_DIR/$f"; then
+    if ! cp_deploy "$FINAL_DIR/$f" "$BOTTLE_APP_DIR/$f"; then
         WRITTEN_FILES+=("$f")
         rollback
     fi

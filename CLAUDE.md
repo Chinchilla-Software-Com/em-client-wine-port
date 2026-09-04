@@ -296,6 +296,11 @@ git checkpoint substitutes for this: the bottle's live files are outside the git
   associations; import `.reg` files for the missing ones. `reports/office-file-associations-findings.md`
 - Settings grid occasionally didn't paint — Wine clip-region bug; added `AllPaintingInWmPaint`.
   `reports/settings-panel-clip-region-findings.md`
+- Severe, recurring multi-minute freezes during Exchange sync (esp. mid-compose) — Wine can't
+  honor async DNS cancellation, so `AccountManager.SendAndReceiveAll` and `Folder.Synchronize`
+  (both fully synchronous, both reachable from the UI thread) could block on a 20s completion-port
+  fallback; moved both onto dedicated guarded background `Thread`s (not `Task.Run` — ThreadPool
+  ramp-up caused its own stutter, see the report). `reports/exchange-sync-freeze-findings.md`
 
 **Email notifications not displaying correctly until fade** — one root problem, several visible
 symptoms: `this` form's own window doesn't reliably paint or receive input under Wine, so content
@@ -330,8 +335,18 @@ until-fade-findings.md`.
 - 1 site in vendored `QRCoder.dll` (QR export only).
 - 2 `InterpolationMode.High` sites — confirmed broken by the same disassembly, not yet patched.
 
-**Deploy status**: all of it is in `releases/<version>/deploy.sh` now (Stages 1–14) — nothing left
-to apply manually. Stages 8–14 are the notification chain, which MUST run in this exact order
+**Deploy status**: all of it is in `releases/<version>/deploy.sh` now (Stages 1–15) — nothing left
+to apply manually. `deploy.sh` is revision-aware: it reads a `MailClient.Wine.dll` version marker
+from the target bottle to figure out which of these revisions (0/1/2/3, tracked via
+`REVISION_LAST_STAGE`) are already applied and resumes from the first stage that isn't, rather
+than always running the full pipeline. When revision 3 (Stage 15) was added, stages 8–14 —
+previously unconditional, safe only because at most two revisions existed — had to be
+retroactively wrapped in the same "already applied, skip" conditional, since re-running an
+already-applied patch on its own output is a real corruption risk most of these stages have no
+guard against (unlike Stage 1, which refuses outright if it finds an already-patched input).
+Validated live, twice: a resume-from-revision-2 run correctly skipped straight to Stage 15, and a
+second run against an already-revision-3 bottle correctly skipped the whole pipeline. Stages 8–14
+are the notification chain, which MUST run in this exact order
 (the tool itself enforces two of these orderings, failing loudly rather than silently
 misapplying if violated): `--patch-notification-click-resubscribe` (Stage 8), then Stage 9
 (`--patch-notification-content-padding`, `--patch-notification-avatar-title-gap`,
@@ -355,6 +370,17 @@ the result live. That run also caught a real gap in `deploy.sh`'s own close-hand
 Client's own "Close application to tray" setting can make a graceful close request succeed
 (window disappears) without the process ever exiting, which the script didn't previously handle
 (would time out and `die` instead of falling back to `kill`) — fixed.
+
+Stage 15 (revision 3) is the Exchange-sync-freeze fix: `--patch-account-manager-sync-async`
+(`MailClient.Accounts.dll`, `AccountManager.SendAndReceiveAll`) then
+`--patch-folder-sync-async` (same assembly, `Folder.Synchronize(bool, bool)`) — order doesn't
+matter between the two (different types, no shared state), but both must run after Stage 14
+since they touch a different assembly than the notification chain and have no ordering
+dependency on it either way. Both move their target method onto a dedicated guarded
+`Thread` (see `reports/exchange-sync-freeze-findings.md` for why `Task.Run` was tried first and
+reverted). Verified via decompile plus `--dump-handlers` (both add a `try`/`catch(Exception)`)
+before every deploy, and live end-to-end against `emClient_win_8_x64` twice — once resuming from
+revision 2 (only Stage 15 ran), once already at revision 3 (nothing ran) — both correct.
 
 ## Investigation method (what actually worked this round)
 
@@ -596,6 +622,55 @@ session, all worth guarding against explicitly next time:
     (`new MethodReference(name, module.TypeSystem.Void, buttonTypeRef) { HasThis = true }` plus
     one `Parameters.Add(...)`) instead of trying to resolve one from a file — sidesteps the
     input/output split entirely.
+13. **To move an existing method's logic onto a new entry point without hand-authoring a second
+    copy of its IL, just reassign the new method's `.Body` to the ORIGINAL method's already-
+    compiled `MethodBody` object, then give the ORIGINAL method a fresh, simple body instead.**
+    Needed for `--patch-account-manager-sync-async`/`--patch-folder-sync-async`: the real sync
+    logic (`SendAndReceiveAll`, `Folder.Synchronize`) has to keep running unchanged, but from a
+    background thread, while the original method name becomes a thin guard/dispatch wrapper.
+    Hand-copying either body's IL instruction-by-instruction would have been risky — both contain
+    null-conditional delegate/event invokes, a construct that's easy to get subtly wrong by hand.
+    Instead: create the new method (`__RunSendAndReceiveAllCore`, matching parameter shape),
+    `newMethod.Body = originalMethod.Body;` (literally reuse the same `MethodBody` object, not a
+    copy), then replace `originalMethod.Body` with a brand new, small `MethodBody` containing just
+    the guard and dispatch. Works because the new method has the same parameter shape (so its
+    `ldarg` instructions still mean the same thing) and stays declared on the same type (so any
+    internal member references the reused body makes remain valid). Confirmed via decompile: the
+    new method's decompiled output is byte-for-byte what the original method used to decompile as.
+    Prefer this over hand-authoring whenever the goal is "run this exact existing logic from
+    somewhere else," not "run modified logic."
+14. **`Task.Run` is the wrong dispatch primitive for a fix whose whole point is unblocking the UI
+    thread from a long, blocking operation — it schedules onto the shared ThreadPool, which ramps
+    up slowly (roughly one new thread per 500ms–1s) under sustained demand, and produces its own
+    distinctive "freeze, ~1s unfreeze, freeze again" stutter once multiple such operations are
+    in flight concurrently.** The first working version of both sync-freeze patches used
+    `Task.Run(...)` to move `SendAndReceiveAll`/`Folder.Synchronize` off the UI thread — this
+    genuinely fixed the original multi-minute freeze, but introduced a new, smaller, repeating
+    stutter the user caught immediately during live testing (multiple accounts/folders each
+    dispatching via `Task.Run`, each blockable for up to 20s by the same Wine DNS-cancellation
+    gap, competing for a pool that wasn't growing fast enough to keep up). Fixed by switching both
+    to `new Thread(ThreadStart) { IsBackground = true }.Start()` instead — a dedicated thread per
+    dispatch, no shared pool to contend over — which also matches a pattern already established
+    elsewhere in the app itself (`MailClient.Commands.DefaultSynchronizationQueue` uses one
+    dedicated `Thread` per account, never the ThreadPool). When a fix's entire purpose is "don't
+    block on this," prefer a dedicated `Thread` over `Task.Run` by default for any operation that
+    can block for a long, unbounded, or externally-controlled duration (network I/O with no
+    reliable cancellation being the sharpest case) — reserve `Task.Run` for short, CPU-bound work
+    where pool reuse is actually a win.
+15. **Reading an app-local enum's real member values from the TARGET module's own
+    `FieldDefinition.Constant` is the only safe option — guessing the values, or reflecting on the
+    patching tool's own runtime for the same type name, are both live risks, not just style
+    preferences.** `--patch-folder-sync-async` needs `SynchronizationPriority.Background`/
+    `BackgroundForced`'s actual integer values to build a ternary in IL. Guessing (or assuming an
+    enum's declaration order matches its underlying values) is exactly the mistake lesson-adjacent
+    to this one already caught elsewhere in this session: `GCLargeObjectHeapCompactionMode
+    .CompactOnce` was assumed to be `1` and was actually `2` (`Default` is `1`), caught only by
+    the mandatory post-patch decompile check. Reflecting on the patching tool's own process for an
+    app-local type has its own, separately-documented failure mode (lesson 5). The reliable fix
+    used here: resolve the enum's `TypeDefinition` from the target module (already being patched,
+    so this is a normal, safe reference walk, not tool-runtime reflection), then
+    `priorityTypeDef.Fields.FirstOrDefault(f => f.Name == "Background").Constant` — reads the
+    literal value the target assembly itself actually shipped with, no assumption involved.
 
 **A new `--dump-il <dll> <type> <method>` utility mode** (same rationale as `--dump-handlers`)
 prints a method's real instruction stream with offsets — use it before writing any patch that

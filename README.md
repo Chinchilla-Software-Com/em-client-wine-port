@@ -40,8 +40,9 @@ for both and tells you how to install whichever is missing.
 | Splash screen tip line showed two tofu boxes | A real emoji character Wine has no glyph for (a genuine Wine gap, investigated at length) | [splash-tip-icon-findings.md](reports/splash-tip-icon-findings.md) |
 | Docx attachments (and other extensions) wouldn't open — "no Windows program configured" | Fresh CrossOver bottles ship no file-type association for most attachment extensions (not an eM Client bug) | [office-file-associations-findings.md](reports/office-file-associations-findings.md) |
 | New-mail notification toast didn't display correctly until it faded out — invisible text/icons, no hover-pause, unclickable icons | `this` form's own window doesn't reliably paint or receive input under Wine; content only ever appeared during the fade animation ticks | [notification-empty-until-fade-findings.md](reports/notification-empty-until-fade-findings.md) |
+| Severe, recurring multi-minute freezes during Exchange sync, especially while composing/replying | Wine can't honor async DNS lookup cancellation, so two fully-synchronous, UI-thread-reachable sync entry points could each block for a 20s completion-port fallback | [exchange-sync-freeze-findings.md](reports/exchange-sync-freeze-findings.md) |
 
-All eight confirmed fixed and working, tested across Windows 7/8/10/11 CrossOver bottles.
+All nine confirmed fixed and working, tested across Windows 7/8/10/11 CrossOver bottles.
 
 ## How it's built
 

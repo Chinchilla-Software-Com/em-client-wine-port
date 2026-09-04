@@ -98,6 +98,16 @@ if (args.Length > 0 && args[0] == "--patch-splash-tip-icon")
     return RunPatchSplashTipIcon(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-account-manager-sync-async")
+{
+    return RunPatchAccountManagerSyncAsync(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-folder-sync-async")
+{
+    return RunPatchFolderSyncAsync(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-notification-invalidate")
 {
     return RunPatchNotificationInvalidate(args);
@@ -8697,6 +8707,445 @@ static bool IsStloc(Instruction insn, MethodBody body, out VariableDefinition? v
     if (insn.OpCode == OpCodes.Stloc_2) { variable = body.Variables[2]; return true; }
     if (insn.OpCode == OpCodes.Stloc_3) { variable = body.Variables[3]; return true; }
     return false;
+}
+
+// --patch-account-manager-sync-async <input-dir> <output-dir>
+//
+// Root-cause fix for the freeze traced in reports/exchange-sync-freeze-findings.md: the
+// once-a-minute auto-sync timer (DesktopAccountManager.timerSendAndReceive, a plain
+// System.Windows.Forms.Timer -- confirmed via decompile its Tick always fires on the UI
+// thread) calls AccountManager.SendAndReceiveAll(...) directly and synchronously, whose own
+// sequential per-account loop can block for up to 20 seconds per account on Wine's
+// GetAddrInfoExW (which can't honor a connection-timeout cancellation), freezing the whole
+// app for however long that takes.
+//
+// A first version of this fix patched only the timer's own call site
+// (DesktopAccountManager.timerSendAndReceive_Tick). Live testing found the app can ALSO
+// freeze immediately on startup, before the timer ever fires -- traced to eM Client's own
+// "check for mail on startup" option and other direct call sites (menu items, shortcuts, a
+// Synchronize() handler tied to initial folder selection) that all call
+// AccountManager.SendAndReceiveAll(...) directly too, none of which that narrower, timer-only
+// version touched. Superseded by this patch and not shipped.
+//
+// This patch moves the guard+background-dispatch down into SendAndReceiveAll itself (in
+// MailClient.Accounts.dll, the shared base every one of those call sites funnels through),
+// so it's fixed once for all callers instead of needing every call site found and patched
+// individually.
+//
+// To avoid hand-authoring a faithful copy of SendAndReceiveAll's own body (it has a couple of
+// null-conditional delegate/event invokes -- `logger?.Invoke(...)`, `SendingAndOrReceiving?.
+// Invoke(...)` -- that are easy to get subtly wrong by hand), this patch REUSES the existing,
+// already-correct compiled MethodBody verbatim in a new private method
+// (__RunSendAndReceiveAllCore), and replaces the original method's body with a small fresh
+// guard/dispatch wrapper. Since the new method keeps the exact same (bool) parameter shape
+// and stays on the same type, no operand rewriting is needed inside the reused body at all
+// -- its ldarg_0/ldarg_1 and internal member references are already correct as-is.
+static int RunPatchAccountManagerSyncAsync(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-account-manager-sync-async <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.Accounts.dll";
+    const string targetType = "MailClient.Accounts.AccountManager";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var sendAndReceiveAll = type.Methods.FirstOrDefault(m =>
+            m.Name == "SendAndReceiveAll" && m.Parameters.Count == 1 && !m.IsStatic);
+        if (sendAndReceiveAll is null) { Console.Error.WriteLine("FAIL: SendAndReceiveAll(bool) not found"); return 1; }
+
+        var sendReceiveAllowedField = type.Fields.FirstOrDefault(f => f.Name == "sendReceiveAllowed");
+        if (sendReceiveAllowedField is null) { Console.Error.WriteLine("FAIL: sendReceiveAllowed field not found"); return 1; }
+
+        var boolType = module.TypeSystem.Boolean;
+        var voidType = module.TypeSystem.Void;
+
+        var syncInProgressField = new FieldDefinition("__syncInProgress", FieldAttributes.Private, boolType);
+        type.Fields.Add(syncInProgressField);
+        var pendingArgField = new FieldDefinition("__pendingCheckIncludeInGlobalOperations", FieldAttributes.Private, boolType);
+        type.Fields.Add(pendingArgField);
+
+        // Dedicated background Thread, not Task.Run -- Task.Run schedules onto the shared
+        // .NET ThreadPool, which this project's OWN account-level sync already avoids for
+        // exactly this reason (DefaultSynchronizationQueue uses a raw dedicated Thread per
+        // account, not the ThreadPool). A first version of this patch used Task.Run and was
+        // deployed; live testing then showed a new stutter pattern (freeze, ~1s unfreeze,
+        // freeze again) once multiple accounts' and folders' Task.Run calls could be in
+        // flight together, each able to block a pooled worker for up to 20s on the same Wine
+        // DNS issue -- the ThreadPool's own slow ramp-up under sustained demand (roughly one
+        // new thread per 500ms-1s) produces exactly that stutter shape. Matching the app's own
+        // established pattern (a dedicated Thread per unit of potentially-blocking work)
+        // avoids competing with the ThreadPool at all.
+        var threadCtor = module.ImportReference(
+            typeof(System.Threading.Thread).GetConstructor(new[] { typeof(System.Threading.ThreadStart) }));
+        var threadStartCtor = module.ImportReference(
+            typeof(System.Threading.ThreadStart).GetConstructor(new[] { typeof(object), typeof(IntPtr) }));
+        var isBackgroundSetter = module.ImportReference(
+            typeof(System.Threading.Thread).GetProperty("IsBackground")!.GetSetMethod());
+        var threadStartMethod = module.ImportReference(
+            typeof(System.Threading.Thread).GetMethod("Start", Type.EmptyTypes));
+        var exceptionType = module.ImportReference(typeof(Exception));
+
+        // --- New method: __RunSendAndReceiveAllCore(bool) -- takes over SendAndReceiveAll's
+        // ORIGINAL body verbatim (see doc comment above for why: reuse over hand-authoring).
+        var coreMethod = new MethodDefinition("__RunSendAndReceiveAllCore",
+            MethodAttributes.Private | MethodAttributes.HideBySig, voidType);
+        coreMethod.Parameters.Add(new ParameterDefinition("checkIncludeInGlobalOperations", ParameterAttributes.None, boolType));
+        coreMethod.Body = sendAndReceiveAll.Body;
+        type.Methods.Add(coreMethod);
+
+        // --- New method: __syncTaskEntry() -- parameterless (a plain Thread's ThreadStart
+        // delegate needs a parameterless target), runs the reused core body on the dedicated
+        // background thread, always resetting __syncInProgress afterward regardless of
+        // outcome. Single try/catch(Exception), not a hand-built try/finally -- simpler,
+        // already-precedented IL shape (see --patch-folder-sync-async for the same pattern),
+        // same guarantee that the flag always clears.
+        var entryMethod = new MethodDefinition("__syncTaskEntry",
+            MethodAttributes.Private | MethodAttributes.HideBySig, voidType);
+        type.Methods.Add(entryMethod);
+        {
+            var body = entryMethod.Body;
+            var il = body.GetILProcessor();
+            var exVar = new VariableDefinition(exceptionType);
+            body.Variables.Add(exVar);
+
+            var tryStart = il.Create(OpCodes.Ldarg_0);
+            il.Append(tryStart);
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Ldfld, pendingArgField));
+            il.Append(il.Create(OpCodes.Call, coreMethod));
+            var leaveAfterTry = il.Create(OpCodes.Leave, tryStart);
+            il.Append(leaveAfterTry);
+
+            var catchStart = il.Create(OpCodes.Stloc, exVar);
+            il.Append(catchStart);
+            var leaveAfterCatch = il.Create(OpCodes.Leave, tryStart);
+            il.Append(leaveAfterCatch);
+
+            var resetPoint = il.Create(OpCodes.Ldarg_0);
+            il.Append(resetPoint);
+            il.Append(il.Create(OpCodes.Ldc_I4_0));
+            il.Append(il.Create(OpCodes.Volatile));
+            il.Append(il.Create(OpCodes.Stfld, syncInProgressField));
+            il.Append(il.Create(OpCodes.Ret));
+
+            leaveAfterTry.Operand = resetPoint;
+            leaveAfterCatch.Operand = resetPoint;
+
+            body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+            {
+                TryStart = tryStart,
+                TryEnd = catchStart,
+                HandlerStart = catchStart,
+                HandlerEnd = resetPoint,
+                CatchType = exceptionType
+            });
+
+            body.SimplifyMacros();
+        }
+
+        // --- Fresh, small body for SendAndReceiveAll itself: guard, stash the arg, fire the
+        // background task. Everything the original body used to do now happens inside
+        // __RunSendAndReceiveAllCore instead.
+        {
+            var body = sendAndReceiveAll.Body = new MethodBody(sendAndReceiveAll);
+            var il = body.GetILProcessor();
+            var end = il.Create(OpCodes.Ret);
+
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Ldfld, sendReceiveAllowedField));
+            il.Append(il.Create(OpCodes.Brfalse, end));
+
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Volatile));
+            il.Append(il.Create(OpCodes.Ldfld, syncInProgressField));
+            il.Append(il.Create(OpCodes.Brtrue, end));
+
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Ldarg_1)); // checkIncludeInGlobalOperations
+            il.Append(il.Create(OpCodes.Stfld, pendingArgField));
+
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Ldc_I4_1));
+            il.Append(il.Create(OpCodes.Volatile));
+            il.Append(il.Create(OpCodes.Stfld, syncInProgressField));
+
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Ldftn, entryMethod));
+            il.Append(il.Create(OpCodes.Newobj, threadStartCtor));
+            il.Append(il.Create(OpCodes.Newobj, threadCtor));
+            il.Append(il.Create(OpCodes.Dup));
+            il.Append(il.Create(OpCodes.Ldc_I4_1));
+            il.Append(il.Create(OpCodes.Callvirt, isBackgroundSetter));
+            il.Append(il.Create(OpCodes.Callvirt, threadStartMethod));
+
+            il.Append(end);
+
+            body.SimplifyMacros();
+        }
+
+        module.Write(destPath);
+        patched = true;
+        Console.WriteLine($"OK   {fileName}: MailClient.Accounts.AccountManager::SendAndReceiveAll -- moved the original method body into a new __RunSendAndReceiveAllCore, guarded by a volatile __syncInProgress field and dispatched via a dedicated background Thread (not Task.Run -- see doc comment); fixes every call site (timer, startup check, menu, shortcuts), not just the periodic timer");
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+    return 0;
+}
+
+// --patch-folder-sync-async <input-dir> <output-dir>
+//
+// Second guarded entry point alongside --patch-account-manager-sync-async: Folder.Synchronize
+// (bool, bool) (MailClient.Accounts.dll) is called directly and synchronously by the manual
+// refresh path
+// (formMain.sendReceiveAll() calls SelectedFolder?.Synchronize(forced: true, fromUI: true)
+// BEFORE it ever reaches AccountManager.SendAndReceiveAll), and is also the entry point the
+// "download messages for offline use" folder-tree walk very likely funnels through (its own
+// OfflineSynchronizationScope/Mode settings only gate how much gets downloaded per folder --
+// see reports/exchange-sync-freeze-findings.md -- not a separate trigger path). Its own
+// private recursive overload (Synchronize(SynchronizationPriority, bool)) walks subfolders
+// sequentially and isn't touched by this patch at all -- unlike the SendAndReceiveAll fix,
+// there's no need to reuse or duplicate its body: the public method's original body is just
+// one ternary and one call to that private overload, so it's simpler to hand-author the
+// guard/dispatch wrapper directly and leave the entire recursive walk (however deep) running
+// on the single background thread the wrapper dispatches to -- it never touches the UI thread
+// either way, regardless of how long the walk takes.
+//
+// SynchronizationPriority's enum values (Background/BackgroundForced) are read directly from
+// this field's Constant in the TARGET module, not hardcoded or guessed via reflection --
+// the same class of mistake (assuming an enum's numeric values instead of reading them) was
+// made and caught, via the mandatory decompile check, getting GCLargeObjectHeapCompactionMode
+// wrong in an earlier draft of --patch-account-manager-sync-async; reading the real value
+// from the assembly being patched removes the guesswork entirely.
+static int RunPatchFolderSyncAsync(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-folder-sync-async <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.Accounts.dll";
+    const string targetType = "MailClient.Storage.Application.Folder";
+    const string priorityType = "MailClient.Storage.Synchronization.SynchronizationPriority";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var publicSync = type.Methods.FirstOrDefault(m =>
+            m.Name == "Synchronize" && m.IsPublic && m.Parameters.Count == 2 &&
+            m.Parameters[0].ParameterType.FullName == "System.Boolean");
+        if (publicSync is null) { Console.Error.WriteLine("FAIL: public Synchronize(bool,bool) not found"); return 1; }
+
+        var privateSync = type.Methods.FirstOrDefault(m =>
+            m.Name == "Synchronize" && !m.IsPublic && m.Parameters.Count == 2 &&
+            m.Parameters[0].ParameterType.FullName == priorityType);
+        if (privateSync is null) { Console.Error.WriteLine("FAIL: private Synchronize(SynchronizationPriority,bool) not found"); return 1; }
+
+        var priorityTypeDef = module.GetType(priorityType);
+        if (priorityTypeDef is null) { Console.Error.WriteLine($"FAIL: type not found: {priorityType}"); return 1; }
+        var backgroundField = priorityTypeDef.Fields.FirstOrDefault(f => f.Name == "Background");
+        var backgroundForcedField = priorityTypeDef.Fields.FirstOrDefault(f => f.Name == "BackgroundForced");
+        if (backgroundField?.Constant is null || backgroundForcedField?.Constant is null)
+        {
+            Console.Error.WriteLine("FAIL: SynchronizationPriority.Background/BackgroundForced constants not found");
+            return 1;
+        }
+        int backgroundValue = Convert.ToInt32(backgroundField.Constant);
+        int backgroundForcedValue = Convert.ToInt32(backgroundForcedField.Constant);
+
+        var boolType = module.TypeSystem.Boolean;
+        var voidType = module.TypeSystem.Void;
+
+        var syncInProgressField = new FieldDefinition("__folderSyncInProgress", FieldAttributes.Private, boolType);
+        type.Fields.Add(syncInProgressField);
+        var pendingForcedField = new FieldDefinition("__pendingForced", FieldAttributes.Private, boolType);
+        type.Fields.Add(pendingForcedField);
+        var pendingFromUiField = new FieldDefinition("__pendingFromUI", FieldAttributes.Private, boolType);
+        type.Fields.Add(pendingFromUiField);
+
+        // Dedicated background Thread, not Task.Run -- see the matching comment in
+        // --patch-account-manager-sync-async for why: Task.Run's shared ThreadPool caused a
+        // new stutter pattern once multiple accounts' and folders' dispatches could overlap,
+        // fixed by matching the app's own dedicated-Thread-per-account pattern instead.
+        var threadCtor = module.ImportReference(
+            typeof(System.Threading.Thread).GetConstructor(new[] { typeof(System.Threading.ThreadStart) }));
+        var threadStartCtor = module.ImportReference(
+            typeof(System.Threading.ThreadStart).GetConstructor(new[] { typeof(object), typeof(IntPtr) }));
+        var isBackgroundSetter = module.ImportReference(
+            typeof(System.Threading.Thread).GetProperty("IsBackground")!.GetSetMethod());
+        var threadStartMethod = module.ImportReference(
+            typeof(System.Threading.Thread).GetMethod("Start", Type.EmptyTypes));
+        var exceptionType = module.ImportReference(typeof(Exception));
+
+        // --- New method: __folderSyncTaskEntry() -- calls the ORIGINAL, untouched private
+        // recursive Synchronize(SynchronizationPriority, bool) directly (not the public
+        // overload -- that's the one being replaced below), on whatever thread Task.Run
+        // schedules it on. Single try/catch(Exception), same reasoning as the previous two
+        // patches in this chain: simpler, already-precedented shape than a hand-built
+        // try/finally, same guarantee that the flag always clears.
+        var entryMethod = new MethodDefinition("__folderSyncTaskEntry",
+            MethodAttributes.Private | MethodAttributes.HideBySig, voidType);
+        type.Methods.Add(entryMethod);
+        {
+            var body = entryMethod.Body;
+            var il = body.GetILProcessor();
+            var exVar = new VariableDefinition(exceptionType);
+            body.Variables.Add(exVar);
+
+            var tryStart = il.Create(OpCodes.Ldarg_0);
+            il.Append(tryStart);
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Ldfld, pendingForcedField));
+            var pushBackground = il.Create(OpCodes.Ldc_I4, backgroundValue);
+            il.Append(il.Create(OpCodes.Brfalse, pushBackground));
+            il.Append(il.Create(OpCodes.Ldc_I4, backgroundForcedValue));
+            var afterPriority = il.Create(OpCodes.Ldarg_0);
+            il.Append(il.Create(OpCodes.Br, afterPriority));
+            il.Append(pushBackground);
+            il.Append(afterPriority);
+            il.Append(il.Create(OpCodes.Ldfld, pendingFromUiField));
+            il.Append(il.Create(privateSync.IsVirtual ? OpCodes.Callvirt : OpCodes.Call, module.ImportReference(privateSync)));
+            var leaveAfterTry = il.Create(OpCodes.Leave, tryStart);
+            il.Append(leaveAfterTry);
+
+            var catchStart = il.Create(OpCodes.Stloc, exVar);
+            il.Append(catchStart);
+            var leaveAfterCatch = il.Create(OpCodes.Leave, tryStart);
+            il.Append(leaveAfterCatch);
+
+            var resetPoint = il.Create(OpCodes.Ldarg_0);
+            il.Append(resetPoint);
+            il.Append(il.Create(OpCodes.Ldc_I4_0));
+            il.Append(il.Create(OpCodes.Volatile));
+            il.Append(il.Create(OpCodes.Stfld, syncInProgressField));
+            il.Append(il.Create(OpCodes.Ret));
+
+            leaveAfterTry.Operand = resetPoint;
+            leaveAfterCatch.Operand = resetPoint;
+
+            body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+            {
+                TryStart = tryStart,
+                TryEnd = catchStart,
+                HandlerStart = catchStart,
+                HandlerEnd = resetPoint,
+                CatchType = exceptionType
+            });
+
+            body.SimplifyMacros();
+        }
+
+        // --- Fresh body for the PUBLIC Synchronize(bool, bool): guard, stash both args,
+        // fire the background task. The private recursive overload is never touched.
+        {
+            var body = publicSync.Body = new MethodBody(publicSync);
+            var il = body.GetILProcessor();
+            var end = il.Create(OpCodes.Ret);
+
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Volatile));
+            il.Append(il.Create(OpCodes.Ldfld, syncInProgressField));
+            il.Append(il.Create(OpCodes.Brtrue, end));
+
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Ldarg_1)); // forced
+            il.Append(il.Create(OpCodes.Stfld, pendingForcedField));
+
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Ldarg_2)); // fromUI
+            il.Append(il.Create(OpCodes.Stfld, pendingFromUiField));
+
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Ldc_I4_1));
+            il.Append(il.Create(OpCodes.Volatile));
+            il.Append(il.Create(OpCodes.Stfld, syncInProgressField));
+
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Ldftn, entryMethod));
+            il.Append(il.Create(OpCodes.Newobj, threadStartCtor));
+            il.Append(il.Create(OpCodes.Newobj, threadCtor));
+            il.Append(il.Create(OpCodes.Dup));
+            il.Append(il.Create(OpCodes.Ldc_I4_1));
+            il.Append(il.Create(OpCodes.Callvirt, isBackgroundSetter));
+            il.Append(il.Create(OpCodes.Callvirt, threadStartMethod));
+
+            il.Append(end);
+
+            body.SimplifyMacros();
+        }
+
+        module.Write(destPath);
+        patched = true;
+        Console.WriteLine($"OK   {fileName}: MailClient.Storage.Application.Folder::Synchronize(bool,bool) -- guarded by a new volatile __folderSyncInProgress field and dispatched via a dedicated background Thread (not Task.Run -- see doc comment); the private recursive Synchronize(SynchronizationPriority,bool) overload is untouched and now always runs off the UI thread, however deep the subfolder walk goes");
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+    return 0;
 }
 
 record PatchEntry(string Assembly, string Type, string Method, string IlOffset, int OldValue, int NewValue);
