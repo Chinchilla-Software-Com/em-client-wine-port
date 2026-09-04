@@ -50,12 +50,12 @@ EXPECTED_FILE_VERSION="11.0.196.0"
 # This project's own release number against RELEASE_VERSION (see
 # il-patches/MailClient.Wine/VersionMarker.cs) -- bump this, and add a row to
 # REVISION_LAST_STAGE below, every time a new release ships against the same eM Client version.
-# Tag as release/<RELEASE_VERSION>-<OUR_RELEASE_NUMBER> (release/11.0.196-2 for this one).
-OUR_RELEASE_NUMBER=2
+# Tag as release/<RELEASE_VERSION>-<OUR_RELEASE_NUMBER> (release/11.0.196-3 for this one).
+OUR_RELEASE_NUMBER=3
 
 # release number -> last stage number that release introduced. Same "resume mid-pipeline" logic
 # as the 10.4.5674 script.
-declare -A REVISION_LAST_STAGE=( [0]=0 [1]=1 [2]=2 )
+declare -A REVISION_LAST_STAGE=( [0]=0 [1]=1 [2]=2 [3]=3 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -475,11 +475,64 @@ fi
 
 if [[ $START_STAGE -le 2 ]]; then
     log "Stage 2: splash-screen tip label icon fix (same tofu-box bug/fix as the 10.4.5674 pipeline)..."
-    $ILP --patch-splash-tip-icon "$STAGE1_DIR" "$WORKDIR/output-final"
+    $ILP --patch-splash-tip-icon "$STAGE1_DIR" "$WORKDIR/output-stage2"
+    STAGE2_DIR="$WORKDIR/output-stage2"
+else
+    log "Stage 2 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+    STAGE2_DIR="$WORKDIR/original"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 3: new-mail notification toast empty-until-fade fix -- the exact same bug and same
+# 7-part fix as the 10.4.5674 pipeline's Stages 8-14 (see
+# reports/notification-empty-until-fade-findings.md there, and
+# reports/emclient11-notification-empty-until-fade-findings.md for this version's own
+# confirmation that the root cause is genuinely identical, not just similar-looking). Folded into
+# ONE stage here (rather than seven, like the sibling script) since this is the first time it's
+# being applied to this release line -- there's no earlier partial-application history to resume
+# from mid-chain the way 10.4.5674 needed to.
+#
+# 5 of the 7 sub-flags apply completely unmodified. Two needed real changes, both made
+# version-agnostic (auto-detecting either eM Client version's assembly shape) rather than
+# hardcoded to 11.0.196-beta specifically, so the SAME il-patcher flags keep working for the
+# 10.4.5674 pipeline too:
+#   - --patch-notification-hover-forward: LayeredForm moved from MailClient.dll into
+#     MailClient.Common.UI.dll in this version (namespace MailClient.Common.UI.Forms instead of
+#     MailClient.UI.Forms) -- the flag now resolves it from the `layeredWindow` field's own
+#     declared type instead of a hardcoded assembly/namespace, and writes back whichever
+#     assembly actually turns out to declare it.
+#   - --patch-notification-toolbar-icons: FormMailNotification's toolbar buttons were redesigned
+#     from 3 fixed named buttons (button_Reply/button_Flag/button_Delete) to 5 dynamic
+#     button_action0..4 fields sharing one click handler -- the flag now tries both known button
+#     shapes and adapts its generated code (including a real correctness fix: the click-dispatch
+#     code must pass the clicked BUTTON as `sender`, not the form, since the shared handler reads
+#     sender.Tag) to whichever one it finds.
+# Order matters and is enforced by the tool itself in several places (fails loudly rather than
+# silently misapplying), same as the sibling script's own Stages 8-14 -- don't reorder without
+# re-verifying the same way (decompile + --dump-handlers on every touched method, then a full
+# fresh-from-pristine chain re-run).
+# ---------------------------------------------------------------------------
+
+if [[ $START_STAGE -le 3 ]]; then
+    log "Stage 3: notification toast empty-until-fade fix (same bug/fix as the 10.4.5674 pipeline's Stages 8-14)..."
+    $ILP --patch-notification-click-resubscribe "$STAGE2_DIR" "$WORKDIR/output-stage3a"
+    $ILP --patch-notification-content-padding "$WORKDIR/output-stage3a" "$WORKDIR/output-stage3b"
+    $ILP --patch-notification-avatar-title-gap "$WORKDIR/output-stage3b" "$WORKDIR/output-stage3c"
+    $ILP --patch-notification-title-singleline "$WORKDIR/output-stage3c" "$WORKDIR/output-stage3d"
+    $ILP --patch-notification-title-vcenter-fix "$WORKDIR/output-stage3d" "$WORKDIR/output-stage3e"
+    $ILP --patch-notification-text-in-bitmap "$WORKDIR/output-stage3e" "$WORKDIR/output-stage3f"
+    $ILP --patch-notification-refresh-on-content-change "$WORKDIR/output-stage3f" "$WORKDIR/output-stage3g"
+    $ILP --patch-notification-periodic-reblit "$WORKDIR/output-stage3g" "$WORKDIR/output-stage3h"
+    $ILP --patch-notification-suppress-self-text-only "$WORKDIR/output-stage3h" "$WORKDIR/output-stage3i"
+    $ILP --patch-notification-icon-bitmap "$WORKDIR/output-stage3i" "$WORKDIR/output-stage3j"
+    $ILP --patch-notification-title-icon-clip "$WORKDIR/output-stage3j" "$WORKDIR/output-stage3k"
+    $ILP --patch-notification-text-drawstring "$WORKDIR/output-stage3k" "$WORKDIR/output-stage3l"
+    $ILP --patch-notification-hover-forward "$WORKDIR/output-stage3l" "$WORKDIR/output-stage3m"
+    $ILP --patch-notification-toolbar-icons "$WORKDIR/output-stage3m" "$WORKDIR/output-final"
     cp "$MAILCLIENT_WINE_DLL" "$WORKDIR/output-final/"
     FINAL_DIR="$WORKDIR/output-final"
 else
-    log "Stage 2 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+    log "Stage 3 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
     FINAL_DIR="$WORKDIR/original"
 fi
 
@@ -506,17 +559,43 @@ $ILP --dump-handlers "$FINAL_DIR/MailClient.Abstractions.dll" 'MailClient.UI.Fil
     || die "verification failed: --dump-handlers reported a handler-ordering violation in FileBasedCache\`1.Initialize"
 
 # Stage 2 is a raw resource byte edit and must not change file size (same rationale as the
-# 10.4.5674 pipeline's own Stages 6-7 check) -- only meaningful (and only ran) when Stage 2
-# actually ran this time.
+# 10.4.5674 pipeline's own Stages 6-7 check) -- checked against STAGE2_DIR specifically, not
+# FINAL_DIR, since Stage 3 (notification chain) is real IL insertion that legitimately grows the
+# file. Only meaningful (and only ran) when Stage 2 actually ran this time.
 if [[ $START_STAGE -le 2 ]]; then
     STAGE1_SIZE=$(stat -c%s "$STAGE1_DIR/MailClient.dll")
-    FINAL_SIZE=$(stat -c%s "$FINAL_DIR/MailClient.dll")
-    [[ "$STAGE1_SIZE" -eq "$FINAL_SIZE" ]] \
-        || die "verification failed: Stage 2 should not change MailClient.dll's byte size (was $STAGE1_SIZE, now $FINAL_SIZE) -- .resources offset table may be corrupted"
-    ilspycmd_tip_out=$($ILSPY --resource "MailClient.UI.Forms.FormSplashScreen.resources/labelTip.Text" -o "$WORKDIR" "$FINAL_DIR/MailClient.dll" 2>&1) || die "verification failed: couldn't extract labelTip.Text resource ($ilspycmd_tip_out)"
+    STAGE2_SIZE=$(stat -c%s "$STAGE2_DIR/MailClient.dll")
+    [[ "$STAGE1_SIZE" -eq "$STAGE2_SIZE" ]] \
+        || die "verification failed: Stage 2 should not change MailClient.dll's byte size (was $STAGE1_SIZE, now $STAGE2_SIZE) -- .resources offset table may be corrupted"
+    ilspycmd_tip_out=$($ILSPY --resource "MailClient.UI.Forms.FormSplashScreen.resources/labelTip.Text" -o "$WORKDIR" "$STAGE2_DIR/MailClient.dll" 2>&1) || die "verification failed: couldn't extract labelTip.Text resource ($ilspycmd_tip_out)"
     tip_hex=$(xxd -p "$WORKDIR/labelTip.Text" | tr -d '\n')
     [[ "$tip_hex" == "c2a0c2a0" ]] \
         || die "verification failed: labelTip.Text should read c2 a0 c2 a0 (non-breaking spaces), found $tip_hex"
+fi
+
+# Stage 3 verification -- mirrors the 10.4.5674 pipeline's own equivalent checks (see its Stages
+# 8-14 verification block), only meaningful (and only ran) when Stage 3 actually ran this time.
+if [[ $START_STAGE -le 3 ]]; then
+    $ILSPY -t "MailClient.UI.Forms.NotificationForms.FormGenericNotification" "$FINAL_DIR/MailClient.dll" | grep -q "__drawNotificationTextIntoBitmap" \
+        || die "verification failed: __drawNotificationTextIntoBitmap not found -- notification text-in-bitmap fix missing"
+
+    $ILSPY -t "MailClient.UI.Forms.NotificationForms.FormMailNotification" "$FINAL_DIR/MailClient.dll" | grep -q "RaisePaint" \
+        || die "verification failed: FormMailNotification doesn't reference RaisePaint -- notification toolbar-icons fix missing"
+
+    $ILSPY -t "MailClient.Common.UI.Controls.ControlToolStrip.ControlToolStripButton" "$FINAL_DIR/MailClient.Common.UI.dll" | grep -q "public void RaisePaint" \
+        || die "verification failed: ControlToolStripButton.RaisePaint not found or not public -- notification toolbar-icons fix missing"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.dll" MailClient.UI.Forms.NotificationForms.FormGenericNotification OnShown 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in FormGenericNotification.OnShown"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.Common.UI.dll" MailClient.Common.UI.Forms.LayeredForm WndProc 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in LayeredForm.WndProc"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.dll" MailClient.UI.Forms.NotificationForms.FormMailNotification updateBackgroundBitmap 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in FormMailNotification.updateBackgroundBitmap"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.dll" MailClient.UI.Forms.NotificationForms.FormMailNotification performMouseClick 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in FormMailNotification.performMouseClick"
 fi
 
 log "all verification checks passed."
@@ -529,7 +608,7 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="$BACKUPS_DIR/${BOTTLE_NAME}-${TIMESTAMP}"
 mkdir -p "$BACKUP_DIR"
 
-DEPLOY_FILES=(MailClient.dll MailClient.Abstractions.dll MailClient.Wine.dll)
+DEPLOY_FILES=(MailClient.dll MailClient.Abstractions.dll MailClient.Common.UI.dll MailClient.Wine.dll)
 
 log "backing up current files to $BACKUP_DIR ..."
 for f in "${DEPLOY_FILES[@]}"; do

@@ -2627,12 +2627,49 @@ static int RunPatchNotificationToolbarIcons(string[] args)
         var baseType = type.BaseType?.Resolve();
         if (baseType is null) { Console.Error.WriteLine("FAIL: couldn't resolve FormGenericNotification (base type)"); return 1; }
 
-        string[] buttonFieldNames = { "button_Reply", "button_Flag", "button_Delete", "button_Previous", "button_Next" };
-        string[] mouseOverFieldNames = { "mouseOverReply", "mouseOverFlag", "mouseOverDelete", "mouseOverPrevious", "mouseOverNext" };
-        string[] clickHandlerNames = { "Replyaction", "Flag", "Delete", "button_Previous_Click", "button_Next_Click" };
+        // FormMailNotification's toolbar button set differs by eM Client version: 10.4.5674 has
+        // 3 fixed, individually-named action buttons (button_Reply/button_Flag/button_Delete)
+        // each with its own click handler; 11.0.196-beta replaced those with 5 generic
+        // button_action0..4 fields (a configurable "quick actions" feature) all sharing ONE
+        // click handler (MailAction), which reads the clicked button's own .Tag to know which
+        // action fired -- confirmed via decompile diff, a genuine feature-level change, not a
+        // rename. button_Previous/button_Next (navigation, unrelated to the flag/delete/reply/
+        // actions feature) are unchanged in both. Try both known button sets in turn rather than
+        // hardcoding one -- keeps this single flag working for both release lines' pipelines,
+        // matching --patch-notification-hover-forward's own auto-detection approach for
+        // LayeredForm's cross-version assembly move.
+        (string[] buttonFieldNames, string[] mouseOverFieldNames, string[] clickHandlerNames)[] candidateButtonSets =
+        {
+            (new[] { "button_Reply", "button_Flag", "button_Delete", "button_Previous", "button_Next" },
+             new[] { "mouseOverReply", "mouseOverFlag", "mouseOverDelete", "mouseOverPrevious", "mouseOverNext" },
+             new[] { "Replyaction", "Flag", "Delete", "button_Previous_Click", "button_Next_Click" }),
+            (new[] { "button_action0", "button_action1", "button_action2", "button_action3", "button_action4", "button_Previous", "button_Next" },
+             new[] { "mouseOverAction0", "mouseOverAction1", "mouseOverAction2", "mouseOverAction3", "mouseOverAction4", "mouseOverPrevious", "mouseOverNext" },
+             new[] { "MailAction", "MailAction", "MailAction", "MailAction", "MailAction", "button_Previous_Click", "button_Next_Click" }),
+        };
 
-        var buttonFields = new FieldDefinition[5];
-        for (int i = 0; i < 5; i++)
+        string[]? buttonFieldNames = null;
+        string[]? mouseOverFieldNames = null;
+        string[]? clickHandlerNames = null;
+        foreach (var (bNames, mNames, cNames) in candidateButtonSets)
+        {
+            if (bNames.All(n => type.Fields.Any(f => f.Name == n)))
+            {
+                buttonFieldNames = bNames;
+                mouseOverFieldNames = mNames;
+                clickHandlerNames = cNames;
+                break;
+            }
+        }
+        if (buttonFieldNames is null || mouseOverFieldNames is null || clickHandlerNames is null)
+        {
+            Console.Error.WriteLine("FAIL: couldn't find a known toolbar button field set (tried the 10.4.5674 and 11.0.196-beta shapes) on FormMailNotification");
+            return 1;
+        }
+        int buttonCount = buttonFieldNames.Length;
+
+        var buttonFields = new FieldDefinition[buttonCount];
+        for (int i = 0; i < buttonCount; i++)
         {
             var f = type.Fields.FirstOrDefault(f => f.Name == buttonFieldNames[i]);
             if (f is null) { Console.Error.WriteLine($"FAIL: field not found: {buttonFieldNames[i]}"); return 1; }
@@ -2641,8 +2678,8 @@ static int RunPatchNotificationToolbarIcons(string[] args)
         var tlpField = type.Fields.FirstOrDefault(f => f.Name == "tableLayoutPanel1");
         if (tlpField is null) { Console.Error.WriteLine("FAIL: tableLayoutPanel1 field not found"); return 1; }
 
-        var clickHandlerDefs = new MethodDefinition[5];
-        for (int i = 0; i < 5; i++)
+        var clickHandlerDefs = new MethodDefinition[buttonCount];
+        for (int i = 0; i < buttonCount; i++)
         {
             var m = type.Methods.FirstOrDefault(m => m.Name == clickHandlerNames[i] && m.HasBody);
             if (m is null) { Console.Error.WriteLine($"FAIL: click handler method not found: {clickHandlerNames[i]}"); return 1; }
@@ -2762,9 +2799,9 @@ static int RunPatchNotificationToolbarIcons(string[] args)
         var raiseMouseEnterRef = MakeWrapperRef("RaiseMouseEnter", eventArgsTypeRef);
         var raiseMouseLeaveRef = MakeWrapperRef("RaiseMouseLeave", eventArgsTypeRef);
 
-        // --- five new private bool fields ---
-        var mouseOverFields = new FieldDefinition[5];
-        for (int i = 0; i < 5; i++)
+        // --- one new private bool field per button ---
+        var mouseOverFields = new FieldDefinition[buttonCount];
+        for (int i = 0; i < buttonCount; i++)
         {
             var f = new FieldDefinition(mouseOverFieldNames[i], FieldAttributes.Private, boolTypeRef);
             type.Fields.Add(f);
@@ -2981,7 +3018,7 @@ static int RunPatchNotificationToolbarIcons(string[] args)
             il.Emit(OpCodes.Ldc_I4_0);
             il.Emit(OpCodes.Stloc, anyChangedLocal);
 
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < buttonCount; i++)
             {
                 var bf = buttonFields[i];
                 var mf = mouseOverFields[i];
@@ -3066,7 +3103,7 @@ static int RunPatchNotificationToolbarIcons(string[] args)
             body.Variables.Add(rLocal);
             body.InitLocals = true;
 
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < buttonCount; i++)
             {
                 var bf = buttonFields[i];
                 var handler = clickHandlerDefs[i];
@@ -3088,7 +3125,16 @@ static int RunPatchNotificationToolbarIcons(string[] args)
                 il.Emit(OpCodes.Brfalse, skip);
 
                 il.Emit(OpCodes.Ldarg_0);
+                // sender = the button itself, not `this` -- eM Client 10.4.5674's per-button
+                // click handlers (Replyaction/Flag/Delete) never inspected `sender`, so passing
+                // the form there was harmless, but 11.0.196-beta's single shared MailAction
+                // handler NEEDS sender to actually be the clicked ControlToolStripButton (it
+                // reads sender.Tag to know which configured action fired -- see
+                // OnDisplayedNotificationChanged, which sets each button's Tag). Passing the
+                // button here is strictly more correct for both versions (v10's handlers simply
+                // ignore the more-correct sender), so this isn't a version-conditional branch.
                 il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, bf);
                 il.Emit(OpCodes.Ldsfld, eventArgsEmptyFieldRef);
                 il.Emit(OpCodes.Call, module.ImportReference(handler));
                 il.Emit(OpCodes.Ret);
@@ -3103,7 +3149,7 @@ static int RunPatchNotificationToolbarIcons(string[] args)
         }
         type.Methods.Add(newPerformMouseClick);
 
-        Console.WriteLine($"OK   {fileName}: {targetType} -- added updateBackgroundBitmap/OnMouseMove/performMouseClick overrides (bitmap-baked paint + hover-forward + click hit-testing) for button_Reply/button_Flag/button_Delete/button_Previous/button_Next, calling their real OnPaint/OnMouseEnter/OnMouseLeave via the new RaisePaint/RaiseMouseEnter/RaiseMouseLeave wrapper methods (no reflection)");
+        Console.WriteLine($"OK   {fileName}: {targetType} -- added updateBackgroundBitmap/OnMouseMove/performMouseClick overrides (bitmap-baked paint + hover-forward + click hit-testing) for {string.Join("/", buttonFieldNames)}, calling their real OnPaint/OnMouseEnter/OnMouseLeave via the new RaisePaint/RaiseMouseEnter/RaiseMouseLeave wrapper methods (no reflection)");
         patchedMailClient = true;
 
         module.Write(destPath);
@@ -4038,7 +4084,13 @@ static int RunPatchNotificationClickResubscribe(string[] args)
 // risk at all (the WM_SETCURSOR interception itself is unchanged, just one more HIWORD value
 // checked inside it).
 //
-// Two-part fix, both in MailClient.dll:
+// Two-part fix. Originally both parts lived in MailClient.dll (eM Client 10.4.5674); eM Client
+// 11.0.196-beta moved LayeredForm itself into the shared MailClient.Common.UI.dll (namespace
+// MailClient.Common.UI.Forms instead of MailClient.UI.Forms -- confirmed via decompile diff that
+// nothing but the namespace/assembly changed, the class body is untouched), so this patch
+// resolves LayeredForm from the `layeredWindow` field's own declared type rather than a
+// hardcoded assembly/namespace, and writes back whichever physical file actually turns out to
+// declare it -- works unmodified against either version's assembly layout:
 // 1. `LayeredForm.WndProc`: add a HIWORD==512 (WM_MOUSEMOVE) case alongside the existing
 //    click-HIWORD switch, calling `this.OnMouseMove(new MouseEventArgs(MouseButtons.None, 0, 0,
 //    0, 0))` -- raises the base `Control.MouseMove` event (LayeredForm doesn't override it, so
@@ -4075,25 +4127,26 @@ static int RunPatchNotificationHoverForward(string[] args)
 
     const string targetAssembly = "MailClient.dll";
     const string notifType = "MailClient.UI.Forms.NotificationForms.FormGenericNotification";
-    const string layeredFormType = "MailClient.UI.Forms.LayeredForm";
 
     var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
-    bool patched = false;
 
-    foreach (var dllPath in allDlls)
+    // Process targetAssembly directly (not via a loop iteration) -- Directory.GetFiles makes NO
+    // ordering guarantee (confirmed NOT alphabetical on this filesystem), so a loop that patches
+    // targetAssembly on whichever iteration it's reached, then separately writes a SECOND file
+    // (LayeredForm's own assembly, when different from targetAssembly), is only safe if that
+    // second file's own "not targetAssembly, plain-copy" iteration happens to run BEFORE the
+    // patch-and-overwrite step -- which is not guaranteed and, hit for real here, sometimes
+    // doesn't: the plain copy ran AFTER the patched write and silently clobbered it back to the
+    // unpatched original. Doing the patch work up front and the copy-everything-else pass
+    // afterward (skipping both special filenames explicitly) removes the ordering dependency
+    // entirely.
+    var targetPath = Path.Combine(inDir, targetAssembly);
+    if (!File.Exists(targetPath)) { Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}"); return 1; }
+
     {
-        string fileName = Path.GetFileName(dllPath);
-        string destPath = Path.Combine(outDir, fileName);
-
-        if (fileName != targetAssembly)
-        {
-            File.Copy(dllPath, destPath, overwrite: true);
-            continue;
-        }
-
         var resolver = new DefaultAssemblyResolver();
         resolver.AddSearchDirectory(inDir);
-        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        using var module = ModuleDefinition.ReadModule(targetPath, new ReaderParameters
         {
             AssemblyResolver = resolver,
             ReadWrite = false
@@ -4101,8 +4154,23 @@ static int RunPatchNotificationHoverForward(string[] args)
 
         var type = module.GetType(notifType);
         if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {notifType}"); return 1; }
-        var layeredFormTypeDef = module.GetType(layeredFormType);
-        if (layeredFormTypeDef is null) { Console.Error.WriteLine($"FAIL: type not found: {layeredFormType}"); return 1; }
+
+        // LayeredForm's own declaring assembly/namespace varies by eM Client version -- eM
+        // Client 10.4.5674 has it in MailClient.dll's own MailClient.UI.Forms namespace; the
+        // 11.0.196-beta line moved the (otherwise byte-identical) class into the shared
+        // MailClient.Common.UI.dll under MailClient.Common.UI.Forms instead, confirmed via a
+        // decompile diff (nothing but the namespace/assembly changed). Rather than hardcode
+        // either, resolve it from the `layeredWindow` FIELD's own declared type instead --
+        // Cecil's resolver transparently follows the cross-assembly reference (the same
+        // AssemblyResolver/search-directory already set up above), so this works unchanged
+        // whichever assembly actually turns out to declare it, and the resolved
+        // TypeDefinition's own .Module tells us which physical file to write the patched
+        // WndProc back into (see the write step at the end of this function).
+        var layeredWindowField = type.Fields.FirstOrDefault(f => f.Name == "layeredWindow") ??
+            type.BaseType?.Resolve()?.Fields.FirstOrDefault(f => f.Name == "layeredWindow");
+        if (layeredWindowField is null) { Console.Error.WriteLine("FAIL: layeredWindow field not found"); return 1; }
+        var layeredFormTypeDef = layeredWindowField.FieldType.Resolve();
+        if (layeredFormTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve LayeredForm from the layeredWindow field's own type"); return 1; }
 
         var onShownMethod = type.Methods.FirstOrDefault(m => m.Name == "OnShown" && m.HasBody);
         var onMouseMoveMethod = type.Methods.FirstOrDefault(m => m.Name == "OnMouseMove" && m.HasBody);
@@ -4152,10 +4220,7 @@ static int RunPatchNotificationHoverForward(string[] args)
         var setOpacityRef = module.ImportReference(setOpacityDef);
 
         var mouseOverField = type.Fields.FirstOrDefault(f => f.Name == "mouseOver");
-        // layeredWindow is declared on the base class (LayeredBaseForm), not directly on
-        // FormGenericNotification -- type.Fields only lists directly-declared fields.
-        var layeredWindowField = type.Fields.FirstOrDefault(f => f.Name == "layeredWindow") ??
-            type.BaseType?.Resolve()?.Fields.FirstOrDefault(f => f.Name == "layeredWindow");
+        // layeredWindow itself was already resolved above (needed early, to locate LayeredForm).
         var disposedField = type.Fields.FirstOrDefault(f => f.Name == "disposed");
         var disposingField = type.Fields.FirstOrDefault(f => f.Name == "disposing");
         if (onShownMethod is null || onMouseMoveMethod is null || onMouseEnterMethod is null || onMouseLeaveMethod is null)
@@ -4163,14 +4228,14 @@ static int RunPatchNotificationHoverForward(string[] args)
             Console.Error.WriteLine("FAIL: couldn't find OnShown/OnMouseMove/OnMouseEnter/OnMouseLeave");
             return 1;
         }
-        if (mouseOverField is null || layeredWindowField is null || disposedField is null || disposingField is null)
+        if (mouseOverField is null || disposedField is null || disposingField is null)
         {
-            Console.Error.WriteLine("FAIL: couldn't find mouseOver/layeredWindow/disposed/disposing field(s)");
+            Console.Error.WriteLine("FAIL: couldn't find mouseOver/disposed/disposing field(s)");
             return 1;
         }
 
         var wndProcMethod = layeredFormTypeDef.Methods.FirstOrDefault(m => m.Name == "WndProc" && m.HasBody);
-        if (wndProcMethod is null) { Console.Error.WriteLine($"FAIL: WndProc not found on {layeredFormType}"); return 1; }
+        if (wndProcMethod is null) { Console.Error.WriteLine($"FAIL: WndProc not found on {layeredFormTypeDef.FullName}"); return 1; }
 
         // MouseEventArgs -- resolve from FormGenericNotification's own OnMouseMove parameter type
         // (app-deployed System.Windows.Forms.dll -- IL-patching lesson 5), not typeof().
@@ -4179,7 +4244,16 @@ static int RunPatchNotificationHoverForward(string[] args)
         if (mouseEventArgsTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve MouseEventArgs from OnMouseMove's own parameter type"); return 1; }
         var mouseEventArgsCtorDef = mouseEventArgsTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 5);
         if (mouseEventArgsCtorDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve MouseEventArgs(MouseButtons,int,int,int,int)"); return 1; }
+        // Used from method bodies in TWO different modules below (Part 1's WndProc, which lives
+        // in whichever module actually declares LayeredForm; Part 2b's new handler method, which
+        // lives in `module`/targetAssembly) -- each module needs its OWN imported copy of this
+        // MethodReference, a plain reference imported into the wrong module fails at
+        // module.Write() time with "declared in another module and needs to be imported" (hit
+        // for real the first time this ran against eM Client 11.0.196-beta, where LayeredForm
+        // is no longer in the same module as FormGenericNotification -- see this function's own
+        // doc comment above).
         var mouseEventArgsCtorRef = module.ImportReference(mouseEventArgsCtorDef);
+        var mouseEventArgsCtorRefForLayeredForm = layeredFormTypeDef.Module.ImportReference(mouseEventArgsCtorDef);
         var mouseButtonsTypeRef = mouseEventArgsCtorDef.Parameters[0].ParameterType;
 
         // Message.get_Msg()/get_LParam() -- reuse the exact MethodReferences WndProc's own
@@ -4211,7 +4285,12 @@ static int RunPatchNotificationHoverForward(string[] args)
             Console.Error.WriteLine("FAIL: couldn't resolve one of Control.OnMouseMove/add_MouseMove/remove_MouseMove/get_MousePosition/PointToClient/get_ClientRectangle");
             return 1;
         }
-        var controlOnMouseMoveRef = module.ImportReference(controlOnMouseMoveDef);
+        // controlOnMouseMoveRef is called from inside WndProc itself (Part 1, layeredForm-side
+        // module) -- import into THAT module, not `module`, for the same cross-module reason as
+        // mouseEventArgsCtorRefForLayeredForm above. addMouseMoveRef/removeMouseMoveRef below are
+        // called from FormGenericNotification.OnShown instead (module-side), so `module` is the
+        // correct import target for those two.
+        var controlOnMouseMoveRef = layeredFormTypeDef.Module.ImportReference(controlOnMouseMoveDef);
         var addMouseMoveRef = module.ImportReference(addMouseMoveDef);
         var removeMouseMoveRef = module.ImportReference(removeMouseMoveDef);
         var getMousePositionRef = module.ImportReference(getMousePositionDef);
@@ -4277,7 +4356,7 @@ static int RunPatchNotificationHoverForward(string[] args)
             il.InsertBefore(first, Instruction.Create(OpCodes.Ldc_I4_0)); // x
             il.InsertBefore(first, Instruction.Create(OpCodes.Ldc_I4_0)); // y
             il.InsertBefore(first, Instruction.Create(OpCodes.Ldc_I4_0)); // delta
-            il.InsertBefore(first, Instruction.Create(OpCodes.Newobj, mouseEventArgsCtorRef));
+            il.InsertBefore(first, Instruction.Create(OpCodes.Newobj, mouseEventArgsCtorRefForLayeredForm));
             il.InsertBefore(first, Instruction.Create(OpCodes.Callvirt, controlOnMouseMoveRef));
 
             il.InsertBefore(first, skip);
@@ -4433,16 +4512,38 @@ static int RunPatchNotificationHoverForward(string[] args)
             il.Append(ret);
         }
 
-        Console.WriteLine($"OK   {fileName}: {layeredFormType}::WndProc now synthesizes a MouseMove event from WM_SETCURSOR's WM_MOUSEMOVE hint (same mechanism already used for Click); {notifType}::OnShown subscribes and forwards to the existing OnMouseEnter/OnMouseMove/OnMouseLeave, restoring hover-pause-the-auto-hide-timer behavior");
-        patched = true;
+        Console.WriteLine($"OK   {targetAssembly}: {layeredFormTypeDef.FullName}::WndProc now synthesizes a MouseMove event from WM_SETCURSOR's WM_MOUSEMOVE hint (same mechanism already used for Click); {notifType}::OnShown subscribes and forwards to the existing OnMouseEnter/OnMouseMove/OnMouseLeave, restoring hover-pause-the-auto-hide-timer behavior");
 
-        module.Write(destPath);
-    }
+        // Copy every OTHER dll through unchanged FIRST -- explicitly skipping targetAssembly and
+        // (when different) LayeredForm's own assembly, since both get written from the in-memory
+        // patched modules below instead of a stale on-disk copy. Doing the plain copies before
+        // the patched writes (rather than relying on Directory.GetFiles' enumeration order, which
+        // makes no ordering guarantee and isn't alphabetical on this filesystem -- confirmed the
+        // hard way: a same-named plain copy landing AFTER the patched write silently clobbered it
+        // back to the unpatched original) means nothing can overwrite the patched output after
+        // the fact.
+        var layeredFormFileName = layeredFormTypeDef.Module.Name!;
+        foreach (var dllPath in allDlls)
+        {
+            string fileName = Path.GetFileName(dllPath);
+            if (fileName == targetAssembly || fileName == layeredFormFileName) continue;
+            File.Copy(dllPath, Path.Combine(outDir, fileName), overwrite: true);
+        }
 
-    if (!patched)
-    {
-        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
-        return 1;
+        module.Write(Path.Combine(outDir, targetAssembly));
+
+        // LayeredForm.WndProc was mutated above via layeredFormTypeDef -- the actual
+        // TypeDefinition Resolve() hands back, live in whatever module really declares it, not
+        // a copy. When that's a DIFFERENT assembly than targetAssembly (the eM Client
+        // 11.0.196-beta case: LayeredForm lives in MailClient.Common.UI.dll), write that module
+        // out too. When LayeredForm is declared in targetAssembly itself (the eM Client
+        // 10.4.5674 case), layeredFormTypeDef.Module is the exact same object as `module`,
+        // already written above -- skip the redundant second write.
+        if (layeredFormTypeDef.Module != module)
+        {
+            layeredFormTypeDef.Module.Write(Path.Combine(outDir, layeredFormFileName));
+            Console.WriteLine($"OK   {layeredFormFileName}: wrote patched {layeredFormTypeDef.FullName} (declared in a different assembly than {targetAssembly})");
+        }
     }
 
     return 0;

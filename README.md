@@ -44,12 +44,34 @@ for both and tells you how to install whichever is missing.
 
 All nine confirmed fixed and working, tested across Windows 7/8/10/11 CrossOver bottles.
 
+## eM Client 11 (beta)
+
+eM Client 11.0.196-beta is a separate, still-changing product build (new assembly set, targets
+.NET 10) tracked completely independently from the 10.4.5674 pipeline above — its own bottle, its
+own `releases/11.0.196-beta/deploy.sh`, its own findings reports. See `CLAUDE.md`'s "eM Client 11
+(beta) — separate release line" section for the full breakdown of what's shared (the patcher
+tool) versus kept separate (everything else).
+
+| Bug | Root cause | Report |
+|---|---|---|
+| App wouldn't start at all — crashed during its own background init | .NET 10's new PBKDF2 API always routes through Wine's `bcrypt.dll`, which throws on the exact call the app makes to derive its local-cache encryption key | [emclient11-pbkdf2-startup-crash-findings.md](reports/emclient11-pbkdf2-startup-crash-findings.md) |
+| Splash screen tip line showed two tofu boxes | Same bug as the 10.4.5674 fix above — confirmed identical, not just similar | [emclient11-splash-tip-icon-findings.md](reports/emclient11-splash-tip-icon-findings.md) |
+| New-mail notification toast empty until fade | Same bug and same fix as the 10.4.5674 fix above; two of the seven sub-fixes needed real adaptation for structural changes in this build | [emclient11-notification-empty-until-fade-findings.md](reports/emclient11-notification-empty-until-fade-findings.md) |
+
+Unlike the 10.4.5674 pipeline, eM Client 11 ships as an MSIX package, which CrossOver/Wine can't
+install directly — there's no classic installer to run inside the bottle. Get a clean install in
+place first with `releases/11.0.196-beta/install-msix.sh` (downloads the .NET 10 desktop runtime,
+resolves and downloads the current MSIX bundle, and extracts it into the bottle by hand — see
+`CLAUDE.md`'s eM Client 11 section for the full mechanics), then run
+`releases/11.0.196-beta/deploy.sh` as usual to apply the patches above.
+
 ## How it's built
 
 ```
-original/<os-version>/   Untouched eM Client install output, one subfolder per Windows version
-                          tested against (the installer ships identical bytes for every version
-                          checked so far). Not tracked in git — drop a fresh install here.
+original/em-<version>/   Untouched eM Client install output, one subfolder per eM Client version
+                          tested against (confirmed byte-identical regardless of target Windows
+                          version, so one snapshot per eM Client build is enough). Not tracked in
+                          git — drop a fresh install here.
 
 il-patches/               The Cecil-based patcher tools (source tracked, binaries built fresh
                            each run) plus every patch's own doc comments explaining what it does

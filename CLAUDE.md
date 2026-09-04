@@ -125,12 +125,18 @@ Deploy commands need the `$BOTTLE` path swapped accordingly when testing there i
 differently — `emClient_win_8_x64`, `emClient_win_10_x64`, and `emClient_win_11_x64`, all
 confirmed working with the full deploy.sh pipeline (Windows 10/11 run the Microsoft Store variant
 of the app, with no classic License menu entry — licensing there is presumably handled via
-`MicrosoftStoreLicenseSource` instead, not yet investigated). `original/` is split into
-per-OS-version subfolders (`original/7/`, `original/8/`, more to come) — confirmed `original/7`
-and `original/8` are byte-for-byte identical (2408 files, zero diffs, matching hashes on every
-touched assembly), i.e. the eM Client installer doesn't differentiate its payload by target OS
-version, at least for these two. Worth re-confirming for each new OS subfolder as it's added, in
-case a later Windows version does differ.
+`MicrosoftStoreLicenseSource` instead, not yet investigated). `original/` is organized by full eM
+Client version string, one subfolder per version tested against — currently
+`original/em-10.4.5674/` and `original/em-11.0.196/` (the latter is the separate 11.0.196-beta
+release line, see below) — **not** by target Windows OS version: an early investigation
+confirmed the installer ships byte-for-byte identical payloads regardless of target OS version
+(2408 files, zero diffs, matching hashes on every touched assembly, checked across two OS
+versions), so a single snapshot per eM Client version is sufficient. `original/v1/` also exists
+in this repo and predates the current naming convention — it's actually another eM Client
+10.4.5674 snapshot despite the name, not a distinct version; ignore it, `original/em-10.4.5674/`
+is the current canonical one. `deploy.sh` itself never reads from `original/` at runtime — it
+always copies fresh from whatever's actually installed in the target bottle (see its own header
+comment) — these snapshots exist purely as a read-only reference for diffing/investigation.
 
 **Primary testing bottle shifted permanently from `emClient_win_7_x64` to `emClient_win_8_x64`**
 (already set up with test data) — use bottle 8 for new investigation/testing going forward unless
@@ -139,7 +145,7 @@ license state, kept available for licensing-related testing).
 
 ## eM Client 11 (beta) — separate release line
 
-Everything above (`original/7,8,10,11`, `releases/10.4.5674/`, the "Status" section below) is
+Everything above (`original/em-10.4.5674/`, `releases/10.4.5674/`, the "Status" section below) is
 for eM Client **10.4.5674**. eM Client **11.0.196-beta** is a genuinely different, still-changing
 product build (new assembly set, targets .NET 10 instead of .NET 8, different bugs) tracked
 completely separately, on purpose — never fold its fixes into `releases/10.4.5674/deploy.sh` or
@@ -151,12 +157,43 @@ but don't rely on that alone).
   install path shape as the v10 bottles (`drive_c/Program Files (x86)/eM Client/MailClient.dll`).
 - **`original/em-11.0.196/`** — the pristine reference snapshot for this exact build
   (`MailClient.dll` FileVersion `11.0.196.0`, InformationalVersion
-  `11.0.196-beta+b945a075a5`). Named by full eM Client version string, deliberately **not**
-  `original/11/` — that name is already taken by "Windows 11" in the v10 OS-version scheme above,
-  and reusing it here would silently collide/confuse the two axes (OS version vs. eM Client
-  version). `original/v1/` also exists in this repo and is **not** related to eM Client 11 at
-  all despite the name — it's an old, differently-named snapshot of eM Client 10.4.5674, a
-  leftover from before the current `original/<os-version>/` convention was adopted; ignore it.
+  `11.0.196-beta+b945a075a5`), same `original/em-<version>/` naming convention as v10's own
+  `original/em-10.4.5674/` (see the naming-convention note above). `original/v1/` also exists in
+  this repo and is **not** related to eM Client 11 despite the name — it's an old, differently-
+  named snapshot of eM Client 10.4.5674, a leftover from before the current convention was
+  adopted; ignore it.
+- **`releases/11.0.196-beta/install-msix.sh`** — eM Client 11 ships as an MSIX package (Microsoft
+  Store-style), which CrossOver/Wine can't install directly the way `deploy.sh` assumes something
+  already is — there's no classic installer to run inside the bottle. This script gets a clean,
+  unpatched install into place by hand, entirely from network downloads (all into a fresh `/tmp`
+  workdir, cleaned up on success): downloads both the x64 and x86 .NET 10 desktop runtime
+  installers (`windowsdesktop-runtime-10.0.11-win-{x64,x86}.exe`) and silently installs them into
+  the chosen bottle (`wine <exe> /install /quiet /norestart`, the documented unattended-install
+  invocation for Microsoft's Burn-based bootstrapper installers); downloads and parses the app's
+  own update feed, `https://licensing.emclient.com/api/update/emclient.appinstaller?beta=true` (a
+  small XML manifest whose `<MainBundle Uri="...">` attribute is the *actual* current download
+  URL — resolved via `python3`'s `xml.etree.ElementTree`, not hardcoded, since it changes with
+  every release) to find and download the current `.msixbundle`; extracts just the x86 `.msix`
+  from the bundle (a plain zip containing one `.msix` per architecture — confirmed via
+  `unzip -l` against a real bundle: `MailClient_win-{x86,x64,arm64}.msix` plus bundle-level Appx
+  metadata) and extracts THAT (also a plain zip, flat layout, no VFS redirection folder —
+  confirmed by inspection, and by matching `original/em-11.0.196/`'s own file count exactly,
+  2493 files both ways) directly into the bottle's classic
+  `drive_c/Program Files (x86)/eM Client/` location; copies the tracked `supporting/eM Client.lnk`
+  shortcut (confirmed via a raw strings check to already point at exactly that install path) into
+  the bottle's Start Menu Programs folder; and runs `cxmenu --sync --bottle <name>` to pick up the
+  new shortcut without a manual "Install Application into Bottle" pass. Bottle selection scans
+  every bottle under `~/.cxoffice/` (not filtered to ones that already have eM Client, unlike
+  `deploy.sh` — the point here is installing into one that doesn't yet) and warns if the chosen
+  one's own `cxbottle.conf` `"Template"` setting isn't `win11_*` (confirmed reliable across every
+  bottle checked — `win7_64`/`win8_64`/`win10_64`/`win11_64`), since Windows 11 is the only target
+  confirmed working so far. Does **not** run `deploy.sh`'s own patch pipeline — that's a
+  deliberately separate, subsequent step (same "always regenerate fresh from whatever's actually
+  installed" design works identically regardless of how that install got there). The XML-parsing
+  and MSIX-entry-detection logic were both validated directly against real reference files
+  (`/home/portagent/Downloads/emclient.appinstaller` and `setup.msixbundle`) before being wired
+  into the script; the live network-download and in-bottle installation steps have not yet been
+  run end-to-end (pending a bottle free to test against).
 - **`releases/11.0.196-beta/deploy.sh`** — this version's own deploy script, same overall shape
   (bottle discovery, running-instance check, version gate, backup, verify, deploy-with-rollback,
   a `MailClient.Wine.dll` revision marker) as `releases/10.4.5674/deploy.sh` but much smaller —
@@ -175,7 +212,7 @@ but don't rely on that alone).
   Independent of the DLL-patch pipeline (runs regardless of which stages applied this time), same
   as v10. Verified live: fonts land in the bottle's `windows/Fonts`, registry SystemLink entries
   read back correctly, `--no-fonts` skips cleanly on a re-run.
-- **Status:** two DLL fixes so far, plus fonts.
+- **Status:** three DLL fixes so far, plus fonts.
   - `release/11.0.196-1` — a startup crash (PBKDF2 key derivation broken under Wine's
     `bcrypt.dll`, blocking `InitOnBackground` before the main window ever appears). Full
     root-cause and fix details: `reports/emclient11-pbkdf2-startup-crash-findings.md`. Fixed via
@@ -190,9 +227,24 @@ but don't rely on that alone).
     `reports/emclient11-splash-tip-icon-findings.md`). Fixed by reusing the existing
     `--patch-splash-tip-icon` flag completely **unmodified** — no new patch code needed, just
     wired into this release line's own Stage 2. Visually confirmed working by the user.
-  Both flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every v10 patch flag
-  (shared tooling, not duplicated per release line) — only the deploy scripts and release folders
-  are kept separate, not the patcher tool itself. Also added (not a DLL patch, so not part of the
+  - `release/11.0.196-3` — new-mail notification toast empty until fade (Stage 3, mirroring v10's
+    Stages 8–14 as one combined stage here), the **exact same bug and same 7-part fix** as the
+    already-fixed v10 issue (`reports/notification-empty-until-fade-findings.md`) — confirmed via
+    decompile diff before porting anything (5 of 7 sub-flags apply completely unmodified; 2
+    needed real adaptation: `--patch-notification-hover-forward` for `LayeredForm` moving
+    assemblies, `--patch-notification-toolbar-icons` for `FormMailNotification`'s buttons being
+    redesigned from 3 fixed named buttons to 5 dynamic ones). Both adapted flags were also made
+    auto-detecting (work unmodified against EITHER eM Client version's assembly shape, not just
+    11.0.196-beta), and this work caught two previously-latent bugs in `il-patcher` itself (a
+    cross-module `MethodReference` import bug, and a `Directory.GetFiles` enumeration-order bug
+    that let one patched file silently get clobbered by a later plain copy) — see IL-patching
+    lessons 16–17 above and `reports/emclient11-notification-empty-until-fade-findings.md` for
+    the full story. Verified via decompile + `--dump-handlers` at every stage and a full
+    fresh-from-pristine chain re-run; **not yet deployed live or visually confirmed** (pending a
+    free bottle to test against).
+  All three flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every v10 patch
+  flag (shared tooling, not duplicated per release line) — only the deploy scripts and release
+  folders are kept separate, not the patcher tool itself. Also added (not a DLL patch, so not part of the
   `REVISION_LAST_STAGE`/stage-number scheme, same as v10): vendored font installation,
   `--install-fonts`/`--no-fonts`, described above.
 
@@ -417,13 +469,15 @@ before vcenter-fix, the latter expects flags the former adds), Stage 10
 before icon-bitmap, the latter needs `__drawNotificationTextIntoBitmap`, which the former
 creates), Stage 12 (`--patch-notification-text-drawstring`), Stage 13
 (`--patch-notification-hover-forward`), Stage 14 (`--patch-notification-toolbar-icons`). Verified
-two ways before folding in: a fresh rebuild from `original/8` confirmed byte-for-byte equivalent
-(decompiled output identical) to the build already live-tested, and genuinely cleaner (the
-previously-live build had accumulated dev-only diagnostic logging — `--patch-diag` etc., now
-removed from the tool entirely — inside several notification methods, e.g. 8 stray
-`File.AppendAllText` calls inside `OnShown` alone, none of which exist in this chain); then a
-full real run of `deploy.sh` itself against a bottle restored to pristine (`cp -a original/8/.`
-over the live install, removing the stray `MailClient.Licensing.BouncyCastlePatch.dll` too) —
+two ways before folding in: a fresh rebuild from a pristine `original/` snapshot (at the time,
+`original/8`; the equivalent snapshot today is `original/em-10.4.5674/` — see the naming-
+convention note above) confirmed byte-for-byte equivalent (decompiled output identical) to the
+build already live-tested, and genuinely cleaner (the previously-live build had accumulated
+dev-only diagnostic logging — `--patch-diag` etc., now removed from the tool entirely — inside
+several notification methods, e.g. 8 stray `File.AppendAllText` calls inside `OnShown` alone,
+none of which exist in this chain); then a full real run of `deploy.sh` itself against a bottle
+restored to pristine (`cp -a` that snapshot's files over the live install, removing the stray
+`MailClient.Licensing.BouncyCastlePatch.dll` too) —
 all 14 stages, every verification check, backup, and deploy succeeded, and the user confirmed
 the result live. That run also caught a real gap in `deploy.sh`'s own close-handling: eM
 Client's own "Close application to tray" setting can make a graceful close request succeed
@@ -730,6 +784,43 @@ session, all worth guarding against explicitly next time:
     so this is a normal, safe reference walk, not tool-runtime reflection), then
     `priorityTypeDef.Fields.FirstOrDefault(f => f.Name == "Background").Constant` — reads the
     literal value the target assembly itself actually shipped with, no assumption involved.
+16. **Every `MethodReference`/`FieldReference` used inside a method body must be imported into
+    THAT method's own declaring module — not whichever module happened to be open when the
+    reference was built.** Every patch before this one touched exactly one assembly, so
+    `module.ImportReference(...)` (where `module` is the single file being read/written) was
+    always correct by construction. `--patch-notification-hover-forward` needed to insert IL into
+    `LayeredForm.WndProc`, and eM Client 11.0.196-beta moved `LayeredForm` into a *different*
+    assembly (`MailClient.Common.UI.dll`) than the one being iterated as the "main" target
+    (`MailClient.dll`) — a `MouseEventArgs` constructor reference imported via
+    `module.ImportReference(...)` (module = `MailClient.dll`) but then used inside
+    `WndProc`'s body (which belongs to `MailClient.Common.UI.dll`'s own module) built without
+    error, decompiled fine, and only failed at `module.Write()` time:
+    `ArgumentException: ... is declared in another module and needs to be imported`. When the
+    SAME underlying member is called from method bodies in two different modules (as this
+    constructor was — once from `WndProc`, once from a handler method declared alongside
+    `FormGenericNotification`), that's two separate `ImportReference` calls, one per module, even
+    though it's conceptually "the same" reference — resolve which module a given piece of
+    generated IL will actually live in before choosing which module to import into, don't assume
+    it's always the one you happened to open first.
+17. **A patch that writes more than one output file cannot rely on `Directory.GetFiles`'
+    enumeration order — it isn't alphabetical, and isn't guaranteed to be anything.** Every prior
+    multi-file patch's loop shape was "File.Copy everything that isn't `targetAssembly`, patch
+    and write whichever file *is*" — safe as long as targetAssembly's own patch-and-write step is
+    the LAST thing that ever touches its output path. `--patch-notification-hover-forward`,
+    once patching two files (see lesson 16), needed to ALSO write the second file
+    (`MailClient.Common.UI.dll`) from the mutated in-memory module — and the same loop iterated
+    over `MailClient.dll` first (patching + writing both files correctly, confirmed via debug
+    instrumentation: a `FileInfo.Length` check immediately after the write showed a materially
+    different size), then reached `MailClient.Common.UI.dll`'s OWN "not targetAssembly, plain
+    copy" branch later in the same pass and silently clobbered the just-patched file back to a
+    byte-identical copy of the unpatched input. No exception, no warning — the tool's own success
+    message printed correctly both times, and the bug only surfaced by explicitly diffing the
+    output against the input by hand afterward. Fixed by restructuring: do all patch work up
+    front (outside any file-enumeration loop), THEN do one copy-everything-else pass that
+    explicitly excludes every filename that got patched, THEN write the patched module(s) —
+    removes the ordering dependency entirely rather than trying to control or predict iteration
+    order. Worth checking any EXISTING multi-file patch for this same shape if it's ever extended
+    to touch a third file.
 
 **A new `--dump-il <dll> <type> <method>` utility mode** (same rationale as `--dump-handlers`)
 prints a method's real instruction stream with offsets — use it before writing any patch that
