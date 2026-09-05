@@ -179,10 +179,11 @@ but don't rely on that alone).
   metadata) and extracts THAT (also a plain zip, flat layout, no VFS redirection folder —
   confirmed by inspection, and by matching `original/em-11.0.196/`'s own file count exactly,
   2493 files both ways) directly into the bottle's classic
-  `drive_c/Program Files (x86)/eM Client/` location; copies the tracked `supporting/eM Client.lnk`
-  shortcut (confirmed via a raw strings check to already point at exactly that install path) into
-  the bottle's Start Menu Programs folder; and runs `cxmenu --sync --bottle <name>` to pick up the
-  new shortcut without a manual "Install Application into Bottle" pass. Bottle selection scans
+  `drive_c/Program Files (x86)/eM Client/` location; copies the tracked
+  `releases/11.0.196-beta/eM Client.lnk` shortcut (lives alongside the script itself, not in
+  `supporting/` — confirmed via a raw strings check to already point at exactly that install
+  path) into the bottle's Start Menu Programs folder; and runs `cxmenu --sync --bottle <name>` to
+  pick up the new shortcut without a manual "Install Application into Bottle" pass. Bottle selection scans
   every bottle under `~/.cxoffice/` (not filtered to ones that already have eM Client, unlike
   `deploy.sh` — the point here is installing into one that doesn't yet) and warns if the chosen
   one's own `cxbottle.conf` `"Template"` setting isn't `win11_*` (confirmed reliable across every

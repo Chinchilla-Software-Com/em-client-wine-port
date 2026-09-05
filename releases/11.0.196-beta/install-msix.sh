@@ -39,8 +39,7 @@ CXSTART_WINE="/opt/cxoffice/bin/wine"
 CXMENU="/opt/cxoffice/bin/cxmenu"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-LNK_FILE="$REPO_ROOT/supporting/eM Client.lnk"
+LNK_FILE="$SCRIPT_DIR/eM Client.lnk"
 
 log()  { echo "[install-msix] $*"; }
 warn() { echo "[install-msix] WARNING: $*" >&2; }
