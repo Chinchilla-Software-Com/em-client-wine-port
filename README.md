@@ -61,9 +61,14 @@ tool) versus kept separate (everything else).
 Unlike the 10.4.5674 pipeline, eM Client 11 ships as an MSIX package, which CrossOver/Wine can't
 install directly — there's no classic installer to run inside the bottle. Get a clean install in
 place first with `releases/11.0.196-beta/install-msix.sh` (downloads the .NET 10 desktop runtime,
-resolves and downloads the current MSIX bundle, and extracts it into the bottle by hand — see
-`CLAUDE.md`'s eM Client 11 section for the full mechanics), then run
-`releases/11.0.196-beta/deploy.sh` as usual to apply the patches above.
+resolves and downloads the current MSIX bundle, extracts it into the bottle by hand, and installs
+a set of ICU DLLs Wine doesn't provide but the app's spell-checker needs — without them, the app
+crashes on essentially every keystroke in a compose window; see
+[emclient11-icu-spellcheck-crash-findings.md](reports/emclient11-icu-spellcheck-crash-findings.md)
+— downloaded fresh each run, not vendored here, same as the .NET runtime above), then run
+`releases/11.0.196-beta/deploy.sh` (which `install-msix.sh` will offer to do for you) to apply the
+patches above. The ICU fix is a missing OS component, not an eM Client bug, so it lives in
+`install-msix.sh` rather than as one of the patches in the table.
 
 ## How it's built
 

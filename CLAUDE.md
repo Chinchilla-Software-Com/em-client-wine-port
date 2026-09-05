@@ -188,13 +188,29 @@ but don't rely on that alone).
   `deploy.sh` — the point here is installing into one that doesn't yet) and warns if the chosen
   one's own `cxbottle.conf` `"Template"` setting isn't `win11_*` (confirmed reliable across every
   bottle checked — `win7_64`/`win8_64`/`win10_64`/`win11_64`), since Windows 11 is the only target
-  confirmed working so far. Does **not** run `deploy.sh`'s own patch pipeline — that's a
-  deliberately separate, subsequent step (same "always regenerate fresh from whatever's actually
-  installed" design works identically regardless of how that install got there). The XML-parsing
-  and MSIX-entry-detection logic were both validated directly against real reference files
-  (`/home/portagent/Downloads/emclient.appinstaller` and `setup.msixbundle`) before being wired
-  into the script; the live network-download and in-bottle installation steps have not yet been
-  run end-to-end (pending a bottle free to test against).
+  confirmed working so far.
+  Right after the MSIX extraction, it also downloads and installs a set of **ICU DLLs** Wine
+  doesn't provide but eM Client's spell-checker needs — see
+  `reports/emclient11-icu-spellcheck-crash-findings.md` for the full investigation (a
+  `DllNotFoundException` crash on essentially every keystroke in a compose window; the fix is a
+  fork of the official `unicode-org/icu` built with unversioned symbol names, from
+  https://github.com/FaithLife-Community/icu, downloaded fresh each run — not vendored in this
+  repo — the same way the .NET runtimes and the msixbundle itself are). This is a missing
+  **OS-level** dependency, not an eM Client bug, so it's provisioned here at install time rather
+  than as a `deploy.sh` IL-patch stage — no release-number bump, no `MailClient.Wine.dll`
+  revision for it.
+  At the end, it offers to run `deploy.sh` against the same bottle immediately (prompted, or
+  automatic under `-y`) rather than just printing the command as a manual next step. Does
+  **not** run `deploy.sh`'s own patch pipeline unless the user says yes to that prompt — it
+  remains a logically separate, optional step (same "always regenerate fresh from whatever's
+  actually installed" design works identically regardless of how that install got there). The
+  XML-parsing, MSIX-entry-detection, and ICU-provenance-verification logic were all validated
+  directly against real reference files/APIs before being wired into the script; the ICU fix
+  itself was additionally confirmed working live (deployed by hand first, then folded into the
+  script) — drafting an email with a deliberate misspelling now shows a normal spell-check
+  underline instead of crashing. The script as a whole has not yet been run start-to-finish in
+  one pass (its pieces were built and verified incrementally against an already-partially-set-up
+  bottle).
 - **`releases/11.0.196-beta/deploy.sh`** — this version's own deploy script, same overall shape
   (bottle discovery, running-instance check, version gate, backup, verify, deploy-with-rollback,
   a `MailClient.Wine.dll` revision marker) as `releases/10.4.5674/deploy.sh` but much smaller —

@@ -8,33 +8,39 @@
 # .NET 10, and a fresh bottle won't have it), installs them into the chosen bottle, resolves the
 # app's own update feed to find the current MSIX bundle, downloads it, extracts the x86 package's
 # contents directly into the bottle's classic "Program Files (x86)\eM Client" location (the same
-# layout releases/11.0.196-beta/deploy.sh's patch pipeline already expects), and drops in a Start
-# Menu shortcut.
+# layout releases/11.0.196-beta/deploy.sh's patch pipeline already expects), installs a set of
+# ICU DLLs Wine doesn't provide but the app's spell-checker needs (see the ICU section below),
+# and drops in a Start Menu shortcut.
 #
-# This does NOT apply any of this repo's Wine-compatibility patches -- run
-# releases/11.0.196-beta/deploy.sh separately afterward for that (it works the same way against a
-# bottle installed by this script as it does against one installed any other way, since it always
-# regenerates its patches fresh from whatever's actually installed).
+# This does NOT apply any of this repo's Wine-compatibility IL patches -- those are a separate,
+# optional step (releases/11.0.196-beta/deploy.sh), which this script offers to run for you at
+# the end. It works the same way against a bottle installed by this script as it does against one
+# installed any other way, since it always regenerates its patches fresh from whatever's actually
+# installed.
 #
 # Usage:
 #   ./install-msix.sh                interactive: lists bottles found, prompts for choice
 #   ./install-msix.sh --bottle NAME  skip bottle selection (bottle dir name under ~/.cxoffice/)
-#   ./install-msix.sh -y|--yes       don't prompt if the chosen bottle isn't a Windows 11 template
+#   ./install-msix.sh -y|--yes       don't prompt on the Windows-11-template check or on whether
+#                                    to run deploy.sh afterward (answers yes to both)
 #   ./install-msix.sh --help         full usage
 #
 # All downloads and extraction happen in a fresh temp directory under /tmp, cleaned up on
 # success; left in place (path printed) for inspection if anything fails. The msixbundle download
 # is large (800MB+) -- expect this to take a while on a slow connection.
 #
-# Requires: curl, python3 (to parse the .appinstaller XML manifest), unzip. No dotnet SDK needed
-# -- unlike deploy.sh, this script does no IL patching, just file extraction and one silent
-# installer run inside the bottle via wine.
+# Requires: curl, python3 (to parse the .appinstaller XML manifest), unzip, tar. No dotnet SDK
+# needed -- unlike deploy.sh, this script does no IL patching, just file extraction and a couple
+# of silent installer/registry operations inside the bottle via wine.
 
 set -euo pipefail
 
 APPINSTALLER_URL="https://licensing.emclient.com/api/update/emclient.appinstaller?beta=true"
 DOTNET_X64_URL="https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/10.0.11/windowsdesktop-runtime-10.0.11-win-x64.exe"
 DOTNET_X86_URL="https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/10.0.11/windowsdesktop-runtime-10.0.11-win-x86.exe"
+# A fork of the official unicode-org/icu, built with unversioned (Microsoft-compatible) symbol
+# names -- see the ICU installation section below for why this is needed and how it was verified.
+ICU_URL="https://github.com/FaithLife-Community/icu/releases/download/72.1-custom%2B4/icu-win.tar.gz"
 CXSTART_WINE="/opt/cxoffice/bin/wine"
 CXMENU="/opt/cxoffice/bin/cxmenu"
 
@@ -72,7 +78,7 @@ done
 # Tool checks
 # ---------------------------------------------------------------------------
 
-for tool in curl python3 unzip; do
+for tool in curl python3 unzip tar; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found -- required by this script."
 done
 [[ -f "$LNK_FILE" ]] || die "shortcut file not found: $LNK_FILE"
@@ -247,6 +253,64 @@ unzip -q -o "$X86_MSIX" -d "$INSTALL_DIR"
 log "eM Client files installed."
 
 # ---------------------------------------------------------------------------
+# ICU DLLs. eM Client 11's spell-checker (MailClient.Utils.Text.WordBreak) calls ICU's
+# BreakIterator C API directly via [DllImport("icuuc.dll")] -- an unversioned symbol name, the
+# classic ICU4C convention. Real Windows 10 1703+ ships this itself (a built-in icu.dll plus
+# compatible icuuc.dll/icuin.dll shims); Wine does not implement or ship ANY of these (confirmed:
+# absent from Wine's own DLL directory and from a clean bottle's system32), so spell-check
+# crashes with DllNotFoundException on essentially every keystroke in a compose window with
+# spell-check enabled -- see reports/emclient11-icu-spellcheck-crash-findings.md for the full
+# investigation, including why a random "icuuc.dll" found online (a thin forwarder to Windows'
+# own built-in icu.dll, confirmed via objdump -- every export was a Forwarder RVA) does NOT fix
+# this: it just moves the missing-dependency problem to a different, equally-absent DLL.
+#
+# This is a missing OS-level dependency, not a bug in eM Client's own binaries -- not something
+# releases/11.0.196-beta/deploy.sh's IL patching can fix, so it's provisioned here at install
+# time instead, the same way the .NET runtimes above are.
+#
+# Source: a fork of the official unicode-org/icu (https://github.com/FaithLife-Community/icu),
+# built with unversioned (Microsoft-compatible) symbol names so icuuc.dll/icuin.dll export plain
+# names like ubrk_open instead of ICU's default versioned form (e.g. ubrk_open_75) -- exactly
+# what eM Client's hardcoded DllImport expects. Referenced from Wine's own bug tracker
+# (https://bugs.winehq.org/show_bug.cgi?id=53354, "Wine should provide icu.dll") as the
+# known-working fix for this exact gap. Verified before use: it's a direct GitHub fork of the
+# real unicode-org/icu project (not an unrelated binary), and icuuc.dll/icuin.dll in this build
+# are themselves thin forwarders to icu.dll (confirmed via objdump) -- but unlike the broken one
+# found online, THIS package ships its own real icu.dll alongside them (~4-5MB, 2108 genuine
+# exports including a non-forwarded ubrk_open), so the forwarding chain actually resolves. All
+# three files must be installed together.
+# ---------------------------------------------------------------------------
+
+log "downloading ICU DLLs (Wine doesn't provide these; eM Client's spell-checker needs them)..."
+curl -fL --progress-bar -o "$TMPDIR/icu-win.tar.gz" "$ICU_URL"
+
+log "extracting and installing ICU DLLs..."
+mkdir -p "$TMPDIR/icu-extract"
+tar xzf "$TMPDIR/icu-win.tar.gz" -C "$TMPDIR/icu-extract"
+for d in system32 syswow64; do
+    [[ -d "$TMPDIR/icu-extract/windows/$d" ]] || die "expected windows/$d/ not found in the downloaded ICU archive -- its layout may have changed"
+done
+
+mkdir -p "$BOTTLE_DIR/drive_c/windows/system32" "$BOTTLE_DIR/drive_c/windows/syswow64" "$BOTTLE_DIR/drive_c/windows/globalization/ICU"
+cp "$TMPDIR/icu-extract/windows/system32/"*.dll "$BOTTLE_DIR/drive_c/windows/system32/"
+cp "$TMPDIR/icu-extract/windows/syswow64/"*.dll "$BOTTLE_DIR/drive_c/windows/syswow64/"
+# This is Windows' own system-wide globalization data (icudtl.dat + timezone/locale .res files),
+# installed to drive_c/windows/globalization/ICU/ -- a completely separate file from eM Client's
+# OWN icudtl.dat that the MSIX extraction step above already placed directly in the app's install
+# directory (that one is CEF/Chromium's own bundled copy, for the browser engine's internal use
+# only). Different consumer, different location -- don't confuse the two.
+cp "$TMPDIR/icu-extract/windows/globalization/ICU/"* "$BOTTLE_DIR/drive_c/windows/globalization/ICU/"
+
+# Wine may have its own (stub, or simply absent) idea of these DLLs -- force it to use the real,
+# just-installed files instead of anything it would otherwise try to resolve internally.
+log "setting DLL overrides to native for icu/icuin/icuuc..."
+for dll in icu icuin icuuc; do
+    CX_BOTTLE="$BOTTLE_NAME" "$CXSTART_WINE" reg add "HKCU\\Software\\Wine\\DllOverrides" /v "$dll" /t REG_SZ /d native /f >/dev/null \
+        || die "failed to set the Wine DLL override for $dll"
+done
+log "ICU DLLs installed and DLL overrides set."
+
+# ---------------------------------------------------------------------------
 # Start Menu shortcut -- a pre-built .lnk already pointing at
 # C:\Program Files (x86)\eM Client\MailClient.exe (confirmed via a raw strings check against the
 # tracked file), matching exactly where this script just installed to. Copied as-is, not
@@ -277,6 +341,34 @@ log "  bottle:      $BOTTLE_NAME"
 log "  eM Client:   $MSIX_VERSION"
 log "  installed to: $INSTALL_DIR"
 log ""
-log "This installed a clean, UNPATCHED copy. Next: run"
-log "  releases/11.0.196-beta/deploy.sh --bottle $BOTTLE_NAME"
-log "to apply this repo's Wine-compatibility fixes."
+log "This installed a clean, UNPATCHED copy (though the ICU DLLs above are already needed just"
+log "to keep the app from crashing, independent of the optional Wine-compatibility patches below)."
+
+# ---------------------------------------------------------------------------
+# Offer to run the optional IL-patch pipeline right away, rather than just printing the command
+# and leaving it as a separate manual step -- deploy.sh lives right alongside this script and
+# already knows how to target the same bottle non-interactively.
+# ---------------------------------------------------------------------------
+
+DEPLOY_SH="$SCRIPT_DIR/deploy.sh"
+if [[ -x "$DEPLOY_SH" ]]; then
+    run_deploy=0
+    if [[ $ASSUME_YES -eq 1 ]]; then
+        run_deploy=1
+    else
+        echo ""
+        read -r -p "Run deploy.sh now to apply this repo's Wine-compatibility patches to this bottle? [Y/n] " reply
+        [[ -z "$reply" || "$reply" =~ ^[Yy]$ ]] && run_deploy=1
+    fi
+
+    if [[ $run_deploy -eq 1 ]]; then
+        log "running deploy.sh --bottle $BOTTLE_NAME ..."
+        "$DEPLOY_SH" --bottle "$BOTTLE_NAME"
+    else
+        log "skipped. Run it later with:"
+        log "  $DEPLOY_SH --bottle $BOTTLE_NAME"
+    fi
+else
+    warn "deploy.sh not found at $DEPLOY_SH -- skipping the offer to run it. Find it and run:"
+    warn "  <that path>/deploy.sh --bottle $BOTTLE_NAME"
+fi
