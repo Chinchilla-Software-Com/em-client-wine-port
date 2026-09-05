@@ -1,10 +1,8 @@
 # eM Client 11 (beta) notification toast: same empty-until-fade bug, same 7-stage fix
 
-**Status: patched, verified via decompile + `--dump-handlers` at every stage, and via a full
-fresh-from-pristine chain re-run. NOT yet deployed to a live bottle or visually confirmed** —
-this round's work happened while the user's own bottle was busy/in-use, so verification stopped
-at the byte/IL level; live deployment and visual confirmation are the next step once a bottle is
-free to test against.
+**Status: fixed and deployed as release/11.0.196-3.** Verified via decompile + `--dump-handlers`
+at every stage and a full fresh-from-pristine chain re-run before deploying, then deployed live
+to `emClient_11_beta_win_11` and confirmed working visually by the user.
 
 Separate product line from the rest of this repo's fixes — see CLAUDE.md's "eM Client 11
 (beta) — separate release line" section. This is the third fix for that line (after
@@ -146,9 +144,10 @@ versions (v10's handlers simply ignore the now-correct value), not a version-con
 - The hover-forward fix specifically was regression-tested against `original/em-10.4.5674/` too
   (not just v11), confirming the version-agnostic rewrite didn't change v10's already-shipped
   behavior.
-- **Not yet done:** live deployment and visual confirmation (blocked on the user's bottle being
-  free to test against — this round's work was explicitly scoped to code-only, scratch-directory
-  verification per the user's own instruction not to touch the running bottle).
+- Deployed live via `releases/11.0.196-beta/deploy.sh` (correctly resumed from revision 2 straight
+  to Stage 3, then a second run correctly skipped the whole pipeline at revision 3) and confirmed
+  working visually by the user — the notification toast now shows its title/content text and
+  icons immediately, not just at fade-out.
 
 ## Tooling notes worth keeping for future cross-assembly patches
 

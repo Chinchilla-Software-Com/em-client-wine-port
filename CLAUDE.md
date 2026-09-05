@@ -229,7 +229,7 @@ but don't rely on that alone).
   Independent of the DLL-patch pipeline (runs regardless of which stages applied this time), same
   as v10. Verified live: fonts land in the bottle's `windows/Fonts`, registry SystemLink entries
   read back correctly, `--no-fonts` skips cleanly on a re-run.
-- **Status:** three DLL fixes so far, plus fonts.
+- **Status:** three DLL fixes so far, plus fonts, plus an install-time OS-dependency fix.
   - `release/11.0.196-1` — a startup crash (PBKDF2 key derivation broken under Wine's
     `bcrypt.dll`, blocking `InitOnBackground` before the main window ever appears). Full
     root-cause and fix details: `reports/emclient11-pbkdf2-startup-crash-findings.md`. Fixed via
@@ -257,13 +257,23 @@ but don't rely on that alone).
     that let one patched file silently get clobbered by a later plain copy) — see IL-patching
     lessons 16–17 above and `reports/emclient11-notification-empty-until-fade-findings.md` for
     the full story. Verified via decompile + `--dump-handlers` at every stage and a full
-    fresh-from-pristine chain re-run; **not yet deployed live or visually confirmed** (pending a
-    free bottle to test against).
-  All three flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every v10 patch
-  flag (shared tooling, not duplicated per release line) — only the deploy scripts and release
-  folders are kept separate, not the patcher tool itself. Also added (not a DLL patch, so not part of the
-  `REVISION_LAST_STAGE`/stage-number scheme, same as v10): vendored font installation,
-  `--install-fonts`/`--no-fonts`, described above.
+    fresh-from-pristine chain re-run, then deployed live to `emClient_11_beta_win_11` and
+    **confirmed working visually by the user**.
+  - **ICU DLLs** (not a numbered release — install-time only, no `MailClient.Wine.dll` revision
+    bump). Spell-check crashed with `DllNotFoundException: icuuc.dll` on essentially every
+    keystroke in a compose window — a missing OS-level dependency real Windows 10 1703+ ships
+    itself but Wine implements none of. Fixed by downloading and installing a self-contained
+    ICU4C build with unversioned symbols (from
+    https://github.com/FaithLife-Community/icu, a verified fork of the official
+    `unicode-org/icu`) via `install-msix.sh`, fresh each run, not vendored in this repo. Full
+    story, including a dead-end tried first (a forwarder-only `icuuc.dll` found online that
+    pointed at Windows' own built-in `icu.dll`, which Wine also doesn't have): see
+    `reports/emclient11-icu-spellcheck-crash-findings.md`. Confirmed working live.
+  All three DLL-patch flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every
+  v10 patch flag (shared tooling, not duplicated per release line) — only the deploy scripts and
+  release folders are kept separate, not the patcher tool itself. Also added (not DLL patches, so
+  not part of the `REVISION_LAST_STAGE`/stage-number scheme, same as v10): vendored font
+  installation (`--install-fonts`/`--no-fonts`, described above) and the ICU fix above.
 
 git is available in this environment (it wasn't in earlier sessions — if CLAUDE.md you're
 reading elsewhere says otherwise, this note supersedes it). Local commit identity for this repo
