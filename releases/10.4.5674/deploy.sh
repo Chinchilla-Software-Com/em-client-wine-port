@@ -255,6 +255,34 @@ BOTTLE_APP_DIR="$(dirname "$SELECTED_DLL")"
 log "target bottle: $BOTTLE_NAME ($BOTTLE_APP_DIR)"
 
 # ---------------------------------------------------------------------------
+# Version gate -- deliberately BEFORE anything else touches this bottle (revision check, and
+# especially the running-instance close-and-kill logic below): a pure metadata read, no side
+# effects, so the user gets a chance to abort a version mismatch before their running eM Client
+# is ever closed. Originally lived after the running-instance check -- moved here after a live
+# review pointed out that a mismatch warning is useless once the disruptive part (closing the
+# app) has already happened.
+# ---------------------------------------------------------------------------
+
+FOUND_VERSION_LINE=$($ILP --version "$SELECTED_DLL")
+FOUND_FILE_VERSION=$(echo "$FOUND_VERSION_LINE" | awk -F'\t' '{print $3}' | sed 's/FileVersion=//')
+log "installed MailClient.dll: $FOUND_VERSION_LINE"
+
+if [[ "$FOUND_FILE_VERSION" != "$EXPECTED_FILE_VERSION" ]]; then
+    warn "this release script was built and verified against FileVersion=$EXPECTED_FILE_VERSION,"
+    warn "but the selected install reports FileVersion=$FOUND_FILE_VERSION."
+    warn "The patches below look for specific types/methods/strings by name, not by version --"
+    warn "they may still apply cleanly, or may fail loudly (and safely -- nothing gets deployed"
+    warn "until every stage AND every verification check below succeeds). But an untested version"
+    warn "mismatch is still a real risk: proceed at your own judgement."
+    if [[ $ASSUME_YES -eq 1 ]]; then
+        log "-y/--yes given, continuing despite version mismatch."
+    else
+        read -r -p "Continue anyway? [y/N] " reply
+        [[ "$reply" =~ ^[Yy]$ ]] || die "aborted by user (version mismatch)."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Revision check -- safe to re-run, and now upgrade-aware: a bottle already patched by an
 # OLDER release of this same script gets only the stages it's missing applied on top of what's
 # already there, not a doomed re-run of the whole pipeline from scratch (Stage 1 in particular
@@ -403,29 +431,6 @@ if [[ ${#RUNNING_PIDS[@]} -gt 0 ]]; then
         log "eM Client closed."
     else
         die "aborted -- close eM Client in this bottle and re-run."
-    fi
-fi
-
-# ---------------------------------------------------------------------------
-# Version gate
-# ---------------------------------------------------------------------------
-
-FOUND_VERSION_LINE=$($ILP --version "$SELECTED_DLL")
-FOUND_FILE_VERSION=$(echo "$FOUND_VERSION_LINE" | awk -F'\t' '{print $3}' | sed 's/FileVersion=//')
-log "installed MailClient.dll: $FOUND_VERSION_LINE"
-
-if [[ "$FOUND_FILE_VERSION" != "$EXPECTED_FILE_VERSION" ]]; then
-    warn "this release script was built and verified against FileVersion=$EXPECTED_FILE_VERSION,"
-    warn "but the selected install reports FileVersion=$FOUND_FILE_VERSION."
-    warn "The patches below look for specific types/methods/strings by name, not by version --"
-    warn "they may still apply cleanly, or may fail loudly (and safely -- nothing gets deployed"
-    warn "until every stage AND every verification check below succeeds). But an untested version"
-    warn "mismatch is still a real risk: proceed at your own judgement."
-    if [[ $ASSUME_YES -eq 1 ]]; then
-        log "-y/--yes given, continuing despite version mismatch."
-    else
-        read -r -p "Continue anyway? [y/N] " reply
-        [[ "$reply" =~ ^[Yy]$ ]] || die "aborted by user (version mismatch)."
     fi
 fi
 

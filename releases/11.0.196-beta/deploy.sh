@@ -229,6 +229,34 @@ BOTTLE_APP_DIR="$(dirname "$SELECTED_DLL")"
 log "target bottle: $BOTTLE_NAME ($BOTTLE_APP_DIR)"
 
 # ---------------------------------------------------------------------------
+# Version gate -- deliberately BEFORE anything else touches this bottle (revision check, and
+# especially the running-instance close-and-kill logic below): a pure metadata read, no side
+# effects, so the user gets a chance to abort a version mismatch before their running eM Client
+# is ever closed. Same fix applied to the 10.4.5674 sibling script, which had the same ordering
+# issue.
+# ---------------------------------------------------------------------------
+
+FOUND_VERSION_LINE=$($ILP --version "$SELECTED_DLL")
+FOUND_FILE_VERSION=$(echo "$FOUND_VERSION_LINE" | awk -F'\t' '{print $3}' | sed 's/FileVersion=//')
+log "installed MailClient.dll: $FOUND_VERSION_LINE"
+
+if [[ "$FOUND_FILE_VERSION" != "$EXPECTED_FILE_VERSION" ]]; then
+    warn "this release script was built and verified against FileVersion=$EXPECTED_FILE_VERSION,"
+    warn "but the selected install reports FileVersion=$FOUND_FILE_VERSION."
+    warn "The patch below finds its target call sites by exact method signature, not by version --"
+    warn "it may still apply cleanly, or may fail loudly (and safely -- nothing gets deployed"
+    warn "until every stage AND every verification check below succeeds). But an untested version"
+    warn "mismatch is still a real risk, and this is beta software that changes fast: proceed at"
+    warn "your own judgement."
+    if [[ $ASSUME_YES -eq 1 ]]; then
+        log "-y/--yes given, continuing despite version mismatch."
+    else
+        read -r -p "Continue anyway? [y/N] " reply
+        [[ "$reply" =~ ^[Yy]$ ]] || die "aborted by user (version mismatch)."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Revision check -- MailClient.Wine.dll marker, same mechanism (and same tracked source,
 # il-patches/MailClient.Wine/VersionMarker.cs) as the 10.4.5674 pipeline, just built with this
 # release line's own version numbers. No legacy-marker fallback needed here: unlike 10.4.5674,
@@ -346,30 +374,6 @@ if [[ ${#RUNNING_PIDS[@]} -gt 0 ]]; then
         log "eM Client closed."
     else
         die "aborted -- close eM Client in this bottle and re-run."
-    fi
-fi
-
-# ---------------------------------------------------------------------------
-# Version gate
-# ---------------------------------------------------------------------------
-
-FOUND_VERSION_LINE=$($ILP --version "$SELECTED_DLL")
-FOUND_FILE_VERSION=$(echo "$FOUND_VERSION_LINE" | awk -F'\t' '{print $3}' | sed 's/FileVersion=//')
-log "installed MailClient.dll: $FOUND_VERSION_LINE"
-
-if [[ "$FOUND_FILE_VERSION" != "$EXPECTED_FILE_VERSION" ]]; then
-    warn "this release script was built and verified against FileVersion=$EXPECTED_FILE_VERSION,"
-    warn "but the selected install reports FileVersion=$FOUND_FILE_VERSION."
-    warn "The patch below finds its target call sites by exact method signature, not by version --"
-    warn "it may still apply cleanly, or may fail loudly (and safely -- nothing gets deployed"
-    warn "until every stage AND every verification check below succeeds). But an untested version"
-    warn "mismatch is still a real risk, and this is beta software that changes fast: proceed at"
-    warn "your own judgement."
-    if [[ $ASSUME_YES -eq 1 ]]; then
-        log "-y/--yes given, continuing despite version mismatch."
-    else
-        read -r -p "Continue anyway? [y/N] " reply
-        [[ "$reply" =~ ^[Yy]$ ]] || die "aborted by user (version mismatch)."
     fi
 fi
 
