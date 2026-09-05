@@ -50,12 +50,12 @@ EXPECTED_FILE_VERSION="11.0.196.0"
 # This project's own release number against RELEASE_VERSION (see
 # il-patches/MailClient.Wine/VersionMarker.cs) -- bump this, and add a row to
 # REVISION_LAST_STAGE below, every time a new release ships against the same eM Client version.
-# Tag as release/<RELEASE_VERSION>-<OUR_RELEASE_NUMBER> (release/11.0.196-3 for this one).
-OUR_RELEASE_NUMBER=3
+# Tag as release/<RELEASE_VERSION>-<OUR_RELEASE_NUMBER> (release/11.0.196-4 for this one).
+OUR_RELEASE_NUMBER=4
 
 # release number -> last stage number that release introduced. Same "resume mid-pipeline" logic
 # as the 10.4.5674 script.
-declare -A REVISION_LAST_STAGE=( [0]=0 [1]=1 [2]=2 [3]=3 )
+declare -A REVISION_LAST_STAGE=( [0]=0 [1]=1 [2]=2 [3]=3 [4]=4 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -533,10 +533,37 @@ if [[ $START_STAGE -le 3 ]]; then
     $ILP --patch-notification-text-drawstring "$WORKDIR/output-stage3k" "$WORKDIR/output-stage3l"
     $ILP --patch-notification-hover-forward "$WORKDIR/output-stage3l" "$WORKDIR/output-stage3m"
     $ILP --patch-notification-toolbar-icons "$WORKDIR/output-stage3m" "$WORKDIR/output-final"
+    STAGE3_DIR="$WORKDIR/output-final"
+else
+    log "Stage 3 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+    STAGE3_DIR="$WORKDIR/original"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 4: Exchange sync-freeze fix -- the exact same bug and same fix as the 10.4.5674
+# pipeline's Stage 15 (see reports/exchange-sync-freeze-findings.md there). Confirmed identical
+# root cause here, not just a similar-looking symptom, before porting anything: decompile-diffed
+# both target methods against the 10.4.5674 build and found them byte-for-byte structurally
+# identical (MailClient.Accounts.AccountManager.SendAndReceiveAll and
+# MailClient.Storage.Application.Folder.Synchronize(bool,bool) -- both still fully synchronous,
+# both still reachable from the UI thread, no dedicated-thread dispatch of their own). Both
+# `--patch-account-manager-sync-async` and `--patch-folder-sync-async` applied cleanly to this
+# build's MailClient.Accounts.dll completely UNMODIFIED -- no adaptation needed at all (unlike
+# Stage 3's two adapted sub-flags), verified via decompile (both the new dispatch wrappers and
+# the moved-body `__Run*Core`/`__folderSyncTaskEntry` methods read correctly) and
+# --dump-handlers (both add a `try`/`catch(Exception)`, both report correct nesting). Order
+# between the two flags doesn't matter (different types, no shared state), same as the sibling
+# script's own Stage 15.
+# ---------------------------------------------------------------------------
+
+if [[ $START_STAGE -le 4 ]]; then
+    log "Stage 4: Exchange sync-freeze fix (same bug/fix as the 10.4.5674 pipeline's Stage 15)..."
+    $ILP --patch-account-manager-sync-async "$STAGE3_DIR" "$WORKDIR/output-stage4a"
+    $ILP --patch-folder-sync-async "$WORKDIR/output-stage4a" "$WORKDIR/output-final"
     cp "$MAILCLIENT_WINE_DLL" "$WORKDIR/output-final/"
     FINAL_DIR="$WORKDIR/output-final"
 else
-    log "Stage 3 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+    log "Stage 4 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
     FINAL_DIR="$WORKDIR/original"
 fi
 
@@ -602,6 +629,22 @@ if [[ $START_STAGE -le 3 ]]; then
         || die "verification failed: --dump-handlers reported a handler-ordering violation in FormMailNotification.performMouseClick"
 fi
 
+# Stage 4 verification -- mirrors the 10.4.5674 pipeline's own equivalent checks (see its Stage
+# 15 verification block), only meaningful (and only ran) when Stage 4 actually ran this time.
+if [[ $START_STAGE -le 4 ]]; then
+    $ILSPY -t "MailClient.Accounts.AccountManager" "$FINAL_DIR/MailClient.Accounts.dll" | grep -q "__RunSendAndReceiveAllCore" \
+        || die "verification failed: AccountManager.__RunSendAndReceiveAllCore not found -- sync freeze fix missing"
+
+    $ILSPY -t "MailClient.Storage.Application.Folder" "$FINAL_DIR/MailClient.Accounts.dll" | grep -q "__folderSyncTaskEntry" \
+        || die "verification failed: Folder.__folderSyncTaskEntry not found -- sync freeze fix missing"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.Accounts.dll" MailClient.Accounts.AccountManager __syncTaskEntry 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in AccountManager.__syncTaskEntry"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.Accounts.dll" MailClient.Storage.Application.Folder __folderSyncTaskEntry 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in Folder.__folderSyncTaskEntry"
+fi
+
 log "all verification checks passed."
 
 # ---------------------------------------------------------------------------
@@ -612,7 +655,7 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="$BACKUPS_DIR/${BOTTLE_NAME}-${TIMESTAMP}"
 mkdir -p "$BACKUP_DIR"
 
-DEPLOY_FILES=(MailClient.dll MailClient.Abstractions.dll MailClient.Common.UI.dll MailClient.Wine.dll)
+DEPLOY_FILES=(MailClient.dll MailClient.Abstractions.dll MailClient.Common.UI.dll MailClient.Accounts.dll MailClient.Wine.dll)
 
 log "backing up current files to $BACKUP_DIR ..."
 for f in "${DEPLOY_FILES[@]}"; do

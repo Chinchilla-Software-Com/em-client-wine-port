@@ -229,7 +229,7 @@ but don't rely on that alone).
   Independent of the DLL-patch pipeline (runs regardless of which stages applied this time), same
   as v10. Verified live: fonts land in the bottle's `windows/Fonts`, registry SystemLink entries
   read back correctly, `--no-fonts` skips cleanly on a re-run.
-- **Status:** three DLL fixes so far, plus fonts, plus an install-time OS-dependency fix.
+- **Status:** four DLL fixes so far, plus fonts, plus an install-time OS-dependency fix.
   - `release/11.0.196-1` — a startup crash (PBKDF2 key derivation broken under Wine's
     `bcrypt.dll`, blocking `InitOnBackground` before the main window ever appears). Full
     root-cause and fix details: `reports/emclient11-pbkdf2-startup-crash-findings.md`. Fixed via
@@ -269,7 +269,19 @@ but don't rely on that alone).
     story, including a dead-end tried first (a forwarder-only `icuuc.dll` found online that
     pointed at Windows' own built-in `icu.dll`, which Wine also doesn't have): see
     `reports/emclient11-icu-spellcheck-crash-findings.md`. Confirmed working live.
-  All three DLL-patch flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every
+  - `release/11.0.196-4` — severe, recurring multi-minute freezes during Exchange sync (Stage 4),
+    the **exact same bug and same fix** as the already-fixed v10 issue (Stage 15,
+    `reports/exchange-sync-freeze-findings.md`) — confirmed via decompile diff before porting
+    anything: `AccountManager.SendAndReceiveAll` and `Folder.Synchronize(bool,bool)` are
+    byte-for-byte structurally identical between the two eM Client versions, still fully
+    synchronous, still reachable from the UI thread. Both `--patch-account-manager-sync-async`
+    and `--patch-folder-sync-async` applied completely **unmodified** — no adaptation needed at
+    all (unlike release-3's two adapted sub-flags). Verified via decompile + `--dump-handlers`,
+    then deployed live to `emClient_11_beta_win_11` (correctly resumed from revision 3 straight
+    to Stage 4, then a second run correctly skipped the whole pipeline at revision 4) — not yet
+    visually/behaviorally confirmed by the user (pending a real Exchange freeze scenario to test
+    against).
+  All four DLL-patch flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every
   v10 patch flag (shared tooling, not duplicated per release line) — only the deploy scripts and
   release folders are kept separate, not the patcher tool itself. Also added (not DLL patches, so
   not part of the `REVISION_LAST_STAGE`/stage-number scheme, same as v10): vendored font
