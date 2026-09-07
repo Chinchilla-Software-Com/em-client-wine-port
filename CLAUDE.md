@@ -269,6 +269,25 @@ but don't rely on that alone).
     story, including a dead-end tried first (a forwarder-only `icuuc.dll` found online that
     pointed at Windows' own built-in `icu.dll`, which Wine also doesn't have): see
     `reports/emclient11-icu-spellcheck-crash-findings.md`. Confirmed working live.
+  - **Startup crash + font fixes** (not a numbered release — install-time only, no
+    `MailClient.Wine.dll` revision bump; full story:
+    `reports/emclient11-startup-stack-overflow-findings.md`). Three separate confirmed root
+    causes, all fixed and all provisioned in `install-msix.sh` (not `deploy.sh` — none of these
+    touch a `MailClient*.dll` assembly): (1) a Wine WinRT stub (`IUISettings2
+    ::get_TextScaleFactor`) causing Chromium-side unbounded retry recursion — worked around via a
+    `windows.ui` DLL override; (2) a second, unrelated `libcef.dll`-internal recursion triggered
+    by a missing sans-serif fallback font — worked around by generating a `sans.ttf` (see
+    `make-sans-fallback-font.py`) from whatever real font the bottle already has and registering
+    it as Chromium's `"sans"` fallback; (3) the message preview-pane header rendering in the
+    wrong font (Tahoma instead of Segoe UI) — root-caused via decompile to
+    `SystemFonts.MessageBoxFont` (which eM Client's own `FontManager.UIFont` uses) reading a
+    missing `HKCU\Control Panel\Desktop\WindowMetrics\MessageFont` binary `LOGFONTW` registry
+    value; fixed by writing a correct 92-byte LOGFONT blob for Segoe UI 9pt. Also installs Aptos
+    and Roboto (both real, separate missing-font gaps found along the way in the Chromium/
+    DirectWrite HTML-body rendering path, confirmed via trace, kept even though neither was the
+    actual cause of (3) — see the report's "Bug C" section for the full account of several wrong
+    turns before finding the real fix). All three fixes plus both extra font families confirmed
+    working live and visually confirmed by the user.
   - `release/11.0.196-4` — severe, recurring multi-minute freezes during Exchange sync (Stage 4),
     the **exact same bug and same fix** as the already-fixed v10 issue (Stage 15,
     `reports/exchange-sync-freeze-findings.md`) — confirmed via decompile diff before porting
