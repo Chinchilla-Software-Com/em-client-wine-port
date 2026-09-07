@@ -286,6 +286,40 @@ but don't rely on that alone).
   release folders are kept separate, not the patcher tool itself. Also added (not DLL patches, so
   not part of the `REVISION_LAST_STAGE`/stage-number scheme, same as v10): vendored font
   installation (`--install-fonts`/`--no-fonts`, described above) and the ICU fix above.
+  - **PARTIALLY fixed, two root causes found and fixed at the DNS/socket level; a third,
+    different CPU-bound mechanism found and NOT fixed** — a separate freeze affecting Microsoft
+    365 / Graph API accounts specifically (not classic IMAP/EWS, so unrelated to release-4's fix
+    above despite the similar symptom). Root cause #1: the same underlying Wine `GetAddrInfoExW`
+    defect as the original Exchange-sync bug, hit via the Graph SDK's `HttpClient` DNS
+    resolution — fixed by a custom `SocketsHttpHandler.ConnectCallback`
+    (`il-patches/MailClient.Wine/DnsConnectHelper.cs`) wired into the *shared*
+    `InteractionController.CreateHttpClient` factory every protocol uses, resolving hosts via
+    the older synchronous `Dns.GetHostAddresses` instead of the broken async path. Root cause
+    #2, found once #1 was fixed: the same class of Wine defect extends past DNS to socket
+    send/receive itself — fixed by `TimeoutBoundedNetworkStream` (same file), which routes all
+    stream I/O through genuinely synchronous `Socket.Receive`/`Send` bounded by
+    `SO_RCVTIMEO`/`SO_SNDTIMEO` (30s) instead of .NET's async socket path. Both verified live:
+    DNS+connect dropped from ~46s hangs to 40-120ms; a real ~30s stall was captured with the
+    timeout firing correctly and the UI heartbeat never stopping. Also fixed in the same session:
+    OAuth2 token refresh (`Credentials.GetAccessTokenRefreshResponse`) had zero retry for a
+    network failure — added `TokenRefreshRetryHelper` (same directory). None of these three
+    fixes are merged into the tracked `il-patcher`/`deploy.sh` pipeline yet — they're real,
+    tracked C# source in `il-patches/MailClient.Wine/` plus a scratch, untracked `il-patcher`
+    fork with the IL patches that wire them in.
+    Root cause #3 (NOT fixed): under heavy load ("sync all folders for offline use" across all
+    accounts), a per-account sync worker thread was captured genuinely CPU-bound (not blocked)
+    at ~70% CPU with a real, actively-executing, recursive-looking 32-frame managed call stack,
+    sustained for over a minute — a different mechanism entirely (CPU starvation of the UI
+    thread, not an I/O hang). A concurrency-limiting mitigation
+    (`il-patches/MailClient.Wine/AccountConcurrencyGate.cs`, gating `Command.Process()`) was
+    tried at several limits and reverted: `limit=1` caused a ~10-hour deadlock (something has one
+    `Command` waiting on another, so a single global permit can't work), `limit=2` avoided
+    deadlock but still had multi-minute freezes under heavy load, `limit=4` was worse than `2`.
+    No value tried has fixed this third mechanism, only changed how it fails. Full writeup of
+    everything (every fix, every dead end, every measurement, the concurrency-gate results, and
+    the tooling built/fixed along the way — an automatic freeze-context capture, two
+    process-architecture discoveries, a `runner-panic` bug found), NOT merged into any tracked
+    file: `reports/emclient11-msgraph-sync-freeze-findings.md`.
 
 git is available in this environment (it wasn't in earlier sessions — if CLAUDE.md you're
 reading elsewhere says otherwise, this note supersedes it). Local commit identity for this repo
@@ -860,6 +894,72 @@ session, all worth guarding against explicitly next time:
     removes the ordering dependency entirely rather than trying to control or predict iteration
     order. Worth checking any EXISTING multi-file patch for this same shape if it's ever extended
     to touch a third file.
+18. **A single instruction can simultaneously be a branch target AND an exception handler's own
+    `TryEnd`/`HandlerEnd`/`TryStart`/`HandlerStart` boundary marker — both need retargeting,
+    independently, when inserting before it.** Lesson 2 already covers retargeting branches that
+    point at a chosen anchor; lesson 3 already covers not extending a handler's range by
+    inserting before its `HandlerEnd`. What's easy to miss is that **the exact same anchor
+    instruction can be both at once** — a `leave` exiting a `try` block on its normal path often
+    targets the instruction immediately after an enclosing `finally`'s `endfinally`, which is
+    *also* that `finally` handler's own `HandlerEnd` (an exclusive boundary reference, per
+    lesson 3). Fixing only the branch (retargeting the `leave` to the new first inserted
+    instruction, per lesson 2) without ALSO checking `body.ExceptionHandlers` for any
+    `TryStart`/`TryEnd`/`HandlerStart`/`HandlerEnd` equal to that same original anchor silently
+    grows the handler's range to swallow the newly inserted code anyway — decompiled as
+    `ilspycmd` control-flow-resolution errors ("Could not find block for branch target",
+    "Discarded unreachable code") rather than garbled-but-parseable C#, since a `leave` landing
+    inside what's now considered "the handler's own body" violates a CLR structural invariant
+    the decompiler's CFG builder can't route around. `--dump-handlers` reported this as
+    correctly nested (the handler's range legitimately grew, it didn't overlap a sibling) — this
+    class of bug doesn't fail that check, only a decompile attempt surfaces it. Fix: after
+    retargeting any branches pointing at the original anchor, ALSO loop over
+    `body.ExceptionHandlers` checking all four boundary fields by reference equality against
+    that same anchor and reassign any match to the new first inserted instruction (hit for real,
+    scratch `--patch-diag-taskqueue`, instrumenting `TaskQueue`'s dequeue loop in
+    `MailClient.Accounts.dll` — see
+    `reports/emclient11-msgraph-sync-freeze-findings.md`).
+19. **A static helper added to a GENERIC type must be referenced, from within that same type's
+    own generic methods, through the type's OWN generic parameters as the instantiation — never
+    the bare open generic type definition.** Adding `__safeAppendDiagLog4(string)` directly to
+    `MSGraphItemSynchronizer<TItem,TStorageItem,TGraphItem>` and calling it via a plain
+    `MethodReference` whose `DeclaringType` was that open generic type definition (the same
+    style of reference used for every non-generic patch in this file) decompiled cleanly and
+    built without error, but threw `System.InvalidOperationException: Could not execute the
+    method because either the method itself or the containing type is not fully instantiated`
+    the instant the instrumented generic method (`IterateDeltaPages<TDeltaResponse>`) actually
+    ran — caught live via the app's own exception-reporting UI, not by any static check
+    (`--dump-handlers` and a clean decompile both passed; this is a runtime-only generics
+    validity rule, invisible to both). Worse than a silent corruption: the exception aborted the
+    instrumented method immediately, before the real work after the log call ever ran — so the
+    diagnostic didn't just fail to collect data, it silently disabled the very code path under
+    investigation, which could easily be mistaken for "the freeze is fixed" if the resulting
+    lack of a freeze isn't traced back to the broken instrumentation first. Fix: build a
+    `GenericInstanceType` of the target generic type, instantiated with that same type's own
+    `GenericParameters` as the arguments (`new GenericInstanceType(targetType)` +
+    `GenericArguments.Add(gp)` for each of `targetType.GenericParameters`), then construct the
+    call's `MethodReference` against THAT instantiation rather than `targetType` directly — the
+    same construction a C# compiler emits automatically for a static call from inside a generic
+    class to a sibling static member of that same class. Applies to any future patch adding a
+    new static (or instance) member to a generic type and calling it from that type's own
+    generic-parameter-bearing methods (`--patch-diag-deltasync`, instrumenting
+    `MSGraphItemSynchronizer<TItem,TStorageItem,TGraphItem>.IterateDeltaPages` in
+    `MailClient.Protocols.MSGraph.dll` — see
+    `reports/emclient11-msgraph-sync-freeze-findings.md`).
+20. **A `public` method on an `internal` type is still only as accessible as the type itself from
+    outside the assembly.** Adding a new helper type to a sibling assembly (following this
+    project's usual "smallest necessary visibility" instinct, e.g. `internal static class
+    DnsConnectHelper`) and calling one of its `public` methods from a DIFFERENT assembly
+    decompiled clean and built without error, but crashed on the very first launch with
+    `System.MethodAccessException: Attempt by method '...' to access method '...' failed` the
+    instant the caller actually invoked it — the same "decompiling clean is not sufficient proof"
+    shape as lessons 3 and 19, a new trigger for it. The CLR's JIT-time accessibility check looks
+    at BOTH the member's own accessibility AND its declaring type's, and a caller in another
+    assembly fails the type-level check regardless of the member being `public`. Fix: any new
+    type in a sibling assembly that will be called from elsewhere must itself be `public`, not
+    just its individual members — internal member visibility WITHIN that type (e.g. a private
+    implementation-detail class it uses internally, like `DnsConnectHelper`'s own `DnsCache`) is
+    unaffected and can stay as restrictive as actually needed
+    (`--patch-http-dns-connect-callback`, see `reports/emclient11-msgraph-sync-freeze-findings.md`).
 
 **A new `--dump-il <dll> <type> <method>` utility mode** (same rationale as `--dump-handlers`)
 prints a method's real instruction stream with offsets — use it before writing any patch that

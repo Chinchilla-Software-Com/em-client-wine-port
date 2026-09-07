@@ -23,6 +23,19 @@
 #   ./deploy.sh --list              list found bottles and their installed versions, then exit
 #   ./deploy.sh -y|--yes            don't prompt on a version mismatch, continue automatically
 #   ./deploy.sh --force             skip the "already at this revision" short-circuit
+#   ./deploy.sh --max-revision N    cap the deploy at revision N (e.g. 3 applies Stages 1-3 only,
+#                                   never Stage 4+) instead of this script's own latest
+#                                   (OUR_RELEASE_NUMBER). Useful for reverting a bottle to an
+#                                   earlier, known-good revision (restore the bottle's files from
+#                                   original/em-<version>/ first, THEN run with --max-revision --
+#                                   this flag alone does not undo anything already installed) or
+#                                   for bisecting which stage introduced a regression. The
+#                                   MailClient.Wine.dll marker this run writes reflects the
+#                                   CAPPED revision, not this script's latest, so a later plain
+#                                   `./deploy.sh` run correctly resumes from Stage N+1 instead of
+#                                   thinking it has nothing to do. Must be <= this script's own
+#                                   latest revision (see REVISION_LAST_STAGE below) -- requesting
+#                                   a revision this script doesn't know how to build is an error.
 #   ./deploy.sh --install-fonts     install the vendored fonts/ without the license-consent prompt
 #   ./deploy.sh --no-fonts          skip font installation without the license-consent prompt
 #
@@ -77,9 +90,10 @@ LIST_ONLY=0
 FORCE=0
 INSTALL_FONTS=0
 NO_FONTS=0
+MAX_REVISION=""
 
 print_help() {
-    sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,56p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -88,12 +102,26 @@ while [[ $# -gt 0 ]]; do
         -y|--yes) ASSUME_YES=1; shift ;;
         --list) LIST_ONLY=1; shift ;;
         --force) FORCE=1; shift ;;
+        --max-revision) MAX_REVISION="${2:-}"; shift 2 ;;
         --install-fonts) INSTALL_FONTS=1; shift ;;
         --no-fonts) NO_FONTS=1; shift ;;
         -h|--help) print_help; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
+
+# EFFECTIVE_TARGET_REVISION: what this run should end up at -- either this script's own latest
+# (OUR_RELEASE_NUMBER) or, if --max-revision was given, that lower cap. Computed here (right
+# after arg parsing) rather than inline at each use site, since it needs validating exactly once
+# regardless of how many places below read it.
+if [[ -n "$MAX_REVISION" ]]; then
+    [[ "$MAX_REVISION" =~ ^[0-9]+$ ]] || die "--max-revision must be a non-negative integer, got: $MAX_REVISION"
+    [[ -n "${REVISION_LAST_STAGE[$MAX_REVISION]+x}" ]] || die "--max-revision $MAX_REVISION is not a revision this script knows how to build (valid: ${!REVISION_LAST_STAGE[*]})"
+    EFFECTIVE_TARGET_REVISION="$MAX_REVISION"
+else
+    EFFECTIVE_TARGET_REVISION="$OUR_RELEASE_NUMBER"
+fi
+EFFECTIVE_LAST_STAGE="${REVISION_LAST_STAGE[$EFFECTIVE_TARGET_REVISION]}"
 
 # ---------------------------------------------------------------------------
 # dotnet check
@@ -283,11 +311,11 @@ fi
 
 DLL_ALREADY_PATCHED=0
 START_STAGE=1
-if [[ $FORCE -eq 0 && "$CURRENT_REVISION" -ge "$OUR_RELEASE_NUMBER" ]]; then
+if [[ $FORCE -eq 0 && "$CURRENT_REVISION" -ge "$EFFECTIVE_TARGET_REVISION" ]]; then
     DLL_ALREADY_PATCHED=1
-    log "already at release $RELEASE_VERSION-$CURRENT_REVISION (this script is release"
-    log "$RELEASE_VERSION-$OUR_RELEASE_NUMBER) -- skipping the DLL patch pipeline (pass --force to"
-    log "attempt patching anyway)."
+    log "already at release $RELEASE_VERSION-$CURRENT_REVISION (this run targets"
+    log "$RELEASE_VERSION-$EFFECTIVE_TARGET_REVISION) -- skipping the DLL patch pipeline (pass"
+    log "--force to attempt patching anyway)."
 elif [[ "$CURRENT_REVISION" -gt 0 && $FORCE -eq 0 ]]; then
     START_STAGE=$(( ${REVISION_LAST_STAGE[$CURRENT_REVISION]} + 1 ))
     log "install is at release $RELEASE_VERSION-$CURRENT_REVISION -- resuming from Stage $START_STAGE"
@@ -411,22 +439,26 @@ log "ilspycmd ready: $ILSPY"
 # Build MailClient.Wine.dll -- the version marker (same tracked source as the 10.4.5674
 # pipeline, il-patches/MailClient.Wine/VersionMarker.cs -- see its own doc comment). Built here
 # with THIS release line's own version numbers: AssemblyVersion is this eM Client build's
-# FileVersion (11.0.196.0), FileVersion's leading three components match that with the 4th
-# being OUR_RELEASE_NUMBER (11.0.196.1 for this release) -- the exact same scheme the 10.4.5674
-# pipeline uses, just against a different base version, so the same revision-detection logic
-# above (and in any future Stage 2+ this version gets) keeps working unchanged.
+# FileVersion (11.0.196.0), FileVersion's leading three components match that with the 4th being
+# EFFECTIVE_TARGET_REVISION (normally OUR_RELEASE_NUMBER, but a lower --max-revision cap if one
+# was given -- the marker must reflect what THIS run actually deploys, not this script's latest,
+# otherwise a later plain `./deploy.sh` run would see the marker at OUR_RELEASE_NUMBER and
+# wrongly skip the pipeline instead of applying the stages this run deliberately capped away) --
+# the exact same scheme the 10.4.5674 pipeline uses, just against a different base version, so
+# the same revision-detection logic above (and in any future Stage 2+ this version gets) keeps
+# working unchanged.
 # ---------------------------------------------------------------------------
 
-log "building MailClient.Wine version marker (release $RELEASE_VERSION-$OUR_RELEASE_NUMBER)..."
+log "building MailClient.Wine version marker (release $RELEASE_VERSION-$EFFECTIVE_TARGET_REVISION)..."
 mkdir -p "$WORKDIR/tools/MailClient.Wine"
 cp "$IL_PATCHES_DIR/MailClient.Wine/MailClient.Wine.csproj" "$IL_PATCHES_DIR/MailClient.Wine/VersionMarker.cs" "$WORKDIR/tools/MailClient.Wine/"
 dotnet build -c Release \
     -p:AssemblyVersion="$EXPECTED_FILE_VERSION" \
-    -p:FileVersion="$RELEASE_VERSION.$OUR_RELEASE_NUMBER" \
+    -p:FileVersion="$RELEASE_VERSION.$EFFECTIVE_TARGET_REVISION" \
     "$WORKDIR/tools/MailClient.Wine" >"$WORKDIR/build-mailclient-wine.log" 2>&1 \
     || { cat "$WORKDIR/build-mailclient-wine.log" >&2; die "failed to build MailClient.Wine marker (log above)"; }
 MAILCLIENT_WINE_DLL="$WORKDIR/tools/MailClient.Wine/bin/Release/net8.0/MailClient.Wine.dll"
-log "MailClient.Wine marker built ($RELEASE_VERSION.$OUR_RELEASE_NUMBER)."
+log "MailClient.Wine marker built ($RELEASE_VERSION.$EFFECTIVE_TARGET_REVISION)."
 
 # ---------------------------------------------------------------------------
 # Stage 1: PBKDF2 startup crash fix (see reports/emclient11-pbkdf2-startup-crash-findings.md).
@@ -447,17 +479,23 @@ log "MailClient.Wine marker built ($RELEASE_VERSION.$OUR_RELEASE_NUMBER)."
 # or fewer -- the tool fails loudly if it finds zero, but doesn't hardcode an exact count.
 # ---------------------------------------------------------------------------
 
-if [[ $START_STAGE -le 1 ]]; then
+if [[ $START_STAGE -le 1 && $EFFECTIVE_LAST_STAGE -ge 1 ]]; then
     log "Stage 1: PBKDF2 startup crash fix (bcrypt-backed static Pbkdf2 -> working instance API)..."
     $ILP --patch-pbkdf2-instance-api "$WORKDIR/original" "$WORKDIR/output-stage1"
     STAGE1_DIR="$WORKDIR/output-stage1"
-else
+elif [[ $START_STAGE -gt 1 ]]; then
     # Resuming past Stage 1: already baked into what's actually installed ($WORKDIR/original is
     # already a full, complete copy of it) -- re-running would be redundant (and, unlike Stage 1
     # of the 10.4.5674 pipeline, this patch has no "expected pristine, found already-patched"
     # guard of its own, so a re-run wouldn't even fail loudly -- skipping outright is the safe
     # choice, same reasoning as the sibling script's own post-hoc stage guards).
     log "Stage 1 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+    STAGE1_DIR="$WORKDIR/original"
+else
+    # EFFECTIVE_LAST_STAGE < 1: --max-revision capped this run below Stage 1 (i.e. revision 0 --
+    # deliberately deploying nothing). Nothing to carry forward from (Stage 1 is the first),
+    # so this is the one case where "capped" and "not yet started" coincide with plain original.
+    log "Stage 1 skipped -- --max-revision caps this deploy at revision $EFFECTIVE_TARGET_REVISION."
     STAGE1_DIR="$WORKDIR/original"
 fi
 
@@ -477,13 +515,16 @@ fi
 # C2 A0 C2 A0 (two non-breaking spaces) afterward.
 # ---------------------------------------------------------------------------
 
-if [[ $START_STAGE -le 2 ]]; then
+if [[ $START_STAGE -le 2 && $EFFECTIVE_LAST_STAGE -ge 2 ]]; then
     log "Stage 2: splash-screen tip label icon fix (same tofu-box bug/fix as the 10.4.5674 pipeline)..."
     $ILP --patch-splash-tip-icon "$STAGE1_DIR" "$WORKDIR/output-stage2"
     STAGE2_DIR="$WORKDIR/output-stage2"
-else
+elif [[ $START_STAGE -gt 2 ]]; then
     log "Stage 2 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
     STAGE2_DIR="$WORKDIR/original"
+else
+    log "Stage 2 skipped -- --max-revision caps this deploy at revision $EFFECTIVE_TARGET_REVISION."
+    STAGE2_DIR="$STAGE1_DIR"
 fi
 
 # ---------------------------------------------------------------------------
@@ -517,7 +558,7 @@ fi
 # fresh-from-pristine chain re-run).
 # ---------------------------------------------------------------------------
 
-if [[ $START_STAGE -le 3 ]]; then
+if [[ $START_STAGE -le 3 && $EFFECTIVE_LAST_STAGE -ge 3 ]]; then
     log "Stage 3: notification toast empty-until-fade fix (same bug/fix as the 10.4.5674 pipeline's Stages 8-14)..."
     $ILP --patch-notification-click-resubscribe "$STAGE2_DIR" "$WORKDIR/output-stage3a"
     $ILP --patch-notification-content-padding "$WORKDIR/output-stage3a" "$WORKDIR/output-stage3b"
@@ -534,9 +575,12 @@ if [[ $START_STAGE -le 3 ]]; then
     $ILP --patch-notification-hover-forward "$WORKDIR/output-stage3l" "$WORKDIR/output-stage3m"
     $ILP --patch-notification-toolbar-icons "$WORKDIR/output-stage3m" "$WORKDIR/output-final"
     STAGE3_DIR="$WORKDIR/output-final"
-else
+elif [[ $START_STAGE -gt 3 ]]; then
     log "Stage 3 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
     STAGE3_DIR="$WORKDIR/original"
+else
+    log "Stage 3 skipped -- --max-revision caps this deploy at revision $EFFECTIVE_TARGET_REVISION."
+    STAGE3_DIR="$STAGE2_DIR"
 fi
 
 # ---------------------------------------------------------------------------
@@ -556,16 +600,26 @@ fi
 # script's own Stage 15.
 # ---------------------------------------------------------------------------
 
-if [[ $START_STAGE -le 4 ]]; then
+if [[ $START_STAGE -le 4 && $EFFECTIVE_LAST_STAGE -ge 4 ]]; then
     log "Stage 4: Exchange sync-freeze fix (same bug/fix as the 10.4.5674 pipeline's Stage 15)..."
     $ILP --patch-account-manager-sync-async "$STAGE3_DIR" "$WORKDIR/output-stage4a"
     $ILP --patch-folder-sync-async "$WORKDIR/output-stage4a" "$WORKDIR/output-final"
-    cp "$MAILCLIENT_WINE_DLL" "$WORKDIR/output-final/"
     FINAL_DIR="$WORKDIR/output-final"
-else
+elif [[ $START_STAGE -gt 4 ]]; then
     log "Stage 4 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
     FINAL_DIR="$WORKDIR/original"
+else
+    log "Stage 4 skipped -- --max-revision caps this deploy at revision $EFFECTIVE_TARGET_REVISION."
+    FINAL_DIR="$STAGE3_DIR"
 fi
+
+# The version marker is copied in here, unconditionally, regardless of which of the three
+# branches above produced FINAL_DIR -- it must always reflect EFFECTIVE_TARGET_REVISION (the
+# revision THIS run actually deploys), not just whichever stage happened to run last. Safe to
+# always overwrite: reaching this point at all means EFFECTIVE_TARGET_REVISION > CURRENT_REVISION
+# (the DLL_ALREADY_PATCHED short-circuit above already handled the "nothing to do" case), so this
+# is always a forward move to a higher revision than whatever marker (if any) was already there.
+cp "$MAILCLIENT_WINE_DLL" "$FINAL_DIR/"
 
 # ---------------------------------------------------------------------------
 # Verify -- run automatically before anything is deployed.
@@ -593,7 +647,7 @@ $ILP --dump-handlers "$FINAL_DIR/MailClient.Abstractions.dll" 'MailClient.UI.Fil
 # 10.4.5674 pipeline's own Stages 6-7 check) -- checked against STAGE2_DIR specifically, not
 # FINAL_DIR, since Stage 3 (notification chain) is real IL insertion that legitimately grows the
 # file. Only meaningful (and only ran) when Stage 2 actually ran this time.
-if [[ $START_STAGE -le 2 ]]; then
+if [[ $START_STAGE -le 2 && $EFFECTIVE_LAST_STAGE -ge 2 ]]; then
     STAGE1_SIZE=$(stat -c%s "$STAGE1_DIR/MailClient.dll")
     STAGE2_SIZE=$(stat -c%s "$STAGE2_DIR/MailClient.dll")
     [[ "$STAGE1_SIZE" -eq "$STAGE2_SIZE" ]] \
@@ -606,7 +660,7 @@ fi
 
 # Stage 3 verification -- mirrors the 10.4.5674 pipeline's own equivalent checks (see its Stages
 # 8-14 verification block), only meaningful (and only ran) when Stage 3 actually ran this time.
-if [[ $START_STAGE -le 3 ]]; then
+if [[ $START_STAGE -le 3 && $EFFECTIVE_LAST_STAGE -ge 3 ]]; then
     $ILSPY -t "MailClient.UI.Forms.NotificationForms.FormGenericNotification" "$FINAL_DIR/MailClient.dll" | grep -q "__drawNotificationTextIntoBitmap" \
         || die "verification failed: __drawNotificationTextIntoBitmap not found -- notification text-in-bitmap fix missing"
 
@@ -631,7 +685,7 @@ fi
 
 # Stage 4 verification -- mirrors the 10.4.5674 pipeline's own equivalent checks (see its Stage
 # 15 verification block), only meaningful (and only ran) when Stage 4 actually ran this time.
-if [[ $START_STAGE -le 4 ]]; then
+if [[ $START_STAGE -le 4 && $EFFECTIVE_LAST_STAGE -ge 4 ]]; then
     $ILSPY -t "MailClient.Accounts.AccountManager" "$FINAL_DIR/MailClient.Accounts.dll" | grep -q "__RunSendAndReceiveAllCore" \
         || die "verification failed: AccountManager.__RunSendAndReceiveAllCore not found -- sync freeze fix missing"
 
@@ -699,9 +753,10 @@ for f in "${DEPLOY_FILES[@]}"; do
 done
 
 log "deploy complete."
-log "  bottle:  $BOTTLE_NAME"
-log "  version: $FOUND_FILE_VERSION"
-log "  backup:  $BACKUP_DIR"
+log "  bottle:   $BOTTLE_NAME"
+log "  version:  $FOUND_FILE_VERSION"
+log "  revision: $RELEASE_VERSION-$EFFECTIVE_TARGET_REVISION"
+log "  backup:   $BACKUP_DIR"
 
 fi  # DLL_ALREADY_PATCHED
 

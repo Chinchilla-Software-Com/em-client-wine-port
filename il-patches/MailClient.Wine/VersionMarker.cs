@@ -1,10 +1,16 @@
-// MailClient.Wine.dll -- not loaded by eM Client, not referenced in MailClient.deps.json, has
-// no code that does anything. Its sole purpose is to exist as a small file dropped alongside
-// the real assemblies in the eM Client install directory, carrying this project's own patch
-// version in its standard .NET/Win32 version fields, so releases/<version>/deploy.sh can tell
-// which of *our* releases (if any) is currently applied to a given install -- something the
-// license-fix marker (MailClient.Licensing.BouncyCastlePatch.dll) alone can't do, since it only
-// answers "is Stage 5 applied", not "which release introduced the assemblies currently here".
+// MailClient.Wine.dll -- originally not loaded by eM Client at all, just a small file dropped
+// alongside the real assemblies carrying this project's own patch version in its standard
+// .NET/Win32 version fields, so releases/<version>/deploy.sh can tell which of *our* releases
+// (if any) is currently applied to a given install -- something the license-fix marker
+// (MailClient.Licensing.BouncyCastlePatch.dll) alone can't do, since it only answers "is Stage 5
+// applied", not "which release introduced the assemblies currently here". VersionMarker itself
+// (this type) is still never loaded or referenced by anything -- it exists purely so the
+// assembly's version fields mean something when deploy.sh reads them. As of the eM Client
+// 11.0.196-beta line's Wine-DNS-hang fix, this assembly ALSO carries real, loaded, referenced
+// code (see DnsConnectHelper.cs) -- deploy.sh's "which release is this" check still works
+// identically (it only ever reads THIS type's containing assembly's version fields, unaffected
+// by what else lives in the assembly), but "not loaded by eM Client" no longer describes the
+// assembly as a whole, only this one marker type within it.
 //
 // Two version fields are used, both plain numeric (no semver suffix -- AssemblyVersion in
 // particular can't carry one):

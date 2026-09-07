@@ -9,22 +9,29 @@ treatment as MailClient.Licensing.BouncyCastlePatch did -- genericized rather th
 file a second time. Name/version default to the original BouncyCastlePatch case so existing callers
 (deploy.sh) don't need updating.
 
-Usage: patch-deps-json.py <path-to-MailClient.deps.json> [assembly-name] [version]
+Usage: patch-deps-json.py <path-to-MailClient.deps.json> [assembly-name] [version] [target-key]
 Idempotent: safe to run again on an already-patched file (checks before adding).
+
+target-key defaults to the 10.4.5674 (net8.0) pipeline's own target framework moniker/RID pair --
+the eM Client 11.0.196-beta pipeline (net10.0) needs ".NETCoreApp,Version=v10.0/win-x86" passed
+explicitly (confirmed against a live MailClient.deps.json: it lists both
+".NETCoreApp,Version=v10.0" and ".NETCoreApp,Version=v10.0/win-x86" as top-level target keys --
+the RID-qualified one is the one carrying the actual per-library "dependencies"/"runtime" entries
+this script edits, same shape as v10's own win-x86-qualified key).
 """
 import json
 import sys
 
 NAME = sys.argv[2] if len(sys.argv) > 2 else "MailClient.Licensing.BouncyCastlePatch"
 VERSION = sys.argv[3] if len(sys.argv) > 3 else "1.0.0"
+TARGET_KEY = sys.argv[4] if len(sys.argv) > 4 else ".NETCoreApp,Version=v8.0/win-x86"
 KEY = f"{NAME}/{VERSION}"
 
 path = sys.argv[1]
 with open(path) as f:
     d = json.load(f)
 
-tkey = ".NETCoreApp,Version=v8.0/win-x86"
-targets = d["targets"][tkey]
+targets = d["targets"][TARGET_KEY]
 root_key = next(k for k in targets if k.startswith("MailClient/"))
 
 changed = False
