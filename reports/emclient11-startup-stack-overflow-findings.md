@@ -549,7 +549,7 @@ avoidable detour (checking Roboto, another real-but-irrelevant missing font foun
 Chromium/DirectWrite trace) before the actual scope error was caught: **every screenshot the user
 had sent, throughout this entire font investigation, was cropped to the message *header* area**
 (sender name, "to" recipient, reply-timestamp line) — never the email's own HTML body
-paragraph. Aptos and Roboto both affect the Chromium-rendered HTML *body* — a completely
+paragraph (the greeting line addressed to the recipient by name). Aptos and Roboto both affect the Chromium-rendered HTML *body* — a completely
 different rendering subsystem from the header, which is classic native WinForms UI text, drawn
 via GDI, not DirectWrite/Chromium at all. All of the Aptos/Roboto tracing (`+dwrite`) was
 therefore examining the wrong subsystem for what the user was actually looking at — a scope
