@@ -158,7 +158,11 @@ but don't rely on that alone).
 - **`original/em-11.0.196/`** — the pristine reference snapshot for this exact build
   (`MailClient.dll` FileVersion `11.0.196.0`, InformationalVersion
   `11.0.196-beta+b945a075a5`), same `original/em-<version>/` naming convention as v10's own
-  `original/em-10.4.5674/` (see the naming-convention note above). `original/v1/` also exists in
+  `original/em-10.4.5674/` (see the naming-convention note above). `original/em-11.0.282/`
+  (FileVersion `11.0.282.0`, InformationalVersion `11.0.282-beta+ff9ca141f2`) is the equivalent
+  snapshot for the newer build now also supported by `releases/11.0.196-beta/deploy.sh` (see that
+  script's own bullet below) — both snapshots are kept side by side specifically so future
+  eM Client updates can be decompile-diffed against either. `original/v1/` also exists in
   this repo and is **not** related to eM Client 11 despite the name — it's an old, differently-
   named snapshot of eM Client 10.4.5674, a leftover from before the current convention was
   adopted; ignore it.
@@ -229,6 +233,34 @@ but don't rely on that alone).
   Independent of the DLL-patch pipeline (runs regardless of which stages applied this time), same
   as v10. Verified live: fonts land in the bottle's `windows/Fonts`, registry SystemLink entries
   read back correctly, `--no-fonts` skips cleanly on a re-run.
+  **Now supports multiple eM Client builds** (`11.0.196` and `11.0.282` so far) from this SAME
+  script — a deliberate exception to the general "copy the whole `releases/<version>/` folder to
+  a new one" convention stated above: when eM Client updated to `11.0.282`, a full decompile-diff
+  plus a dry run of every stage against a fresh `11.0.282` install confirmed the patch content is
+  completely unaffected (every touched type/method — `AccountManager`, `MailClient.Storage
+  .Application.Folder`, `FormMailNotification`, `ControlToolStripButton`, the PBKDF2 call-site
+  count, the splash-tip resource bytes — decompiles byte-for-byte identical to `11.0.196`; only
+  `LayeredForm` differs at all, losing one unused convenience overload unrelated to the patched
+  `WndProc`). Since nothing needed adapting, forking into a second folder would have been pure
+  duplication — added `11.0.282` to this script's own `SUPPORTED_EMCLIENT_VERSIONS`-equivalent
+  map instead. See `reports/emclient11-startup-stack-overflow-findings.md` for the verification
+  details. If a future eM Client build ever DOES need different patch logic, that's the signal to
+  go back to forking a new `releases/<version>/` folder — this shared-script approach only holds
+  as long as the patch content stays identical across versions.
+  This introduced a real split worth understanding before touching the script again:
+  `OUR_RELEASE_NUMBER_FOR_VERSION` (an associative array, e.g. `["11.0.196"]=4 ["11.0.282"]=1`)
+  is a PER-VERSION release-tag number, used only for `release/<version>-<N>` git tags and
+  human-facing log messages — `11.0.282` starts its own count at 1 even though the pipeline
+  itself is already at stage 4, because it's the first tagged release for that specific eM
+  Client build, not because fewer stages apply to it. `PIPELINE_LATEST_STAGE` (a plain constant,
+  currently `4`) is the SEPARATE, version-agnostic axis that actually controls how many patch
+  stages get built and what the on-bottle `MailClient.Wine.dll` marker's own revision number
+  means (shared across every supported version, since the patch content doesn't vary by
+  version). Conflating these two would be a real bug, not just a naming nitpick: if the
+  per-version release number were used to decide how many stages to apply, a fresh `11.0.282`
+  deploy would stop after Stage 1 only (`OUR_RELEASE_NUMBER_FOR_VERSION["11.0.282"]` = 1) instead
+  of all four. Add a new eM Client build to `OUR_RELEASE_NUMBER_FOR_VERSION` only after doing the
+  same decompile-diff-plus-dry-run verification described above — never on faith.
 - **Status:** four DLL fixes so far, plus fonts, plus an install-time OS-dependency fix.
   - `release/11.0.196-1` — a startup crash (PBKDF2 key derivation broken under Wine's
     `bcrypt.dll`, blocking `InitOnBackground` before the main window ever appears). Full
@@ -300,6 +332,10 @@ but don't rely on that alone).
     to Stage 4, then a second run correctly skipped the whole pipeline at revision 4) — not yet
     visually/behaviorally confirmed by the user (pending a real Exchange freeze scenario to test
     against).
+  - `release/11.0.282-1` — first tagged release confirming this same `deploy.sh` (all four
+    stages, unmodified) also works against eM Client build `11.0.282` — see this file's own
+    `deploy.sh` bullet above for the verification method and the per-version release-number
+    split this introduced. Tested and confirmed working by the user on a separate machine.
   All four DLL-patch flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every
   v10 patch flag (shared tooling, not duplicated per release line) — only the deploy scripts and
   release folders are kept separate, not the patcher tool itself. Also added (not DLL patches, so

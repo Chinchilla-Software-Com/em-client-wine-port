@@ -3,19 +3,25 @@
 # bottle. See ../../CLAUDE.md for the project overview and ../10.4.5674/deploy.sh for the more
 # mature sibling pipeline this one deliberately does NOT share code with -- eM Client 11 is a
 # genuinely different, still-beta product build (different assembly set, different bugs), and
-# this script's own version gate (see EXPECTED_FILE_VERSION below) keeps the two pipelines from
-# ever being run against the wrong bottle by accident.
+# this script's own version gate (see SUPPORTED_EMCLIENT_VERSIONS below) keeps the two pipelines
+# from ever being run against the wrong bottle by accident.
 #
 # Always regenerates the patch fresh from whatever assemblies are actually installed --
 # deliberately never copies pre-built DLLs out of this repo (see the sibling script's own header
 # comment for why: an update-prone app makes a stale pre-built copy actively dangerous). Nothing
 # is deployed until every stage AND every verification check below succeeds.
 #
-# This script is versioned per eM Client release: it lives at releases/<version>/deploy.sh and
-# is built and tested against that exact version (see EXPECTED_FILE_VERSION below). When this
-# beta updates to a new build, don't edit this file in place -- copy this whole
-# releases/<version>/ folder to a new releases/<new-version>/, retest by hand (same process as
-# CLAUDE.md's "Investigation method"), and adjust whatever patch logic broke.
+# This script is versioned per eM Client release LINE (not per exact build): it lives at
+# releases/<version>/deploy.sh and is built and tested against the eM Client build(s) listed in
+# SUPPORTED_EMCLIENT_VERSIONS below. Unlike the general "copy the whole releases/<version>/
+# folder to a new one" convention (still the right move whenever a new build's patches need real
+# adaptation), 11.0.282 was added to this SAME script instead: a full decompile-diff plus a dry
+# run of every stage against a fresh 11.0.282 install confirmed the patch content is completely
+# unaffected (every touched type/method decompiles byte-for-byte identical to 11.0.196) -- see
+# reports/emclient11-startup-stack-overflow-findings.md's own version-compat note and CLAUDE.md's
+# eM Client 11 section. Add a new eM Client build to SUPPORTED_EMCLIENT_VERSIONS the same way
+# only after doing that same verification; if a future build actually needs different patch
+# logic, that's when a real fork into a new releases/<version>/ becomes the right move again.
 #
 # Usage:
 #   ./deploy.sh                     interactive: lists bottles found, prompts for choice + confirms
@@ -25,7 +31,7 @@
 #   ./deploy.sh --force             skip the "already at this revision" short-circuit
 #   ./deploy.sh --max-revision N    cap the deploy at revision N (e.g. 3 applies Stages 1-3 only,
 #                                   never Stage 4+) instead of this script's own latest
-#                                   (OUR_RELEASE_NUMBER). Useful for reverting a bottle to an
+#                                   (PIPELINE_LATEST_STAGE). Useful for reverting a bottle to an
 #                                   earlier, known-good revision (restore the bottle's files from
 #                                   original/em-<version>/ first, THEN run with --max-revision --
 #                                   this flag alone does not undo anything already installed) or
@@ -57,17 +63,30 @@
 
 set -euo pipefail
 
-RELEASE_VERSION="11.0.196"
-EXPECTED_FILE_VERSION="11.0.196.0"
+# eM Client FileVersion prefixes (major.minor.build, i.e. FileVersion minus its trailing
+# revision component) this script is confirmed to work against, each mapped to THIS deploy
+# line's own per-version release number (see il-patches/MailClient.Wine/VersionMarker.cs) --
+# used only for the release/<version>-<N> git tag and log/header messages. This is a SEPARATE
+# axis from PIPELINE_LATEST_STAGE below (which controls how many patch stages actually get
+# built and is shared across every version here, since the patch content itself doesn't vary by
+# version -- see the header comment's note on how 11.0.282 was verified): 11.0.282 starts its
+# own release-number count at 1 even though the underlying pipeline is already at stage 4,
+# because it's the first tagged release for that specific eM Client build, not because fewer
+# stages apply to it. Add a new entry the first time a new eM Client build is confirmed working
+# (after doing that same verification -- don't just add a version number here on faith); bump an
+# existing entry's number when you tag a new release against a version that was already
+# supported.
+declare -A OUR_RELEASE_NUMBER_FOR_VERSION=( ["11.0.196"]=4 ["11.0.282"]=1 )
 
-# This project's own release number against RELEASE_VERSION (see
-# il-patches/MailClient.Wine/VersionMarker.cs) -- bump this, and add a row to
-# REVISION_LAST_STAGE below, every time a new release ships against the same eM Client version.
-# Tag as release/<RELEASE_VERSION>-<OUR_RELEASE_NUMBER> (release/11.0.196-4 for this one).
-OUR_RELEASE_NUMBER=4
+# Highest pipeline stage number this script knows how to build -- shared across every supported
+# eM Client version above. This (not OUR_RELEASE_NUMBER_FOR_VERSION) is what controls how far a
+# fresh deploy goes by default, and what the on-bottle MailClient.Wine.dll marker's own revision
+# number means (see REVISION_LAST_STAGE below) -- purely mechanical "how far through the shared
+# pipeline has this bottle progressed" bookkeeping, unrelated to which eM Client build it's on.
+PIPELINE_LATEST_STAGE=4
 
-# release number -> last stage number that release introduced. Same "resume mid-pipeline" logic
-# as the 10.4.5674 script.
+# revision (= pipeline stage count applied so far, NOT a release number) -> last stage number
+# that revision introduced. Same "resume mid-pipeline" logic as the 10.4.5674 script.
 declare -A REVISION_LAST_STAGE=( [0]=0 [1]=1 [2]=2 [3]=3 [4]=4 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -111,15 +130,17 @@ while [[ $# -gt 0 ]]; do
 done
 
 # EFFECTIVE_TARGET_REVISION: what this run should end up at -- either this script's own latest
-# (OUR_RELEASE_NUMBER) or, if --max-revision was given, that lower cap. Computed here (right
-# after arg parsing) rather than inline at each use site, since it needs validating exactly once
-# regardless of how many places below read it.
+# (PIPELINE_LATEST_STAGE, shared across every supported eM Client version) or, if --max-revision
+# was given, that lower cap. Computed here (right after arg parsing, before the installed eM
+# Client version is even known -- deliberately: this is about pipeline stages, not about which
+# version's release-number is being tagged) rather than inline at each use site, since it needs
+# validating exactly once regardless of how many places below read it.
 if [[ -n "$MAX_REVISION" ]]; then
     [[ "$MAX_REVISION" =~ ^[0-9]+$ ]] || die "--max-revision must be a non-negative integer, got: $MAX_REVISION"
     [[ -n "${REVISION_LAST_STAGE[$MAX_REVISION]+x}" ]] || die "--max-revision $MAX_REVISION is not a revision this script knows how to build (valid: ${!REVISION_LAST_STAGE[*]})"
     EFFECTIVE_TARGET_REVISION="$MAX_REVISION"
 else
-    EFFECTIVE_TARGET_REVISION="$OUR_RELEASE_NUMBER"
+    EFFECTIVE_TARGET_REVISION="$PIPELINE_LATEST_STAGE"
 fi
 EFFECTIVE_LAST_STAGE="${REVISION_LAST_STAGE[$EFFECTIVE_TARGET_REVISION]}"
 
@@ -179,7 +200,7 @@ check_dotnet
 # inspected)
 # ---------------------------------------------------------------------------
 
-WORKDIR="$(mktemp -d /tmp/emclient-deploy-${RELEASE_VERSION}-XXXXXX)"
+WORKDIR="$(mktemp -d /tmp/emclient11-deploy-XXXXXX)"
 CLEANUP_ON_EXIT=1
 
 cleanup() {
@@ -285,8 +306,18 @@ FOUND_VERSION_LINE=$($ILP --version "$SELECTED_DLL")
 FOUND_FILE_VERSION=$(echo "$FOUND_VERSION_LINE" | awk -F'\t' '{print $3}' | sed 's/FileVersion=//')
 log "installed MailClient.dll: $FOUND_VERSION_LINE"
 
-if [[ "$FOUND_FILE_VERSION" != "$EXPECTED_FILE_VERSION" ]]; then
-    warn "this release script was built and verified against FileVersion=$EXPECTED_FILE_VERSION,"
+# RELEASE_VERSION is the found FileVersion's major.minor.build prefix (e.g. "11.0.196.0" ->
+# "11.0.196") -- used from here on for every "which eM Client build is this" comparison and
+# message (the on-bottle marker's own version check, the MailClient.Wine.dll AssemblyVersion
+# built further down, etc). OUR_RELEASE_NUMBER is looked up from that prefix, purely for the
+# release/<version>-<N> style messages -- see OUR_RELEASE_NUMBER_FOR_VERSION's own doc comment.
+RELEASE_VERSION="${FOUND_FILE_VERSION%.*}"
+if [[ -n "${OUR_RELEASE_NUMBER_FOR_VERSION[$RELEASE_VERSION]+x}" ]]; then
+    OUR_RELEASE_NUMBER="${OUR_RELEASE_NUMBER_FOR_VERSION[$RELEASE_VERSION]}"
+    log "eM Client $RELEASE_VERSION is a supported build (this deploy line's release $RELEASE_VERSION-$OUR_RELEASE_NUMBER)."
+else
+    OUR_RELEASE_NUMBER="?"
+    warn "this deploy script is verified against: ${!OUR_RELEASE_NUMBER_FOR_VERSION[*]}"
     warn "but the selected install reports FileVersion=$FOUND_FILE_VERSION."
     warn "The patch below finds its target call sites by exact method signature, not by version --"
     warn "it may still apply cleanly, or may fail loudly (and safely -- nothing gets deployed"
@@ -304,10 +335,12 @@ fi
 # ---------------------------------------------------------------------------
 # Revision check -- MailClient.Wine.dll marker, same mechanism (and same tracked source,
 # il-patches/MailClient.Wine/VersionMarker.cs) as the 10.4.5674 pipeline, just built with this
-# release line's own version numbers. No legacy-marker fallback needed here: unlike 10.4.5674,
-# this is the FIRST release for this eM Client version, so there's no pre-marker history to
-# account for -- a bottle with no marker, or a marker for a different eM Client version, is
-# simply revision 0.
+# release line's own version numbers. This revision number is the pipeline stage count (see
+# PIPELINE_LATEST_STAGE above), NOT the per-version OUR_RELEASE_NUMBER looked up above -- a
+# bottle with no marker, or a marker for a different eM Client version (e.g. it was last patched
+# on 11.0.196 and has since been upgraded to 11.0.282 in place), is simply revision 0: the
+# assemblies are different binaries even where the patch content happens to be identical, so a
+# full fresh-patch pass is the safe default rather than assuming stage completion carries over.
 # ---------------------------------------------------------------------------
 
 CURRENT_REVISION=0
@@ -319,7 +352,7 @@ if [[ -f "$MARKER_DLL" ]]; then
     marker_revision="${marker_file_version##*.}"
     if [[ "$marker_emclient_version" == "$RELEASE_VERSION" && "$marker_revision" =~ ^[0-9]+$ ]]; then
         CURRENT_REVISION="$marker_revision"
-        log "found MailClient.Wine.dll: this install is at release $RELEASE_VERSION-$CURRENT_REVISION."
+        log "found MailClient.Wine.dll: this install is at $RELEASE_VERSION revision $CURRENT_REVISION."
     else
         warn "MailClient.Wine.dll present but for a different eM Client version"
         warn "($marker_file_version, expected $RELEASE_VERSION.N) -- ignoring it, treating as revision 0."
@@ -330,12 +363,12 @@ DLL_ALREADY_PATCHED=0
 START_STAGE=1
 if [[ $FORCE -eq 0 && "$CURRENT_REVISION" -ge "$EFFECTIVE_TARGET_REVISION" ]]; then
     DLL_ALREADY_PATCHED=1
-    log "already at release $RELEASE_VERSION-$CURRENT_REVISION (this run targets"
-    log "$RELEASE_VERSION-$EFFECTIVE_TARGET_REVISION) -- skipping the DLL patch pipeline (pass"
+    log "already at $RELEASE_VERSION revision $CURRENT_REVISION (this run targets revision"
+    log "$EFFECTIVE_TARGET_REVISION) -- skipping the DLL patch pipeline (pass"
     log "--force to attempt patching anyway)."
 elif [[ "$CURRENT_REVISION" -gt 0 && $FORCE -eq 0 ]]; then
     START_STAGE=$(( ${REVISION_LAST_STAGE[$CURRENT_REVISION]} + 1 ))
-    log "install is at release $RELEASE_VERSION-$CURRENT_REVISION -- resuming from Stage $START_STAGE"
+    log "install is at $RELEASE_VERSION revision $CURRENT_REVISION -- resuming from Stage $START_STAGE"
     log "(stages 1-$(( START_STAGE - 1 )) already applied, left as-is)."
 fi
 
@@ -455,22 +488,24 @@ log "ilspycmd ready: $ILSPY"
 # ---------------------------------------------------------------------------
 # Build MailClient.Wine.dll -- the version marker (same tracked source as the 10.4.5674
 # pipeline, il-patches/MailClient.Wine/VersionMarker.cs -- see its own doc comment). Built here
-# with THIS release line's own version numbers: AssemblyVersion is this eM Client build's
-# FileVersion (11.0.196.0), FileVersion's leading three components match that with the 4th being
-# EFFECTIVE_TARGET_REVISION (normally OUR_RELEASE_NUMBER, but a lower --max-revision cap if one
-# was given -- the marker must reflect what THIS run actually deploys, not this script's latest,
-# otherwise a later plain `./deploy.sh` run would see the marker at OUR_RELEASE_NUMBER and
-# wrongly skip the pipeline instead of applying the stages this run deliberately capped away) --
-# the exact same scheme the 10.4.5674 pipeline uses, just against a different base version, so
-# the same revision-detection logic above (and in any future Stage 2+ this version gets) keeps
-# working unchanged.
+# with the ACTUALLY DETECTED eM Client build's own version numbers (RELEASE_VERSION, resolved
+# above from the real installed FileVersion, not a hardcoded constant -- this is what lets the
+# same script support multiple eM Client builds): AssemblyVersion is "$RELEASE_VERSION.0",
+# FileVersion's leading three components match that with the 4th being EFFECTIVE_TARGET_REVISION
+# (normally PIPELINE_LATEST_STAGE, but a lower --max-revision cap if one was given -- the marker
+# must reflect what THIS run actually deploys, not this script's latest, otherwise a later plain
+# `./deploy.sh` run would see the marker already at the latest stage and wrongly skip the
+# pipeline instead of applying the stages this run deliberately capped away) -- the exact same
+# scheme the 10.4.5674 pipeline uses, just against a different base version, so the same
+# revision-detection logic above (and in any future Stage 5+ this version gets) keeps working
+# unchanged regardless of which supported eM Client build it's running against.
 # ---------------------------------------------------------------------------
 
-log "building MailClient.Wine version marker (release $RELEASE_VERSION-$EFFECTIVE_TARGET_REVISION)..."
+log "building MailClient.Wine version marker ($RELEASE_VERSION revision $EFFECTIVE_TARGET_REVISION)..."
 mkdir -p "$WORKDIR/tools/MailClient.Wine"
 cp "$IL_PATCHES_DIR/MailClient.Wine/MailClient.Wine.csproj" "$IL_PATCHES_DIR/MailClient.Wine/VersionMarker.cs" "$WORKDIR/tools/MailClient.Wine/"
 dotnet build -c Release \
-    -p:AssemblyVersion="$EXPECTED_FILE_VERSION" \
+    -p:AssemblyVersion="$RELEASE_VERSION.0" \
     -p:FileVersion="$RELEASE_VERSION.$EFFECTIVE_TARGET_REVISION" \
     "$WORKDIR/tools/MailClient.Wine" >"$WORKDIR/build-mailclient-wine.log" 2>&1 \
     || { cat "$WORKDIR/build-mailclient-wine.log" >&2; die "failed to build MailClient.Wine marker (log above)"; }
@@ -771,8 +806,8 @@ done
 
 log "deploy complete."
 log "  bottle:   $BOTTLE_NAME"
-log "  version:  $FOUND_FILE_VERSION"
-log "  revision: $RELEASE_VERSION-$EFFECTIVE_TARGET_REVISION"
+log "  version:  $FOUND_FILE_VERSION (release $RELEASE_VERSION-$OUR_RELEASE_NUMBER)"
+log "  revision: $EFFECTIVE_TARGET_REVISION"
 log "  backup:   $BACKUP_DIR"
 
 fi  # DLL_ALREADY_PATCHED
