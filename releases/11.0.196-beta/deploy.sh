@@ -127,22 +127,20 @@ EFFECTIVE_LAST_STAGE="${REVISION_LAST_STAGE[$EFFECTIVE_TARGET_REVISION]}"
 # dotnet check
 # ---------------------------------------------------------------------------
 
-check_dotnet() {
-    command -v dotnet >/dev/null 2>&1 && return 0
-    err "dotnet SDK not found -- required to build the patch tool and read assembly versions."
+print_dotnet_install_instructions() {
     if [[ -f /etc/os-release ]]; then
         # shellcheck disable=SC1091
         . /etc/os-release
         case "${ID:-}" in
             debian|ubuntu|linuxmint|pop)
-                echo "  Install with:  sudo apt update && sudo apt install -y dotnet-sdk-8.0" ;;
+                echo "  Install with:  sudo apt update && sudo apt install -y dotnet-sdk-10.0" ;;
             fedora)
-                echo "  Install with:  sudo dnf install -y dotnet-sdk-8.0" ;;
+                echo "  Install with:  sudo dnf install -y dotnet-sdk-10.0" ;;
             rhel|centos|rocky|almalinux)
-                echo "  Install with:  sudo dnf install -y dotnet-sdk-8.0"
+                echo "  Install with:  sudo dnf install -y dotnet-sdk-10.0"
                 echo "  (may need Microsoft's package repo enabled first: https://learn.microsoft.com/dotnet/core/install/linux-rhel)" ;;
             opensuse*|sles)
-                echo "  Install with:  sudo zypper install -y dotnet-sdk-8.0" ;;
+                echo "  Install with:  sudo zypper install -y dotnet-sdk-10.0" ;;
             arch|manjaro)
                 echo "  Install with:  sudo pacman -S dotnet-sdk" ;;
             *)
@@ -151,7 +149,26 @@ check_dotnet() {
     else
         echo "  See: https://learn.microsoft.com/dotnet/core/install/linux"
     fi
-    die "install dotnet SDK and re-run this script."
+}
+
+# Unlike the 10.4.5674 sibling script (net8.0), il-patcher here targets net10.0 (matching eM
+# Client 11's own target -- see the csproj written further down) -- a .NET 8-only SDK install
+# still satisfies `command -v dotnet` below, so that alone is not sufficient: it needs an actual
+# net10.0-capable SDK present, or the first real build attempt fails deep into the pipeline with
+# NETSDK1045 instead of a clear message here (hit for real -- see git history for the report).
+check_dotnet() {
+    if ! command -v dotnet >/dev/null 2>&1; then
+        err "dotnet SDK not found -- required to build the patch tool and read assembly versions."
+        print_dotnet_install_instructions
+        die "install a .NET 10 SDK and re-run this script."
+    fi
+    if ! dotnet --list-sdks 2>/dev/null | awk '{print $1}' | cut -d. -f1 | grep -qE '^[1-9][0-9]$'; then
+        err "no .NET 10+ SDK found -- il-patcher targets net10.0 (matching eM Client 11 itself)."
+        err "installed SDK(s):"
+        dotnet --list-sdks 2>/dev/null | sed 's/^/  /' >&2
+        print_dotnet_install_instructions
+        die "install a .NET 10 SDK (in addition to any older one already installed) and re-run this script."
+    fi
 }
 
 check_dotnet
