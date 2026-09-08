@@ -281,6 +281,7 @@ if [[ -z "${BOTTLE_NAME:-}" ]]; then
 fi
 
 BOTTLE_DIR="$HOME/.cxoffice/$BOTTLE_NAME"
+BOTTLE_FONTS_DIR="$BOTTLE_DIR/drive_c/windows/Fonts"
 TEMPLATE="$(bottle_template "$BOTTLE_NAME")"
 if [[ "$TEMPLATE" != win11_* ]]; then
     warn "bottle '$BOTTLE_NAME' has template '$TEMPLATE', not a Windows 11 one."
@@ -603,7 +604,6 @@ log "default message-box font set to Segoe UI."
 # files, not freely redistributable, hence the license-consent prompt.
 # ---------------------------------------------------------------------------
 
-BOTTLE_FONTS_DIR="$BOTTLE_DIR/drive_c/windows/Fonts"
 if [[ -d "$FONTS_DIR" ]] && compgen -G "$FONTS_DIR"/*.ttf >/dev/null; then
     font_count=$(ls "$FONTS_DIR"/*.ttf | wc -l)
     do_install_fonts=0
