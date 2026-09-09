@@ -273,22 +273,23 @@ but don't rely on that alone).
   go back to forking a new `releases/<version>/` folder — this shared-script approach only holds
   as long as the patch content stays identical across versions.
   This introduced a real split worth understanding before touching the script again:
-  `OUR_RELEASE_NUMBER_FOR_VERSION` (an associative array, e.g. `["11.0.196"]=4 ["11.0.282"]=1`)
-  is a PER-VERSION release-tag number, used only for `release/<version>-<N>` git tags and
-  human-facing log messages — `11.0.282` started its own count at 1 (now at 2) even though the
-  pipeline itself was already at stage 4 (now the mandatory pipeline's stage 3, plus optional
-  stage 5 — see the Status section's `release/11.0.282-2` entry below for the Stage 4/5
-  renumbering), because it's the first tagged release for that specific eM Client build, not
-  because fewer stages apply to it. `PIPELINE_LATEST_STAGE` (a plain constant, currently `3` —
-  the highest MANDATORY stage; optional stages, currently just Stage 5, are a separate opt-in on
-  top of it) is the SEPARATE, version-agnostic axis that actually controls how many patch stages
+  `OUR_RELEASE_NUMBER_FOR_VERSION` (an associative array, currently
+  `["11.0.196"]=5 ["11.0.282"]=4`) is a PER-VERSION release-tag number, used only for
+  `release/<version>-<N>` git tags and human-facing log messages — `11.0.282` started its own
+  count at 1 even though the pipeline itself was already at stage 4 (now the mandatory pipeline's
+  stage 3, plus optional stage 5 — see the Status section's `release/11.0.282-2` entry below for
+  the Stage 4/5 renumbering), because it's the first tagged release for that specific eM Client
+  build, not because fewer stages apply to it. `PIPELINE_LATEST_STAGE` (a plain constant, currently
+  `4` — the highest MANDATORY stage; optional stages, currently just Stage 6, are a separate opt-in
+  on top of it) is the SEPARATE, version-agnostic axis that actually controls how many patch stages
   get built by default and what the on-bottle `MailClient.Wine.dll` marker's own revision number
   means (shared across every supported version, since the patch content doesn't vary by
   version). Conflating these two would be a real bug, not just a naming nitpick: if the
   per-version release number were used to decide how many stages to apply, a fresh `11.0.282`
-  deploy would stop after Stage 1 only (`OUR_RELEASE_NUMBER_FOR_VERSION["11.0.282"]` = 2) instead
-  of the mandatory three. Add a new eM Client build to `OUR_RELEASE_NUMBER_FOR_VERSION` only after
-  doing the same decompile-diff-plus-dry-run verification described above — never on faith.
+  deploy would stop after Stage 1 only (`OUR_RELEASE_NUMBER_FOR_VERSION["11.0.282"]` = 4, taken
+  literally as a stage count) instead of the mandatory four. Add a new eM Client build to
+  `OUR_RELEASE_NUMBER_FOR_VERSION` only after doing the same decompile-diff-plus-dry-run
+  verification described above — never on faith.
 
   **x64 support**: bottle discovery now checks both architectures' conventional install paths
   (`drive_c/Program Files (x86)/eM Client/` and plain `drive_c/Program Files/eM Client/`) rather
@@ -298,7 +299,7 @@ but don't rely on that alone).
   decompile-diff plus a dry run of every stage against `original/em-11.0.282-x64/` (see
   `install-msix.sh`'s own bullet above for the file-level findings) — the patch content applies
   identically regardless of architecture.
-- **Status:** four DLL fixes so far, plus fonts, plus an install-time OS-dependency fix.
+- **Status:** five DLL fixes so far, plus fonts, plus an install-time OS-dependency fix.
   - `release/11.0.196-1` — a startup crash (PBKDF2 key derivation broken under Wine's
     `bcrypt.dll`, blocking `InitOnBackground` before the main window ever appears). Full
     root-cause and fix details: `reports/emclient11-pbkdf2-startup-crash-findings.md`. Fixed via
@@ -392,7 +393,26 @@ but don't rely on that alone).
     loop now checks both architectures' conventional install paths (see both scripts' own bullets
     above for the verification and the shortcut-generation unification this also introduced —
     `cscript.exe` for both architectures now, the tracked `eM Client.lnk` deleted).
-  All four DLL-patch flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every
+  - `release/11.0.196-5` / `release/11.0.282-4` — message preview pane intermittently blank fix
+    (new Stage 4, taking the vacant slot `release/11.0.282-2` reserved; the optional Exchange
+    sync-freeze fix shifted from Stage 5 to Stage 6 as a result, leaving a fresh vacant Stage 5 for
+    next time). Full investigation (video-frame diffing, `CX_DEBUGMSG` trace work, and a leading
+    root-cause theory — Chromium's own native window occlusion tracking — that was built,
+    deployed, and empirically RULED OUT live before landing on this mitigation):
+    `reports/emclient11-preview-pane-blank-findings.md`. `--patch-preview-pane-periodic-repaint`
+    adds a 400ms timer to `ControlMessageDetail`'s constructor that periodically forces a real
+    `RedrawWindow` (via a new, self-contained `user32.dll` P/Invoke) against the CEF browser's own
+    native child hwnd — the same pragmatic "periodic re-assertion of already-correct content"
+    approach already proven for the notification toast bug
+    (`--patch-notification-periodic-reblit`), since the exact Wine/Chromium trigger mechanism was
+    never pinned down despite ruling out the leading theory. Verified via decompile +
+    `--dump-handlers`, applied identically (byte-for-byte matching success output) against
+    `original/em-11.0.196/`, `original/em-11.0.282/`, and `original/em-11.0.282-x64/` — no
+    version-specific adaptation needed, hence bumping both versions' release numbers together.
+    Deployed live to `emClient_11_beta_win_11` and **confirmed working by the user**: reproduced
+    the freeze deliberately (mouse held outside the VM for 20-30s) and confirmed the pane now
+    recovers on its own within about a second — "This looks like the fix for this issue."
+  All five DLL-patch flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every
   v10 patch flag (shared tooling, not duplicated per release line) — only the deploy scripts and
   release folders are kept separate, not the patcher tool itself. Also added (not DLL patches, so
   not part of the `REVISION_LAST_STAGE`/stage-number scheme, same as v10): vendored font

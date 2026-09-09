@@ -113,6 +113,16 @@ if (args.Length > 0 && args[0] == "--patch-folder-sync-async")
     return RunPatchFolderSyncAsync(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-disable-native-win-occlusion")
+{
+    return RunPatchDisableNativeWinOcclusion(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-preview-pane-periodic-repaint")
+{
+    return RunPatchPreviewPanePeriodicRepaint(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-notification-invalidate")
 {
     return RunPatchNotificationInvalidate(args);
@@ -9434,6 +9444,378 @@ static int RunPatchFolderSyncAsync(string[] args)
         Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
         return 1;
     }
+    return 0;
+}
+
+// --patch-disable-native-win-occlusion <input-dir> <output-dir>
+//
+// Working theory for the intermittent "message preview pane goes blank white, sometimes just
+// the header, sometimes the whole email, and stays that way for an arbitrary length of time
+// until the mouse moves into the window" bug (see
+// reports/emclient11-preview-pane-blank-findings.md): Chromium's own Native Window Occlusion
+// Tracking (a real, documented Chromium feature since ~v85 -- ui/base/win/window_event_target.cc
+// et al.) periodically decides whether its own native window is occluded (covered/not visible)
+// using native Win32 visibility signals, and stops presenting composited frames to a window it
+// believes is occluded, to save CPU/GPU -- re-evaluating on signals like the window regaining
+// focus or receiving mouse input. This heuristic is built against real Windows' DWM and has a
+// well-known history of misfiring under emulated/virtualized/unusual window-manager setups
+// (Wine's X11 driver very much included): a window can get marked occluded while genuinely
+// fully visible, Chromium then simply stops flushing new frames to it (the already-rendered
+// frame just sits there, unpresented), and it isn't reconsidered until something like a mouse
+// enter/move event over the window forces a fresh occlusion check.
+//
+// This matches every observed detail exactly: recovery is instant (the frame was already
+// composited, just not presented -- not a slow re-render), the freeze duration is arbitrary
+// (occlusion state is sticky until externally reconsidered), a single mouse-enter event (not a
+// click, not a hover dwell) is what triggers recovery, only the Chromium-hosted preview pane is
+// ever affected (never native WinForms chrome elsewhere in the app), and the SPECIFIC region
+// that goes blank varies between runs (header only / a white square / the whole pane) --
+// consistent with whichever compositor surface happened to get marked stale that time, not one
+// fixed control's own paint logic.
+//
+// Fix: eM Client's own MailClient.Program/DemoApp.OnBeforeCommandLineProcessing (MailClient.dll)
+// already passes Chromium a --disable-features list (PartitionVisitedLinkDatabase,
+// PartitionVisitedLinkDatabaseWithSelfLinks, PdfOopif) via a single Ldstr operand -- this is a
+// plain operand rewrite, prepending "CalculateNativeWinOcclusion," to that same comma-separated
+// string, no instruction insertion, no exception handlers touched, the same low-risk shape as
+// Stage 1's InterpolationMode fix. Confirmed identical IL (same offset, same string) across
+// every supported build (11.0.196, 11.0.282 x86, 11.0.282 x64) via --dump-il before writing this.
+//
+// RULED OUT, empirically: deployed live to emClient_11_beta_win_11, confirmed active in the
+// running process's actual command line (--disable-features=CalculateNativeWinOcclusion,... was
+// present via `ps aux`), and the user reproduced the exact same "mouse leaves the VM -> pane
+// freezes -> mouse re-enters -> instant recovery" behavior with the flag applied -- "I seems to
+// behave exactly the same." Whatever the real mechanism is, it isn't (solely) Chromium's own
+// documented native-window-occlusion feature. Left in the tool, unused, as a documented dead
+// end -- not wired into any deploy.sh. A CX_DEBUGMSG="+message" trace taken afterward (see
+// reports/emclient11-preview-pane-blank-findings.md) confirmed instead that the freeze aligns
+// exactly with a period where Wine delivers literally zero mouse input of any kind to the
+// process -- consistent with the freeze being real Chromium content-paint suppression triggered
+// by *something* tied to input/focus state, just not this specific feature flag. See
+// --patch-preview-pane-periodic-repaint below for the mitigation that shipped instead.
+static int RunPatchDisableNativeWinOcclusion(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-disable-native-win-occlusion <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.Program/DemoApp";
+    const string targetMethod = "OnBeforeCommandLineProcessing";
+    const string oldFeatures = "PartitionVisitedLinkDatabase,PartitionVisitedLinkDatabaseWithSelfLinks,PdfOopif";
+    const string newFeatures = "CalculateNativeWinOcclusion," + oldFeatures;
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var method = type.Methods.FirstOrDefault(m => m.Name == targetMethod);
+        if (method is null) { Console.Error.WriteLine($"FAIL: method not found: {targetMethod}"); return 1; }
+
+        var target = method.Body.Instructions.FirstOrDefault(i =>
+            i.OpCode == OpCodes.Ldstr && (string)i.Operand == oldFeatures);
+        if (target is null)
+        {
+            Console.Error.WriteLine($"FAIL: expected Ldstr \"{oldFeatures}\" not found in {targetType}.{targetMethod} -- IL shape may have changed");
+            return 1;
+        }
+        target.Operand = newFeatures;
+
+        module.Write(destPath);
+        patched = true;
+        Console.WriteLine($"OK   {fileName}: MailClient.Program.DemoApp::OnBeforeCommandLineProcessing -- added CalculateNativeWinOcclusion to the --disable-features list passed to Chromium, working around Chromium's native window occlusion tracking misfiring under Wine and leaving the message preview pane blank until the mouse moves into it");
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+    return 0;
+}
+
+// --patch-preview-pane-periodic-repaint <input-dir> <output-dir>
+//
+// Mitigation for the intermittent "message preview pane goes blank white -- sometimes just the
+// header, sometimes a white square, sometimes the whole email -- until the mouse moves" bug (see
+// reports/emclient11-preview-pane-blank-findings.md). --patch-disable-native-win-occlusion (see
+// above) was the leading root-cause theory and was RULED OUT empirically -- the user reproduced
+// the identical bug with that feature flag confirmed disabled in the live process. A follow-up
+// CX_DEBUGMSG="+message" trace on the unpatched build instead pinned down the exact behavior: a
+// specific hwnd (the CEF-owned Chrome_WidgetWin_* child window CefWebBrowserEx wraps, exposed as
+// its own public NativeBrowserWindowHandle property) goes 19+ seconds with ZERO WM_PAINT
+// dispatches, and this silence lines up exactly with a period where Wine delivers literally no
+// mouse input of any kind to the process -- consistent with "the mouse left the VM's display" but
+// with the real trigger mechanism (what actually stops WM_PAINT, and what actually restarts it on
+// re-entry) still unidentified after ruling out two red herrings (a routine WinForms timer window
+// and routine CEF worker-thread spawn, both shown to occur constantly regardless of freeze state).
+// Recovery is always instant (a single video frame, not a gradual re-render) -- the correct pixels
+// are already composited and sitting in Chromium's own backing store, just not being presented.
+//
+// Rather than keep chasing the exact Wine/Chromium mechanism, this takes the same pragmatic
+// approach already proven for an analogous Wine paint-staleness bug in this codebase
+// (--patch-notification-periodic-reblit, reports/notification-empty-until-fade-findings.md):
+// periodically force a native repaint of the already-correct content, independent of whatever
+// normally would (or wouldn't) trigger one. Since the CEF browser here is a REAL native child
+// window (not a layered bitmap like the notification form), "force a repaint" means calling the
+// real Win32 RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE|RDW_ERASE|RDW_UPDATENOW|RDW_ALLCHILDREN)
+// on that hwnd directly, synchronously, on a short Timer -- not a WinForms-level Invalidate() (the
+// CEF child window paints itself directly and isn't reachable through WinForms' own paint
+// pipeline), and not SendMessage(WM_PAINT) (which does nothing useful without an actual invalid
+// region already queued -- RedrawWindow's RDW_INVALIDATE flag is what actually creates one).
+//
+// No existing DllImport for RedrawWindow exists anywhere in this app (WinApi.dll's own Win32
+// class -- the shared P/Invoke surface CefWebBrowserEx itself uses for GetClassName/SendMessage/
+// etc. -- has SetWindowPos, SendMessage, PostMessage, but not RedrawWindow or InvalidateRect), so
+// this patch declares its own, private, directly on ControlMessageDetail -- self-contained within
+// one assembly, one type, avoiding any cross-module ImportReference complication (lesson 16) or
+// shared-type blast radius (lesson 10) entirely. Implementation:
+//   - a new `private static extern bool __RedrawWindow(nint, nint, nint, uint)` P/Invoke method
+//     (user32.dll, EntryPoint "RedrawWindow") added directly to ControlMessageDetail;
+//   - a new `private System.Windows.Forms.Timer __previewPaneRepaintTimer` field, its Timer type
+//     resolved from the existing `timerMarkRead` field's own FieldType (not typeof() reflection --
+//     lesson 5, System.Windows.Forms is app-deployed, not a CoreLib facade);
+//   - a new `private void __previewPaneRepaintTick(object, EventArgs)` that no-ops if `webBrowser`
+//     is null, not Visible, or NativeBrowserWindowHandle is IntPtr.Zero (mirrors the property's
+//     own internal null-guard), otherwise calls __RedrawWindow on that handle;
+//   - one-time creation/start of the timer appended at the very end of ControlMessageDetail's
+//     public constructor, immediately before its final `ret` -- confirmed via --dump-il and
+//     --dump-handlers that this constructor has no exception handlers and nothing branches to
+//     that final `ret` (it's simple sequential code, no early `return;` anywhere in the body), so
+//     this is a safe insertion point with no retargeting needed (lessons 2 and 3 don't apply
+//     here). The constructor runs exactly once per control instance (this control is created once
+//     and reused as the user selects different messages, confirmed by the equivalent claim
+//     already verified for FormGenericNotification's instance-reuse in the periodic-reblit
+//     patch's own doc comment), so no re-entry guard is needed the way OnShown needed one there.
+static int RunPatchPreviewPanePeriodicRepaint(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-preview-pane-periodic-repaint <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.Controls.ControlMessageDetail.ControlMessageDetail";
+    const int repaintIntervalMs = 400;
+    const uint RDW_INVALIDATE = 0x0001;
+    const uint RDW_ERASE = 0x0004;
+    const uint RDW_ALLCHILDREN = 0x0080;
+    const uint RDW_UPDATENOW = 0x0100;
+    const uint redrawFlags = RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW;
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var ctor = type.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0);
+        if (ctor is null) { Console.Error.WriteLine("FAIL: parameterless .ctor not found"); return 1; }
+
+        var webBrowserField = type.Fields.FirstOrDefault(f => f.Name == "webBrowser");
+        if (webBrowserField is null) { Console.Error.WriteLine("FAIL: webBrowser field not found"); return 1; }
+        var browserTypeDef = webBrowserField.FieldType.Resolve();
+        if (browserTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve CefWebBrowserEx"); return 1; }
+        var getHandleDef = browserTypeDef.Methods.FirstOrDefault(m => m.Name == "get_NativeBrowserWindowHandle");
+        if (getHandleDef is null) { Console.Error.WriteLine("FAIL: get_NativeBrowserWindowHandle not found on CefWebBrowserEx"); return 1; }
+        var getHandleRef = module.ImportReference(getHandleDef);
+
+        // Visible -- public on Control, walk the base-type chain the same way every other patch
+        // in this file reaches a foreign-assembly Control member.
+        MethodDefinition? FindInBaseChain(TypeDefinition start, string name, int paramCount)
+        {
+            for (var t = start; t is not null; t = t.BaseType?.Resolve())
+            {
+                var m = t.Methods.FirstOrDefault(m => m.Name == name && m.Parameters.Count == paramCount);
+                if (m is not null) return m;
+            }
+            return null;
+        }
+        var getVisibleDef = FindInBaseChain(type, "get_Visible", 0);
+        if (getVisibleDef is null) { Console.Error.WriteLine("FAIL: get_Visible not found in ControlMessageDetail's base chain"); return 1; }
+        var getVisibleRef = module.ImportReference(getVisibleDef);
+
+        // Timer -- resolve from the existing `timerMarkRead` field's own FieldType, not typeof()
+        // reflection (System.Windows.Forms is app-deployed -- IL-patching lesson 5).
+        var existingTimerField = type.Fields.FirstOrDefault(f => f.Name == "timerMarkRead");
+        if (existingTimerField is null) { Console.Error.WriteLine("FAIL: timerMarkRead field not found"); return 1; }
+        var timerTypeDef = existingTimerField.FieldType.Resolve();
+        if (timerTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve Timer from timerMarkRead's own FieldType"); return 1; }
+        var timerCtorDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0);
+        var timerSetIntervalDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "set_Interval");
+        var timerAddTickDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "add_Tick");
+        var timerStartDef = timerTypeDef.Methods.FirstOrDefault(m => m.Name == "Start" && m.Parameters.Count == 0);
+        if (timerCtorDef is null || timerSetIntervalDef is null || timerAddTickDef is null || timerStartDef is null)
+        {
+            Console.Error.WriteLine("FAIL: Timer missing one of .ctor()/set_Interval/add_Tick/Start()");
+            return 1;
+        }
+        var timerCtorRef = module.ImportReference(timerCtorDef);
+        var timerSetIntervalRef = module.ImportReference(timerSetIntervalDef);
+        var timerAddTickRef = module.ImportReference(timerAddTickDef);
+        var timerStartRef = module.ImportReference(timerStartDef);
+        var timerFieldTypeRef = module.ImportReference(existingTimerField.FieldType);
+
+        var eventHandlerCtorRef = module.ImportReference(typeof(EventHandler).GetConstructor(new[] { typeof(object), typeof(IntPtr) })!);
+
+        // --- New P/Invoke: private static extern bool __RedrawWindow(nint, nint, nint, uint);
+        var user32ModuleRef = module.ModuleReferences.FirstOrDefault(m => string.Equals(m.Name, "user32.dll", StringComparison.OrdinalIgnoreCase));
+        if (user32ModuleRef is null)
+        {
+            user32ModuleRef = new ModuleReference("user32.dll");
+            module.ModuleReferences.Add(user32ModuleRef);
+        }
+        var redrawWindowMethod = new MethodDefinition(
+            "__RedrawWindow",
+            MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig | MethodAttributes.PInvokeImpl,
+            module.TypeSystem.Boolean);
+        redrawWindowMethod.Parameters.Add(new ParameterDefinition("hWnd", ParameterAttributes.None, module.TypeSystem.IntPtr));
+        redrawWindowMethod.Parameters.Add(new ParameterDefinition("lprcUpdate", ParameterAttributes.None, module.TypeSystem.IntPtr));
+        redrawWindowMethod.Parameters.Add(new ParameterDefinition("hrgnUpdate", ParameterAttributes.None, module.TypeSystem.IntPtr));
+        redrawWindowMethod.Parameters.Add(new ParameterDefinition("flags", ParameterAttributes.None, module.TypeSystem.UInt32));
+        redrawWindowMethod.IsPreserveSig = true;
+        redrawWindowMethod.PInvokeInfo = new PInvokeInfo(PInvokeAttributes.CallConvWinapi, "RedrawWindow", user32ModuleRef);
+        type.Methods.Add(redrawWindowMethod);
+
+        // --- New field + tick method.
+        var repaintTimerField = new FieldDefinition("__previewPaneRepaintTimer", FieldAttributes.Private, timerFieldTypeRef);
+        type.Fields.Add(repaintTimerField);
+
+        var tickMethod = new MethodDefinition("__previewPaneRepaintTick", MethodAttributes.Private, module.TypeSystem.Void);
+        tickMethod.Parameters.Add(new ParameterDefinition("sender", ParameterAttributes.None, module.TypeSystem.Object));
+        tickMethod.Parameters.Add(new ParameterDefinition("e", ParameterAttributes.None, module.ImportReference(typeof(EventArgs))));
+        var handleLocal = new VariableDefinition(module.TypeSystem.IntPtr);
+        tickMethod.Body.Variables.Add(handleLocal);
+        type.Methods.Add(tickMethod);
+
+        var tmIl = tickMethod.Body.GetILProcessor();
+        var tmRet = Instruction.Create(OpCodes.Ret);
+
+        // if (webBrowser == null) return;
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Ldfld, webBrowserField));
+        tmIl.Append(Instruction.Create(OpCodes.Brfalse, tmRet));
+        // if (!webBrowser.Visible) return;
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Ldfld, webBrowserField));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, getVisibleRef));
+        tmIl.Append(Instruction.Create(OpCodes.Brfalse, tmRet));
+        // var handle = webBrowser.NativeBrowserWindowHandle;
+        tmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        tmIl.Append(Instruction.Create(OpCodes.Ldfld, webBrowserField));
+        tmIl.Append(Instruction.Create(OpCodes.Callvirt, getHandleRef));
+        tmIl.Append(Instruction.Create(OpCodes.Stloc, handleLocal));
+        // if (handle == IntPtr.Zero) return;
+        tmIl.Append(Instruction.Create(OpCodes.Ldloc, handleLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Brfalse, tmRet));
+        // __RedrawWindow(handle, IntPtr.Zero, IntPtr.Zero, redrawFlags);
+        tmIl.Append(Instruction.Create(OpCodes.Ldloc, handleLocal));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+        tmIl.Append(Instruction.Create(OpCodes.Conv_I));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+        tmIl.Append(Instruction.Create(OpCodes.Conv_I));
+        tmIl.Append(Instruction.Create(OpCodes.Ldc_I4, unchecked((int)redrawFlags)));
+        tmIl.Append(Instruction.Create(OpCodes.Call, redrawWindowMethod));
+        tmIl.Append(Instruction.Create(OpCodes.Pop));
+        tmIl.Append(tmRet);
+
+        // --- Append to the constructor, immediately before its final `ret` (confirmed via
+        // --dump-il / --dump-handlers: no exception handlers, nothing branches to that `ret`).
+        {
+            var body = ctor.Body;
+            var il = body.GetILProcessor();
+            var lastInstruction = body.Instructions[body.Instructions.Count - 1];
+            if (lastInstruction.OpCode != OpCodes.Ret)
+            {
+                Console.Error.WriteLine("FAIL: constructor's last instruction isn't Ret -- insertion point assumption invalid, aborting");
+                return 1;
+            }
+
+            var setupBlock = new List<Instruction>
+            {
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Newobj, timerCtorRef),
+                Instruction.Create(OpCodes.Stfld, repaintTimerField),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, repaintTimerField),
+                Instruction.Create(OpCodes.Ldc_I4, repaintIntervalMs),
+                Instruction.Create(OpCodes.Callvirt, timerSetIntervalRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, repaintTimerField),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldftn, tickMethod),
+                Instruction.Create(OpCodes.Newobj, eventHandlerCtorRef),
+                Instruction.Create(OpCodes.Callvirt, timerAddTickRef),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, repaintTimerField),
+                Instruction.Create(OpCodes.Callvirt, timerStartRef)
+            };
+            foreach (var i in setupBlock) { il.InsertBefore(lastInstruction, i); }
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType} -- added __RedrawWindow (user32.dll P/Invoke), __previewPaneRepaintTimer ({repaintIntervalMs}ms, started once in the constructor), and __previewPaneRepaintTick, which forces RedrawWindow(webBrowser.NativeBrowserWindowHandle, NULL, NULL, RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW) whenever webBrowser is non-null, Visible, and has a real native handle");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
     return 0;
 }
 
