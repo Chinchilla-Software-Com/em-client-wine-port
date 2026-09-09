@@ -198,6 +198,18 @@ create_bottle_with_core_fonts() {
     "$CXBOTTLE" --bottle "$name" --create --template win11_64 \
         || die "cxbottle --create failed for '$name'"
 
+    # Disable window-manager decorations for this bottle -- the same "Allow the window manager to
+    # decorate the windows" checkbox winecfg's Graphics tab exposes, unchecked. Wine's X11 driver
+    # reads this straight from the registry (HKCU\Software\Wine\X11 Driver\Decorated, REG_SZ "Y"
+    # or "N") -- there's no CLI equivalent to winecfg's own UI, so this writes the same value
+    # directly rather than needing a GUI step. Done here (right after bottle creation, before
+    # anything else runs in it) so it's in effect from the very first launch, not just future
+    # ones -- matches this project's habit of getting a fresh bottle to a known-good baseline
+    # before eM Client itself ever touches it.
+    log "disabling window-manager decorations (X11 Driver\\Decorated -> N) for '$name'..."
+    CX_BOTTLE="$name" "$CXSTART_WINE" reg add "HKCU\\Software\\Wine\\X11 Driver" /v "Decorated" /t REG_SZ /d "N" /f >/dev/null \
+        || warn "failed to disable window-manager decorations for '$name' -- continuing anyway (cosmetic only)."
+
     # See the header comment's IMPORTANT note: this opens a real window and pre-fills it, but
     # does NOT click Install for you -- that part is a genuine manual step, no way around it in
     # this environment.

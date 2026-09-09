@@ -336,6 +336,20 @@ but don't rely on that alone).
     stages, unmodified) also works against eM Client build `11.0.282` — see this file's own
     `deploy.sh` bullet above for the verification method and the per-version release-number
     split this introduced. Tested and confirmed working by the user on a separate machine.
+  - `release/11.0.282-2` — Stage 4 (Exchange sync-freeze fix) renumbered to Stage 5 and made
+    OPTIONAL (prompted, default skip; `--enable-sync-freeze-fix`/`--skip-sync-freeze-fix` for
+    non-interactive use) after it turned out to behave differently across machines — Stage 4
+    itself is now a deliberately vacant slot reserved for the next patch that IS safe to apply
+    unconditionally (bump `PIPELINE_LATEST_STAGE` to 4 and take that slot when one's ready; shift
+    every still-optional stage up by one again, same as this shuffle). A bottle already marked
+    revision 4 under the old numbering is transparently remapped to revision 5 (same content,
+    just a renumbering) rather than erroring. Also: `install-msix.sh`'s bottle-creation step now
+    disables window-manager decorations (`HKCU\Software\Wine\X11 Driver\Decorated` -> `N`, the
+    same setting winecfg's Graphics tab exposes) on every freshly created bottle. Verified: `--list`
+    and a `--skip-sync-freeze-fix` run against the live `emClient_11_beta_win_11` bottle (at
+    revision 3) both behave correctly; an `--enable-sync-freeze-fix` run was also verified to
+    correctly reach and apply Stage 5 (deployed for real during testing, then rolled back via
+    `deploy.sh`'s own pre-deploy backup since it wasn't an intentional deploy).
   All four DLL-patch flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every
   v10 patch flag (shared tooling, not duplicated per release line) — only the deploy scripts and
   release folders are kept separate, not the patcher tool itself. Also added (not DLL patches, so

@@ -149,6 +149,27 @@ versions (v10's handlers simply ignore the now-correct value), not a version-con
   working visually by the user — the notification toast now shows its title/content text and
   icons immediately, not just at fade-out.
 
+### Update: confirmed still applies unmodified to eM Client 11.0.282
+
+When eM Client's beta updated from `11.0.196` to `11.0.282`, re-ran the same "decompile-diff
+both versions before touching anything" discipline this fix itself was built with, against a
+fresh `11.0.282` install (`original/em-11.0.282/`). Both types this fix touches decompile
+byte-for-byte identical between the two builds: `MailClient.UI.Forms.NotificationForms
+.FormMailNotification` (`MailClient.dll`) and `MailClient.Common.UI.Controls.ControlToolStrip
+.ControlToolStripButton` (`MailClient.Common.UI.dll`). `MailClient.Common.UI.Forms.LayeredForm`
+(also touched by `--patch-notification-hover-forward`) differs by exactly one removed, unused
+convenience overload (`UpdateWindow(Bitmap, byte)`) — unrelated to `WndProc`, the only method of
+that type this fix actually patches, which is untouched.
+
+Also re-ran the full 7-stage pipeline itself (not just a structural diff) against `11.0.282`:
+every sub-patch applied with the same messages as the known-good `11.0.196` run, `--dump-handlers`
+reported correct nesting on every exception-handler-touching stage, and a decompile spot-check on
+`FormGenericNotification.OnShown` read clean. No adaptation needed — `releases/11.0.196-beta
+/deploy.sh` now supports both builds from the same script (see CLAUDE.md's eM Client 11 section
+and that script's own header comment for why this is a deliberate exception to the usual
+fork-a-new-folder-per-version convention). Confirmed working live against a real `11.0.282`
+install by the user, on a separate machine.
+
 ## Tooling notes worth keeping for future cross-assembly patches
 
 - **Decompile-diff both versions' relevant types BEFORE writing or reusing any patch code.**

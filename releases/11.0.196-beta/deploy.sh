@@ -29,10 +29,14 @@
 #   ./deploy.sh --list              list found bottles and their installed versions, then exit
 #   ./deploy.sh -y|--yes            don't prompt on a version mismatch, continue automatically
 #   ./deploy.sh --force             skip the "already at this revision" short-circuit
-#   ./deploy.sh --max-revision N    cap the deploy at revision N (e.g. 3 applies Stages 1-3 only,
-#                                   never Stage 4+) instead of this script's own latest
-#                                   (PIPELINE_LATEST_STAGE). Useful for reverting a bottle to an
-#                                   earlier, known-good revision (restore the bottle's files from
+#   ./deploy.sh --max-revision N    cap the deploy at revision N (e.g. 3 applies the mandatory
+#                                   Stages 1-3 only, never Stage 5) instead of this script's own
+#                                   default target (PIPELINE_LATEST_STAGE, or 5 if the optional
+#                                   Stage 5 was accepted -- see --enable-sync-freeze-fix below).
+#                                   Given explicitly, this ALSO skips the Stage 5 prompt entirely
+#                                   (an explicit revision is a stronger signal than the interactive
+#                                   default). Useful for reverting a bottle to an earlier,
+#                                   known-good revision (restore the bottle's files from
 #                                   original/em-<version>/ first, THEN run with --max-revision --
 #                                   this flag alone does not undo anything already installed) or
 #                                   for bisecting which stage introduced a regression. The
@@ -42,6 +46,15 @@
 #                                   thinking it has nothing to do. Must be <= this script's own
 #                                   latest revision (see REVISION_LAST_STAGE below) -- requesting
 #                                   a revision this script doesn't know how to build is an error.
+#                                   Revision 4 doesn't exist (reserved -- see PIPELINE_LATEST_STAGE
+#                                   below); the only valid values right now are 0, 1, 2, 3, 5.
+#   ./deploy.sh --enable-sync-freeze-fix
+#                                   include the optional Exchange sync-freeze fix (Stage 5)
+#                                   without the interactive prompt. See Stage 5's own header
+#                                   comment further down for why this one is optional at all.
+#   ./deploy.sh --skip-sync-freeze-fix
+#                                   leave the optional Exchange sync-freeze fix out, without the
+#                                   interactive prompt.
 #   ./deploy.sh --install-fonts     install the vendored fonts/ without the license-consent prompt
 #   ./deploy.sh --no-fonts          skip font installation without the license-consent prompt
 #
@@ -76,18 +89,30 @@ set -euo pipefail
 # (after doing that same verification -- don't just add a version number here on faith); bump an
 # existing entry's number when you tag a new release against a version that was already
 # supported.
-declare -A OUR_RELEASE_NUMBER_FOR_VERSION=( ["11.0.196"]=4 ["11.0.282"]=1 )
+declare -A OUR_RELEASE_NUMBER_FOR_VERSION=( ["11.0.196"]=4 ["11.0.282"]=2 )
 
-# Highest pipeline stage number this script knows how to build -- shared across every supported
-# eM Client version above. This (not OUR_RELEASE_NUMBER_FOR_VERSION) is what controls how far a
-# fresh deploy goes by default, and what the on-bottle MailClient.Wine.dll marker's own revision
-# number means (see REVISION_LAST_STAGE below) -- purely mechanical "how far through the shared
-# pipeline has this bottle progressed" bookkeeping, unrelated to which eM Client build it's on.
-PIPELINE_LATEST_STAGE=4
+# Highest MANDATORY pipeline stage number this script builds by default -- shared across every
+# supported eM Client version above. This (not OUR_RELEASE_NUMBER_FOR_VERSION) is what controls
+# how far a fresh deploy goes absent any opt-in, and what the on-bottle MailClient.Wine.dll
+# marker's own revision number means (see REVISION_LAST_STAGE below) -- purely mechanical "how
+# far through the shared pipeline has this bottle progressed" bookkeeping, unrelated to which eM
+# Client build it's on.
+#
+# Stage 4 is deliberately UNUSED right now -- reserved for whatever the next real mandatory patch
+# turns out to be. Stage 4 (Exchange sync-freeze) was renumbered to Stage 5 and made OPTIONAL
+# (see its own header comment further down, and --enable-sync-freeze-fix/--skip-sync-freeze-fix
+# above) after it turned out to behave differently across machines -- optional stages always sit
+# at the highest number(s), past every mandatory one. When a new mandatory patch is ready, it
+# takes the vacant Stage 4 slot (bump PIPELINE_LATEST_STAGE to 4, add [4]=4 below) and every
+# still-optional stage above it shifts up by one (Stage 5 -> Stage 6, its own REVISION_LAST_STAGE
+# entry and CLI flags renumbered to match) -- repeat this shuffle every time a new mandatory
+# patch is added, so optional stages never end up sandwiched between mandatory ones.
+PIPELINE_LATEST_STAGE=3
 
 # revision (= pipeline stage count applied so far, NOT a release number) -> last stage number
-# that revision introduced. Same "resume mid-pipeline" logic as the 10.4.5674 script.
-declare -A REVISION_LAST_STAGE=( [0]=0 [1]=1 [2]=2 [3]=3 [4]=4 )
+# that revision introduced. Same "resume mid-pipeline" logic as the 10.4.5674 script. No entry
+# for 4 (see PIPELINE_LATEST_STAGE's own comment above) -- revision 4 doesn't exist yet.
+declare -A REVISION_LAST_STAGE=( [0]=0 [1]=1 [2]=2 [3]=3 [5]=5 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -110,9 +135,11 @@ FORCE=0
 INSTALL_FONTS=0
 NO_FONTS=0
 MAX_REVISION=""
+ENABLE_SYNC_FREEZE_FIX=0
+SKIP_SYNC_FREEZE_FIX=0
 
 print_help() {
-    sed -n '2,56p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -122,12 +149,16 @@ while [[ $# -gt 0 ]]; do
         --list) LIST_ONLY=1; shift ;;
         --force) FORCE=1; shift ;;
         --max-revision) MAX_REVISION="${2:-}"; shift 2 ;;
+        --enable-sync-freeze-fix) ENABLE_SYNC_FREEZE_FIX=1; shift ;;
+        --skip-sync-freeze-fix) SKIP_SYNC_FREEZE_FIX=1; shift ;;
         --install-fonts) INSTALL_FONTS=1; shift ;;
         --no-fonts) NO_FONTS=1; shift ;;
         -h|--help) print_help; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
+
+[[ $ENABLE_SYNC_FREEZE_FIX -eq 1 && $SKIP_SYNC_FREEZE_FIX -eq 1 ]] && die "--enable-sync-freeze-fix and --skip-sync-freeze-fix are mutually exclusive"
 
 # EFFECTIVE_TARGET_REVISION: what this run should end up at -- either this script's own latest
 # (PIPELINE_LATEST_STAGE, shared across every supported eM Client version) or, if --max-revision
@@ -269,6 +300,42 @@ if [[ $LIST_ONLY -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Optional: Stage 5, the Exchange sync-freeze fix -- see its own header comment further down for
+# what it does. Confirmed fixing severe multi-minute freezes during Exchange sync on some
+# machines, but not yet confirmed to behave the same way on every machine -- kept optional
+# (default: NOT included) rather than risking a regression on a machine that was never affected
+# by the freeze this fixes in the first place. Skipped entirely if --max-revision was given
+# explicitly (a directly-requested revision is a stronger signal than this default, and asking
+# afterward would be confusing -- e.g. `--max-revision 3` explicitly asking to stay mandatory-only
+# shouldn't then prompt to go to 5 anyway).
+# ---------------------------------------------------------------------------
+
+if [[ -n "$MAX_REVISION" ]]; then
+    log "explicit --max-revision $MAX_REVISION given -- not prompting for the optional Exchange sync-freeze fix."
+else
+    include_sync_freeze_fix=0
+    if [[ $ENABLE_SYNC_FREEZE_FIX -eq 1 ]]; then
+        include_sync_freeze_fix=1
+    elif [[ $SKIP_SYNC_FREEZE_FIX -eq 1 ]]; then
+        include_sync_freeze_fix=0
+    else
+        echo ""
+        echo "Stage 5 (optional): a fix for severe, recurring multi-minute freezes during Exchange"
+        echo "sync. Confirmed working on some machines, but not yet confirmed to behave the same"
+        echo "way on every machine -- kept optional until that's better understood. Skipping this"
+        echo "keeps the bottle on the mandatory pipeline only (revision $PIPELINE_LATEST_STAGE); you"
+        echo "can opt in later with a plain re-run once you're ready to try it."
+        read -r -p "Include the Exchange sync-freeze fix in this deploy? [y/N] " sfreply
+        [[ "$sfreply" =~ ^[Yy]$ ]] && include_sync_freeze_fix=1
+    fi
+    if [[ $include_sync_freeze_fix -eq 1 ]]; then
+        EFFECTIVE_TARGET_REVISION=5
+        EFFECTIVE_LAST_STAGE="${REVISION_LAST_STAGE[$EFFECTIVE_TARGET_REVISION]}"
+        log "including the optional Exchange sync-freeze fix (targeting revision 5)."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Select bottle
 # ---------------------------------------------------------------------------
 
@@ -352,6 +419,17 @@ if [[ -f "$MARKER_DLL" ]]; then
     marker_revision="${marker_file_version##*.}"
     if [[ "$marker_emclient_version" == "$RELEASE_VERSION" && "$marker_revision" =~ ^[0-9]+$ ]]; then
         CURRENT_REVISION="$marker_revision"
+        # Compatibility remap: revision 4 only ever existed under this script's OLD stage
+        # numbering, where Stage 4 was this exact Exchange sync-freeze fix and always mandatory.
+        # It's since been renumbered to Stage 5 and made optional (see PIPELINE_LATEST_STAGE's
+        # own comment above) to free up Stage 4 for a real future mandatory patch. A bottle
+        # already marked revision 4 has exactly the same content as today's revision 5
+        # (mandatory Stages 1-3 plus the sync-freeze fix) -- remap it forward rather than
+        # treating slot 4 as unknown or, worse, silently re-running stages that already ran.
+        if [[ "$CURRENT_REVISION" -eq 4 ]]; then
+            CURRENT_REVISION=5
+            log "(this bottle's revision 4 predates the Stage 4->5 renumbering -- treating as revision 5, same content.)"
+        fi
         log "found MailClient.Wine.dll: this install is at $RELEASE_VERSION revision $CURRENT_REVISION."
     else
         warn "MailClient.Wine.dll present but for a different eM Client version"
@@ -636,11 +714,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Stage 4: Exchange sync-freeze fix -- the exact same bug and same fix as the 10.4.5674
-# pipeline's Stage 15 (see reports/exchange-sync-freeze-findings.md there). Confirmed identical
-# root cause here, not just a similar-looking symptom, before porting anything: decompile-diffed
-# both target methods against the 10.4.5674 build and found them byte-for-byte structurally
-# identical (MailClient.Accounts.AccountManager.SendAndReceiveAll and
+# Stage 5 (OPTIONAL -- see the prompt/flags above): Exchange sync-freeze fix -- the exact same
+# bug and same fix as the 10.4.5674 pipeline's Stage 15 (see
+# reports/exchange-sync-freeze-findings.md there). Confirmed identical root cause here, not just
+# a similar-looking symptom, before porting anything: decompile-diffed both target methods
+# against the 10.4.5674 build and found them byte-for-byte structurally identical
+# (MailClient.Accounts.AccountManager.SendAndReceiveAll and
 # MailClient.Storage.Application.Folder.Synchronize(bool,bool) -- both still fully synchronous,
 # both still reachable from the UI thread, no dedicated-thread dispatch of their own). Both
 # `--patch-account-manager-sync-async` and `--patch-folder-sync-async` applied cleanly to this
@@ -650,18 +729,24 @@ fi
 # --dump-handlers (both add a `try`/`catch(Exception)`, both report correct nesting). Order
 # between the two flags doesn't matter (different types, no shared state), same as the sibling
 # script's own Stage 15.
+#
+# Numbered 5 (not 4) and OPTIONAL, unlike every stage before it: this fix has been observed to
+# behave differently across machines, so it's no longer applied unconditionally -- see the
+# prompt/flags right after the bottle list above, and PIPELINE_LATEST_STAGE's own comment near
+# the top of this script for the full renumbering rationale (Stage 4 is a deliberately vacant
+# slot, reserved for the next patch that IS safe to apply unconditionally).
 # ---------------------------------------------------------------------------
 
-if [[ $START_STAGE -le 4 && $EFFECTIVE_LAST_STAGE -ge 4 ]]; then
-    log "Stage 4: Exchange sync-freeze fix (same bug/fix as the 10.4.5674 pipeline's Stage 15)..."
-    $ILP --patch-account-manager-sync-async "$STAGE3_DIR" "$WORKDIR/output-stage4a"
-    $ILP --patch-folder-sync-async "$WORKDIR/output-stage4a" "$WORKDIR/output-final"
+if [[ $START_STAGE -le 5 && $EFFECTIVE_LAST_STAGE -ge 5 ]]; then
+    log "Stage 5: Exchange sync-freeze fix (same bug/fix as the 10.4.5674 pipeline's Stage 15)..."
+    $ILP --patch-account-manager-sync-async "$STAGE3_DIR" "$WORKDIR/output-stage5a"
+    $ILP --patch-folder-sync-async "$WORKDIR/output-stage5a" "$WORKDIR/output-final"
     FINAL_DIR="$WORKDIR/output-final"
-elif [[ $START_STAGE -gt 4 ]]; then
-    log "Stage 4 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+elif [[ $START_STAGE -gt 5 ]]; then
+    log "Stage 5 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
     FINAL_DIR="$WORKDIR/original"
 else
-    log "Stage 4 skipped -- --max-revision caps this deploy at revision $EFFECTIVE_TARGET_REVISION."
+    log "Stage 5 skipped (not included in this deploy -- revision $EFFECTIVE_TARGET_REVISION)."
     FINAL_DIR="$STAGE3_DIR"
 fi
 
@@ -735,9 +820,9 @@ if [[ $START_STAGE -le 3 && $EFFECTIVE_LAST_STAGE -ge 3 ]]; then
         || die "verification failed: --dump-handlers reported a handler-ordering violation in FormMailNotification.performMouseClick"
 fi
 
-# Stage 4 verification -- mirrors the 10.4.5674 pipeline's own equivalent checks (see its Stage
-# 15 verification block), only meaningful (and only ran) when Stage 4 actually ran this time.
-if [[ $START_STAGE -le 4 && $EFFECTIVE_LAST_STAGE -ge 4 ]]; then
+# Stage 5 verification -- mirrors the 10.4.5674 pipeline's own equivalent checks (see its Stage
+# 15 verification block), only meaningful (and only ran) when Stage 5 actually ran this time.
+if [[ $START_STAGE -le 5 && $EFFECTIVE_LAST_STAGE -ge 5 ]]; then
     $ILSPY -t "MailClient.Accounts.AccountManager" "$FINAL_DIR/MailClient.Accounts.dll" | grep -q "__RunSendAndReceiveAllCore" \
         || die "verification failed: AccountManager.__RunSendAndReceiveAllCore not found -- sync freeze fix missing"
 
