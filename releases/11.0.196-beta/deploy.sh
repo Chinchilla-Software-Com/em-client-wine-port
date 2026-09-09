@@ -89,7 +89,7 @@ set -euo pipefail
 # (after doing that same verification -- don't just add a version number here on faith); bump an
 # existing entry's number when you tag a new release against a version that was already
 # supported.
-declare -A OUR_RELEASE_NUMBER_FOR_VERSION=( ["11.0.196"]=4 ["11.0.282"]=2 )
+declare -A OUR_RELEASE_NUMBER_FOR_VERSION=( ["11.0.196"]=4 ["11.0.282"]=3 )
 
 # Highest MANDATORY pipeline stage number this script builds by default -- shared across every
 # supported eM Client version above. This (not OUR_RELEASE_NUMBER_FOR_VERSION) is what controls

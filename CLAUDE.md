@@ -387,6 +387,11 @@ but don't rely on that alone).
     revision 3) both behave correctly; an `--enable-sync-freeze-fix` run was also verified to
     correctly reach and apply Stage 5 (deployed for real during testing, then rolled back via
     `deploy.sh`'s own pre-deploy backup since it wasn't an intentional deploy).
+  - `release/11.0.282-3` — wired up x64 support in both scripts: `install-msix.sh` gained an
+    `--arch x86|x64` flag (default `x86`, unchanged behavior), and `deploy.sh`'s bottle-discovery
+    loop now checks both architectures' conventional install paths (see both scripts' own bullets
+    above for the verification and the shortcut-generation unification this also introduced —
+    `cscript.exe` for both architectures now, the tracked `eM Client.lnk` deleted).
   All four DLL-patch flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every
   v10 patch flag (shared tooling, not duplicated per release line) — only the deploy scripts and
   release folders are kept separate, not the patcher tool itself. Also added (not DLL patches, so
