@@ -271,19 +271,29 @@ ILP="dotnet $WORKDIR/tools/il-patcher/bin/Release/net10.0/il-patcher.dll"
 log "il-patcher built."
 
 # ---------------------------------------------------------------------------
-# Find candidate bottles -- same classic install path shape as eM Client 10.x
-# (confirmed against the beta build: drive_c/Program Files (x86)/eM Client/MailClient.dll).
+# Find candidate bottles -- same classic install path shape as eM Client 10.x, checking BOTH
+# architectures' conventional install locations (confirmed against the beta build: the x86
+# package lands in "Program Files (x86)\eM Client", the x64 one in plain "Program Files\eM
+# Client" -- see install-msix.sh's own --arch flag). Everything downstream derives its paths
+# from whichever candidate is actually selected (BOTTLE_APP_DIR = dirname of the chosen
+# MailClient.dll), so no other part of this script needs to know or care which architecture a
+# given bottle is running -- the patch content itself is identical either way (MailClient
+# .Common.UI.dll and MailClient.Accounts.dll are genuinely AnyCPU, byte-for-byte identical
+# between the two packages; MailClient.dll IS architecture-specific at the PE level, but
+# decompiles byte-for-byte identical either way -- verified via a full decompile-diff and dry
+# run of every stage against a real x64 install).
 # ---------------------------------------------------------------------------
 
 shopt -s nullglob
 BOTTLE_DLLS=()
 for d in "$HOME"/.cxoffice/*/; do
-    candidate="${d}drive_c/Program Files (x86)/eM Client/MailClient.dll"
-    [[ -f "$candidate" ]] && BOTTLE_DLLS+=("$candidate")
+    for candidate in "${d}drive_c/Program Files (x86)/eM Client/MailClient.dll" "${d}drive_c/Program Files/eM Client/MailClient.dll"; do
+        [[ -f "$candidate" ]] && BOTTLE_DLLS+=("$candidate")
+    done
 done
 shopt -u nullglob
 
-[[ ${#BOTTLE_DLLS[@]} -gt 0 ]] || die "no eM Client install found under any ~/.cxoffice/*/drive_c/Program Files (x86)/eM Client/"
+[[ ${#BOTTLE_DLLS[@]} -gt 0 ]] || die "no eM Client install found under any ~/.cxoffice/*/drive_c/Program Files (x86)/eM Client/ or .../Program Files/eM Client/"
 
 log "found ${#BOTTLE_DLLS[@]} eM Client install(s):"
 declare -A BOTTLE_NAME_FOR_DLL

@@ -162,7 +162,11 @@ but don't rely on that alone).
   (FileVersion `11.0.282.0`, InformationalVersion `11.0.282-beta+ff9ca141f2`) is the equivalent
   snapshot for the newer build now also supported by `releases/11.0.196-beta/deploy.sh` (see that
   script's own bullet below) — both snapshots are kept side by side specifically so future
-  eM Client updates can be decompile-diffed against either. `original/v1/` also exists in
+  eM Client updates can be decompile-diffed against either. `original/em-11.0.282-x64/` is the
+  **x64** package of that same `11.0.282` build (extracted from the same `.msixbundle` the x86
+  snapshot came from — one bundle contains a `.msix` per architecture, see
+  `install-msix.sh`'s own bullet below) — 2492 files vs. the x86 package's 2493, kept
+  specifically to support the x64-compatibility verification documented there. `original/v1/` also exists in
   this repo and is **not** related to eM Client 11 despite the name — it's an old, differently-
   named snapshot of eM Client 10.4.5674, a leftover from before the current convention was
   adopted; ignore it.
@@ -177,17 +181,38 @@ but don't rely on that alone).
   own update feed, `https://licensing.emclient.com/api/update/emclient.appinstaller?beta=true` (a
   small XML manifest whose `<MainBundle Uri="...">` attribute is the *actual* current download
   URL — resolved via `python3`'s `xml.etree.ElementTree`, not hardcoded, since it changes with
-  every release) to find and download the current `.msixbundle`; extracts just the x86 `.msix`
-  from the bundle (a plain zip containing one `.msix` per architecture — confirmed via
+  every release) to find and download the current `.msixbundle`; extracts the selected
+  architecture's `.msix` (`--arch x86|x64`, default `x86` — every previously-tested install; see
+  below) from the bundle (a plain zip containing one `.msix` per architecture — confirmed via
   `unzip -l` against a real bundle: `MailClient_win-{x86,x64,arm64}.msix` plus bundle-level Appx
   metadata) and extracts THAT (also a plain zip, flat layout, no VFS redirection folder —
   confirmed by inspection, and by matching `original/em-11.0.196/`'s own file count exactly,
-  2493 files both ways) directly into the bottle's classic
-  `drive_c/Program Files (x86)/eM Client/` location; copies the tracked
-  `releases/11.0.196-beta/eM Client.lnk` shortcut (lives alongside the script itself, not in
-  `supporting/` — confirmed via a raw strings check to already point at exactly that install
-  path) into the bottle's Start Menu Programs folder; and runs `cxmenu --sync --bottle <name>` to
-  pick up the new shortcut without a manual "Install Application into Bottle" pass. Bottle selection scans
+  2493 files both ways, and `original/em-11.0.282-x64/`'s the same way, 2492 files both ways)
+  directly into the bottle's classic per-architecture install location —
+  `drive_c/Program Files (x86)/eM Client/` for x86 (matching real Windows' own convention for a
+  32-bit app), plain `drive_c/Program Files/eM Client/` for x64; generates a Start Menu shortcut
+  fresh via `cscript.exe` + `WScript.Shell`'s `CreateShortcut`, pointed at whichever install
+  location was just used — the same real Windows Shell API a native installer would use
+  (`cscript.exe`/`wscript.exe` are genuine Wine builtins, confirmed present). This used to copy a
+  pre-built, tracked `eM Client.lnk` for x86 and only generate one fresh for x64 (added when x64
+  support was first wired in) — unified onto `cscript` for both and the tracked `.lnk` deleted,
+  since a plain byte-level path substitution on it was never safe anyway ("Program Files (x86)"
+  and "Program Files" are different lengths, and a `.lnk`'s shell-item-ID-list encodes
+  lengths/offsets elsewhere in the binary that a substitution wouldn't update) and there's no
+  reason to maintain two code paths (plus a tracked binary to keep in sync with wherever this
+  script actually installs to) when one already covers both architectures correctly; and runs
+  `cxmenu --sync --bottle <name>` to pick up the new shortcut without a manual "Install
+  Application into Bottle" pass.
+  **x64 support confirmed working, not just plumbed through**: a full decompile-diff plus a dry
+  run of every `deploy.sh` patch stage against `original/em-11.0.282-x64/` showed
+  `MailClient.Common.UI.dll`/`MailClient.Accounts.dll` are genuinely AnyCPU (byte-for-byte
+  identical to the x86 build) and `MailClient.dll` — architecture-specific at the PE level (a
+  real x86 vs. AMD64 machine-type difference, confirmed via each file's own PE header) —
+  decompiles byte-for-byte identical anyway, so the patch content itself needs no x64-specific
+  adaptation at all. `deploy.sh`'s own bottle-discovery loop was updated to check both
+  architectures' install paths (see its own bullet below); everything downstream already derives
+  its paths from whichever install it actually finds, so no other part of that pipeline needed to
+  change. Bottle selection scans
   every bottle under `~/.cxoffice/` (not filtered to ones that already have eM Client, unlike
   `deploy.sh` — the point here is installing into one that doesn't yet) and warns if the chosen
   one's own `cxbottle.conf` `"Template"` setting isn't `win11_*` (confirmed reliable across every
@@ -250,17 +275,29 @@ but don't rely on that alone).
   This introduced a real split worth understanding before touching the script again:
   `OUR_RELEASE_NUMBER_FOR_VERSION` (an associative array, e.g. `["11.0.196"]=4 ["11.0.282"]=1`)
   is a PER-VERSION release-tag number, used only for `release/<version>-<N>` git tags and
-  human-facing log messages — `11.0.282` starts its own count at 1 even though the pipeline
-  itself is already at stage 4, because it's the first tagged release for that specific eM
-  Client build, not because fewer stages apply to it. `PIPELINE_LATEST_STAGE` (a plain constant,
-  currently `4`) is the SEPARATE, version-agnostic axis that actually controls how many patch
-  stages get built and what the on-bottle `MailClient.Wine.dll` marker's own revision number
+  human-facing log messages — `11.0.282` started its own count at 1 (now at 2) even though the
+  pipeline itself was already at stage 4 (now the mandatory pipeline's stage 3, plus optional
+  stage 5 — see the Status section's `release/11.0.282-2` entry below for the Stage 4/5
+  renumbering), because it's the first tagged release for that specific eM Client build, not
+  because fewer stages apply to it. `PIPELINE_LATEST_STAGE` (a plain constant, currently `3` —
+  the highest MANDATORY stage; optional stages, currently just Stage 5, are a separate opt-in on
+  top of it) is the SEPARATE, version-agnostic axis that actually controls how many patch stages
+  get built by default and what the on-bottle `MailClient.Wine.dll` marker's own revision number
   means (shared across every supported version, since the patch content doesn't vary by
   version). Conflating these two would be a real bug, not just a naming nitpick: if the
   per-version release number were used to decide how many stages to apply, a fresh `11.0.282`
-  deploy would stop after Stage 1 only (`OUR_RELEASE_NUMBER_FOR_VERSION["11.0.282"]` = 1) instead
-  of all four. Add a new eM Client build to `OUR_RELEASE_NUMBER_FOR_VERSION` only after doing the
-  same decompile-diff-plus-dry-run verification described above — never on faith.
+  deploy would stop after Stage 1 only (`OUR_RELEASE_NUMBER_FOR_VERSION["11.0.282"]` = 2) instead
+  of the mandatory three. Add a new eM Client build to `OUR_RELEASE_NUMBER_FOR_VERSION` only after
+  doing the same decompile-diff-plus-dry-run verification described above — never on faith.
+
+  **x64 support**: bottle discovery now checks both architectures' conventional install paths
+  (`drive_c/Program Files (x86)/eM Client/` and plain `drive_c/Program Files/eM Client/`) rather
+  than hardcoding the x86 one — everything downstream (`BOTTLE_APP_DIR`, the version gate, every
+  patch stage, backup/deploy) already derives its own paths from whichever `MailClient.dll` was
+  actually selected, so no other part of this script needed to change. Verified via a full
+  decompile-diff plus a dry run of every stage against `original/em-11.0.282-x64/` (see
+  `install-msix.sh`'s own bullet above for the file-level findings) — the patch content applies
+  identically regardless of architecture.
 - **Status:** four DLL fixes so far, plus fonts, plus an install-time OS-dependency fix.
   - `release/11.0.196-1` — a startup crash (PBKDF2 key derivation broken under Wine's
     `bcrypt.dll`, blocking `InitOnBackground` before the main window ever appears). Full

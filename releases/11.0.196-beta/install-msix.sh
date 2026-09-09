@@ -6,11 +6,14 @@
 # releases/10.4.5674/deploy.sh's target install already exists. This script gets a working,
 # unpatched install into place manually: downloads the .NET 10 desktop runtimes (the app targets
 # .NET 10, and a fresh bottle won't have it), installs them into the chosen bottle, resolves the
-# app's own update feed to find the current MSIX bundle, downloads it, extracts the x86 package's
-# contents directly into the bottle's classic "Program Files (x86)\eM Client" location (the same
-# layout releases/11.0.196-beta/deploy.sh's patch pipeline already expects), installs a set of
-# ICU DLLs Wine doesn't provide but the app's spell-checker needs (see the ICU section below),
-# and drops in a Start Menu shortcut.
+# app's own update feed to find the current MSIX bundle (a single bundle contains one package per
+# architecture -- x86, x64, arm64 -- see --arch below), downloads it, extracts the selected
+# architecture's package contents directly into the bottle's classic install location (x86:
+# "Program Files (x86)\eM Client", x64: "Program Files\eM Client" -- the same layout
+# releases/11.0.196-beta/deploy.sh's patch pipeline already expects either way, since it derives
+# its own paths from whichever install it actually finds), installs a set of ICU DLLs Wine
+# doesn't provide but the app's spell-checker needs (see the ICU section below), and drops in a
+# Start Menu shortcut.
 #
 # This does NOT apply any of this repo's Wine-compatibility IL patches -- those are a separate,
 # optional step (releases/11.0.196-beta/deploy.sh), which this script offers to run for you at
@@ -27,6 +30,16 @@
 #                                    install the Core Fonts prerequisite into it before proceeding
 #   ./install-msix.sh -y|--yes       don't prompt on the Windows-11-template check or on whether
 #                                    to run deploy.sh afterward (answers yes to both)
+#   ./install-msix.sh --arch x86|x64  which package to extract from the bundle (default: x86,
+#                                    matching every previously-tested install). Confirmed via a
+#                                    full decompile-diff and dry run of every deploy.sh patch
+#                                    stage that the x64 package's patch-relevant assemblies are
+#                                    either byte-for-byte identical to x86's (MailClient.Common
+#                                    .UI.dll, MailClient.Accounts.dll -- genuinely AnyCPU) or
+#                                    decompile identical despite differing at the PE level
+#                                    (MailClient.dll -- architecture-specific header, identical
+#                                    IL) -- see reports/emclient11-startup-stack-overflow-findings
+#                                    .md and CLAUDE.md's eM Client 11 section.
 #   ./install-msix.sh --help         full usage
 #
 # Interactively (no --bottle/--new-bottle given), this first asks whether to create a brand new
@@ -98,7 +111,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 IL_PATCHES_DIR="$REPO_ROOT/il-patches"
 FONTS_DIR="$REPO_ROOT/fonts"
-LNK_FILE="$SCRIPT_DIR/eM Client.lnk"
 
 log()  { echo "[install-msix] $*"; }
 warn() { echo "[install-msix] WARNING: $*" >&2; }
@@ -115,9 +127,10 @@ ASSUME_YES=0
 LIST_ONLY=0
 INSTALL_FONTS=0
 NO_FONTS=0
+ARCH="x86"
 
 print_help() {
-    sed -n '2,69p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,81p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -128,10 +141,13 @@ while [[ $# -gt 0 ]]; do
         --list) LIST_ONLY=1; shift ;;
         --install-fonts) INSTALL_FONTS=1; shift ;;
         --no-fonts) NO_FONTS=1; shift ;;
+        --arch) ARCH="${2:-}"; shift 2 ;;
         -h|--help) print_help; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
+
+[[ "$ARCH" == "x86" || "$ARCH" == "x64" ]] || die "--arch must be x86 or x64, got: $ARCH"
 
 [[ -n "$BOTTLE_OVERRIDE" && -n "$NEW_BOTTLE_NAME" ]] && die "--bottle and --new-bottle are mutually exclusive"
 
@@ -142,7 +158,6 @@ done
 for tool in curl python3 unzip tar; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found -- required by this script."
 done
-[[ -f "$LNK_FILE" ]] || die "shortcut file not found: $LNK_FILE"
 [[ -x "$CXSTART_WINE" ]] || die "CrossOver's wine binary not found at $CXSTART_WINE"
 
 # ---------------------------------------------------------------------------
@@ -369,30 +384,39 @@ log "resolved eM Client $MSIX_VERSION: $MSIX_BUNDLE_URL"
 # ---------------------------------------------------------------------------
 # Download the bundle (a plain zip containing one .msix per architecture -- win-x86, win-x64,
 # win-arm64, confirmed via `unzip -l` against a real bundle -- plus bundle-level Appx metadata)
-# and extract just the x86 package from it. eM Client's own MSIX ships a flat file layout inside
+# and extract just the selected architecture's package from it (see --arch above; default x86,
+# matching every previously-tested install). eM Client's own MSIX ships a flat file layout inside
 # each architecture's .msix (also a plain zip) -- MailClient.exe and everything else sit directly
 # at the archive root, no VFS/redirection subfolder -- confirmed by inspecting a real x86 .msix's
 # own file listing, and matching this repo's own original/em-11.0.196/ pristine snapshot
-# byte-for-byte in file count (2493 files both ways). This means the x86 .msix's entire contents
-# can be extracted directly into the bottle's classic "Program Files (x86)\eM Client" location
-# with no repackaging step.
+# byte-for-byte in file count (2493 files both ways); the x64 package has the same flat layout,
+# confirmed the same way against original/em-11.0.282-x64/ (2492 files both ways). This means the
+# selected package's entire contents can be extracted directly into the bottle's classic install
+# location with no repackaging step -- x86 installs to "Program Files (x86)\eM Client" (matching
+# real Windows' own convention for a 32-bit app), x64 to plain "Program Files\eM Client" (ditto
+# for a 64-bit app on a 64-bit Windows install, which win11_64 -- the only template this project
+# tests -- already is).
 # ---------------------------------------------------------------------------
 
 log "downloading msixbundle (this is large, 800MB+, may take a while)..."
 curl -fL --progress-bar -o "$TMPDIR/setup.msixbundle" "$MSIX_BUNDLE_URL"
 
-log "extracting the x86 package from the bundle..."
+log "extracting the $ARCH package from the bundle..."
 mkdir -p "$TMPDIR/bundle-extract"
-X86_ENTRY="$(unzip -Z1 "$TMPDIR/setup.msixbundle" | grep -i 'win-x86\.msix$' | head -1)"
-[[ -n "$X86_ENTRY" ]] || die "couldn't find a *win-x86.msix entry inside the downloaded bundle -- its internal layout may have changed"
-unzip -q -o "$TMPDIR/setup.msixbundle" "$X86_ENTRY" -d "$TMPDIR/bundle-extract"
-X86_MSIX="$TMPDIR/bundle-extract/$X86_ENTRY"
-[[ -f "$X86_MSIX" ]] || die "extraction reported success but $X86_MSIX doesn't exist"
+MSIX_ENTRY="$(unzip -Z1 "$TMPDIR/setup.msixbundle" | grep -i "win-${ARCH}\.msix\$" | head -1)"
+[[ -n "$MSIX_ENTRY" ]] || die "couldn't find a *win-${ARCH}.msix entry inside the downloaded bundle -- its internal layout may have changed"
+unzip -q -o "$TMPDIR/setup.msixbundle" "$MSIX_ENTRY" -d "$TMPDIR/bundle-extract"
+SELECTED_MSIX="$TMPDIR/bundle-extract/$MSIX_ENTRY"
+[[ -f "$SELECTED_MSIX" ]] || die "extraction reported success but $SELECTED_MSIX doesn't exist"
 
-INSTALL_DIR="$BOTTLE_DIR/drive_c/Program Files (x86)/eM Client"
+if [[ "$ARCH" == "x64" ]]; then
+    INSTALL_DIR="$BOTTLE_DIR/drive_c/Program Files/eM Client"
+else
+    INSTALL_DIR="$BOTTLE_DIR/drive_c/Program Files (x86)/eM Client"
+fi
 log "installing eM Client into $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
-unzip -q -o "$X86_MSIX" -d "$INSTALL_DIR"
+unzip -q -o "$SELECTED_MSIX" -d "$INSTALL_DIR"
 [[ -f "$INSTALL_DIR/MailClient.exe" ]] || die "extraction completed but MailClient.exe is missing from $INSTALL_DIR -- something's wrong with the package layout"
 log "eM Client files installed."
 
@@ -741,15 +765,38 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Start Menu shortcut -- a pre-built .lnk already pointing at
-# C:\Program Files (x86)\eM Client\MailClient.exe (confirmed via a raw strings check against the
-# tracked file), matching exactly where this script just installed to. Copied as-is, not
-# regenerated.
+# Start Menu shortcut -- generated fresh for either architecture via cscript.exe +
+# WScript.Shell's CreateShortcut (a standard, well-documented technique; both cscript.exe and
+# wscript.exe are genuine Wine builtins, confirmed present in this CrossOver install) -- the same
+# real Windows Shell API a native installer would use. Previously this copied a pre-built,
+# tracked eM Client.lnk for x86 and only generated one fresh for x64 (a plain byte-level path
+# substitution on that tracked file isn't safe: "Program Files (x86)" and "Program Files" are
+# different lengths, and a .lnk's shell-item-ID-list encodes lengths/offsets elsewhere in the
+# binary that a substitution wouldn't update) -- unified onto cscript for both so there's exactly
+# one code path to maintain and no tracked binary to keep in sync with wherever this script
+# actually installs to.
 # ---------------------------------------------------------------------------
+
+if [[ "$ARCH" == "x64" ]]; then
+    WIN_APP_DIR="C:\\Program Files\\eM Client"
+else
+    WIN_APP_DIR="C:\\Program Files (x86)\\eM Client"
+fi
 
 STARTMENU_DIR="$BOTTLE_DIR/drive_c/users/crossover/AppData/Roaming/Microsoft/Windows/Start Menu/Programs"
 mkdir -p "$STARTMENU_DIR"
-cp "$LNK_FILE" "$STARTMENU_DIR/"
+WIN_LNK_PATH="Z:$(echo "$STARTMENU_DIR/eM Client.lnk" | sed 's/\//\\/g')"
+cat > "$TMPDIR/make-shortcut.vbs" <<VBSEOF
+Set oWS = WScript.CreateObject("WScript.Shell")
+Set oLink = oWS.CreateShortcut("$WIN_LNK_PATH")
+oLink.TargetPath = "$WIN_APP_DIR\MailClient.exe"
+oLink.WorkingDirectory = "$WIN_APP_DIR"
+oLink.Save
+VBSEOF
+WIN_VBS_PATH="Z:$(echo "$TMPDIR/make-shortcut.vbs" | sed 's/\//\\/g')"
+CX_BOTTLE="$BOTTLE_NAME" "$CXSTART_WINE" cscript //nologo "$WIN_VBS_PATH" >/dev/null \
+    || die "failed to generate the Start Menu shortcut via cscript"
+[[ -f "$STARTMENU_DIR/eM Client.lnk" ]] || die "cscript reported success but $STARTMENU_DIR/eM Client.lnk doesn't exist"
 log "Start Menu shortcut installed."
 
 # ---------------------------------------------------------------------------
