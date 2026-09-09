@@ -430,25 +430,37 @@ if [[ -f "$MARKER_DLL" ]]; then
     marker_revision="${marker_file_version##*.}"
     if [[ "$marker_emclient_version" == "$RELEASE_VERSION" && "$marker_revision" =~ ^[0-9]+$ ]]; then
         CURRENT_REVISION="$marker_revision"
-        # Compatibility check: revisions 4 and 5 both only ever existed under EARLIER stage
-        # numberings that predate today's Stage 4 (preview-pane periodic-repaint fix, see its own
-        # header comment further down). Revision 4 was the original numbering, where Stage 4 was
-        # the Exchange sync-freeze fix and always mandatory; revision 5 was the numbering after
-        # that fix was renumbered to Stage 5 and made optional. Either way, a bottle marked 4 or 5
-        # has mandatory Stages 1-3 plus the (now Stage 6) sync-freeze fix, but NOT the new
-        # mandatory Stage 4 -- a genuine gap this script's linear single-revision resume logic
-        # (START_STAGE = REVISION_LAST_STAGE[revision] + 1) can't safely represent: there's no
-        # single revision number meaning "stages 1-3 and 6 done, but not 4". Rather than guess
-        # (silently skip the new Stage 4 -- wrong -- or silently re-run stages that already
+        # Compatibility check: revision 5 ONLY ever existed under the EARLIER stage numbering
+        # that predates today's Stage 4 (preview-pane periodic-repaint fix, see its own header
+        # comment further down) -- back when Stage 5 was the (optional) Exchange sync-freeze fix.
+        # Today's REVISION_LAST_STAGE has no [5] entry (it jumps 4 -> 6), so no version of this
+        # script starting from this one will ever WRITE a revision-5 marker again -- any bottle
+        # showing 5 here can only have gotten it from an OLDER script, and unambiguously means
+        # "mandatory Stages 1-3 plus the (now Stage 6) sync-freeze fix, but NOT the new mandatory
+        # Stage 4" -- a gap this script's linear single-revision resume logic
+        # (START_STAGE = REVISION_LAST_STAGE[revision] + 1) can't safely represent. Rather than
+        # guess (silently skip the new Stage 4 -- wrong -- or silently re-run stages that already
         # ran -- also wrong), fail loudly and point at the safe way out.
-        if [[ "$CURRENT_REVISION" -eq 4 || "$CURRENT_REVISION" -eq 5 ]] && [[ $FORCE -eq 0 ]]; then
-            warn "this bottle is marked revision $CURRENT_REVISION under an EARLIER pipeline numbering,"
-            warn "from before today's Stage 4 (preview-pane periodic-repaint fix) existed -- it has"
-            warn "mandatory Stages 1-3 plus the optional Exchange sync-freeze fix (now Stage 6), but"
-            warn "NOT the new mandatory Stage 4. Re-run with --force to fully regenerate the pipeline"
-            warn "from the currently installed assemblies through your target revision (safe -- it"
-            warn "derives fresh output from what's actually installed, it doesn't touch original/)."
-            die "revision $CURRENT_REVISION (pre-Stage-4 numbering) needs --force to proceed."
+        #
+        # Revision 4 is deliberately NOT included in this check, even though it also predates
+        # Stage 4 under the OLDER numbering (where Stage 4 was itself the always-mandatory
+        # Exchange sync-freeze fix) -- unlike 5, that ambiguity is now purely historical: any
+        # bottle that hit old-revision-4 would already have been remapped forward to 5 the very
+        # first time a post-282-2 script ran against it (that script generation's own "eq 4 ->
+        # remap to 5" logic, since replaced by this same check on 5 above), so a live revision-4
+        # marker today can only mean what THIS script just wrote: mandatory Stages 1-4 done, the
+        # normal, common, and completely valid "already at the latest, nothing to do" case. Feed
+        # revision 4 through the ordinary DLL_ALREADY_PATCHED/resume logic below like any other
+        # entry in REVISION_LAST_STAGE.
+        if [[ "$CURRENT_REVISION" -eq 5 ]] && [[ $FORCE -eq 0 ]]; then
+            warn "this bottle is marked revision 5 under an EARLIER pipeline numbering, from"
+            warn "before today's Stage 4 (preview-pane periodic-repaint fix) existed -- it has"
+            warn "mandatory Stages 1-3 plus the optional Exchange sync-freeze fix (now Stage 6),"
+            warn "but NOT the new mandatory Stage 4. Re-run with --force to fully regenerate the"
+            warn "pipeline from the currently installed assemblies through your target revision"
+            warn "(safe -- it derives fresh output from what's actually installed, it doesn't"
+            warn "touch original/)."
+            die "revision 5 (pre-Stage-4 numbering) needs --force to proceed."
         fi
         log "found MailClient.Wine.dll: this install is at $RELEASE_VERSION revision $CURRENT_REVISION."
     else
