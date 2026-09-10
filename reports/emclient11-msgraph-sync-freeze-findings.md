@@ -1,21 +1,27 @@
 # eM Client 11 beta — Microsoft Graph sync freeze investigation
 
-**Status (latest session): TWO real root-cause mechanisms found and fixed at the DNS/socket
-level; a THIRD, different, CPU-bound mechanism found and NOT fixed; a concurrency-limiting
-mitigation for the third was tried and reverted after making things worse, not better.** See
-"Session N: DNS bypass and bounded socket I/O" onward below for the full, current story — the
-original "root MECHANISM confirmed... NOT fixed" framing directly below is now superseded for the
-DNS/timeout part of this bug (fixed), but the underlying investigation history is kept intact
-since it's still the correct explanation of *why* the DNS/socket fixes were the right next step.
-None of this session's fixes are deployed via `deploy.sh` or part of any numbered release yet —
-they exist as real tracked source in `il-patches/MailClient.Wine/` (`DnsConnectHelper.cs`,
+**Status (latest session): the DNS + socket-I/O fix (two of the three known mechanisms) is now
+promoted into the tracked pipeline as optional Stage 7 (`releases/11.0.196-beta/deploy.sh`),
+confirmed working live on the real machine that needed it.** The THIRD, different, CPU-bound
+mechanism (see "Session N: a third, different freeze mechanism" below) is still NOT fixed, and
+the concurrency-gate mitigation for it is still reverted/inert — Stage 7 does not claim to fix
+every Microsoft 365 freeze, only the DNS/socket one. See "Session N: promoted to the tracked
+pipeline (Stage 7)" at the very end of this report for what changed and how it was verified;
+everything above that section describes the investigation and prototyping that led here and is
+kept intact as the reasoning trail.
+
+The remaining paragraph below describes the PRE-promotion state (accurate for everything up to
+and including "Session N: the concurrency-gate experiment" further down) and is kept for
+history — read the final section for current status.
+
+None of this session's fixes were deployed via `deploy.sh` or part of any numbered release yet —
+they existed as real tracked source in `il-patches/MailClient.Wine/` (`DnsConnectHelper.cs`,
 `TokenRefreshRetryHelper.cs`, `AccountConcurrencyGate.cs`) plus a scratch, untracked fork of
 `il-patcher` with the new patch flags (`--patch-http-dns-connect-callback`,
 `--patch-token-refresh-retry`, `--patch-account-concurrency-gate`, plus several diagnostic-only
-flags) — none of it has been merged into the tracked `il-patches/il-patcher-Program.cs` or wired
-into a release script yet. This report exists so the next session doesn't have to re-derive any
-of this from scratch, and doesn't re-tread the dead ends (or the diagnostic-tooling bugs — see
-IL-patching lessons 18-19 in CLAUDE.md) that were already found and fixed.
+flags) — none of it had been merged into the tracked `il-patches/il-patcher-Program.cs` or wired
+into a release script. The dead ends (and the diagnostic-tooling bugs — see IL-patching lessons
+18-19 in CLAUDE.md) documented below are still worth reading before touching this area again.
 
 ---
 
@@ -753,3 +759,122 @@ the recursive walk is), is still open.
    `il-patcher` fork into the tracked `il-patches/il-patcher-Program.cs` and wiring into a new
    `releases/11.0.196-beta` stage — they're the most solid, best-verified result of this whole
    investigation so far.
+
+## Session N: promoted to the tracked pipeline (Stage 7)
+
+Prompted by the user reproducing the freeze live on the same machine this whole investigation was
+run against, and confirming it still needed the (until now) untracked DNS/socket fix. Promoted
+exactly the two DNS/socket fixes recommended in the "Updated recommended next steps" item 6 above
+— `DnsConnectHelper`/`TimeoutBoundedNetworkStream` (Fix 1+2) and `TokenRefreshRetryHelper`
+(Fix 3) — into `il-patches/il-patcher-Program.cs` as two new named flags,
+`--patch-http-dns-connect-callback` and `--patch-token-refresh-retry`, and wired them into
+`releases/11.0.196-beta/deploy.sh` as a new optional **Stage 7**. Deliberately did NOT promote
+`AccountConcurrencyGate` — that mitigation is confirmed reverted/ineffective (see "Session N: the
+concurrency-gate experiment" above), promoting it would ship dead weight at best and a regression
+risk at worst.
+
+### What changed from the original scratch-tool version
+
+Both helper files (`il-patches/MailClient.Wine/DnsConnectHelper.cs` and
+`TokenRefreshRetryHelper.cs`) had their `Log(...)` diagnostic calls stripped before shipping —
+they wrote to `C:\Temp\claude-*.log` on essentially every socket read/write, appropriate for a
+live investigation but not for a production fix wired into `deploy.sh` (same reasoning already
+applied to every other diagnostic-only patch in this project, e.g. `--patch-diag`).
+
+The original design (per Fix 3's own comment, from the scratch tool) built a `Func<...>` delegate
+directly in hand-authored Cecil IL to pass the moved `__GetAccessTokenRefreshResponseCore` method
+into a retry wrapper. That's genuinely impractical to get right by hand (importing the generic
+delegate type, `ldftn`/`newobj` against a method whose cross-assembly accessibility would also
+need checking). The version that shipped instead pushes that complexity into ordinary compiled
+C#: `TokenRefreshRetryHelper.WithRetryAsync` takes the caller `instance` and re-invokes the moved
+core method via a cached `MethodInfo.Invoke` (resolved once via `typeof(Credentials).GetMethod(...,
+BindingFlags.NonPublic)`), so the hand-authored IL wrapper body is a trivial 4-instruction
+`ldarg.0; ldarg.1; ldarg.2; call` rather than a delegate construction. Same idea applied to the
+DNS fix: `DnsConnectHelper.InstallConnectCallback(HttpClientHandler)` does the
+`SocketsHttpHandler` reflection + `ConnectCallback` assignment itself in ordinary C#, so the IL
+patch inserted into `InteractionController.CreateHttpClient` is just `ldloc; call` — no delegate
+construction in IL at all.
+
+### A new architectural first for this pipeline: a REAL loaded sibling assembly
+
+Every prior stage's `MailClient.Wine.dll` was purely an inert version-marker file — deployed
+alongside the app but never actually loaded or referenced by any code (the marker mechanism reads
+its `FileVersion` externally via `il-patcher --version`, entirely outside the running app). Stage
+7 is the first stage where `MailClient.dll`/`MailClient.Accounts.dll` genuinely call into
+`MailClient.Wine.dll` at runtime, which surfaced two new problems, both fixed in `deploy.sh`
+directly (not in this report's own C# files):
+
+1. **Target framework mismatch.** The shared `MailClient.Wine.csproj` (used for the plain
+   marker-only build, still `net8.0` — matching the 10.4.5674 pipeline's own bottles, which is
+   the only reason a wrong target framework never mattered before) can't be used for a REAL
+   loaded assembly in this eM Client 11 (net10.0) pipeline: referencing `MailClient.Accounts.dll`
+   from a net8.0 project failed at build time
+   (`CS1705: ... uses 'System.Runtime, Version=10.0.0.0' which has a higher version than
+   referenced assembly`). Fixed the same way `install-msix.sh`'s own font-systemlink-writer step
+   already handles an identical net8.0-vs-net10.0 split: a FRESH, separate csproj generated
+   inline in `deploy.sh` (not an edit to the shared source file, which the 10.4.5674 pipeline
+   still needs unchanged), targeting `net10.0`.
+2. **`MailClient.deps.json` needs a real entry.** Confirmed the hard way, live, TWICE:
+   - First crash: `MailClient.deps.json` was never added to `deploy.sh`'s own `DEPLOY_FILES`
+     array at all, so even a correctly-patched `deps.json` sitting in the pipeline's temp
+     workdir never actually reached the bottle. Fixed by adding it to `DEPLOY_FILES` and making
+     the "backfill non-dll files from `$WORKDIR/original`" `rsync` step (needed anyway — every
+     Cecil patch function in this tool only ever copies `*.dll` files forward, so any stage's own
+     output directory is missing `MailClient.deps.json` and everything else non-dll) run
+     unconditionally on every deploy, not just when Stage 7 fires.
+   - Second crash, after fixing that: `System.IO.FileNotFoundException: Could not load file or
+     assembly 'MailClient.Wine, Version=11.0.196.0'` — `license-oaep-patcher-patch-deps-json.py`'s
+     `VERSION` argument was left at its default `"1.0.0"`, but `MailClient.Wine.dll` was built
+     with `-p:AssemblyVersion="$RELEASE_VERSION.0"` (`11.0.196.0`) to match this pipeline's own
+     versioning convention — the deps.json entry existed, just under the wrong version key, so
+     resolution for the version `MailClient.dll`'s own `AssemblyReference` actually requested
+     still failed. (The BouncyCastle helper's own deps.json entry never hit this because its
+     `AssemblyVersion` happens to also default to `1.0.0.0`, coincidentally matching the script's
+     default.) Fixed by passing `"$RELEASE_VERSION.0"` explicitly.
+
+Both were caught by an actual live launch test, not by decompile/`--dump-handlers` alone — a
+`FileNotFoundException` at the assembly-loader level is invisible to both those checks, the same
+"decompiling clean is not sufficient proof" shape as several CLAUDE.md IL-patching lessons, just
+a new trigger (assembly-resolution failure rather than a CLR verifier/JIT one).
+
+### Design: an independent axis, not another linear revision number
+
+Stage 6 (Exchange sync-freeze, classic engine) and Stage 7 (Microsoft 365/Graph, this fix) are
+two genuinely unrelated optional fixes a bottle can carry in any combination — the existing
+`PIPELINE_LATEST_STAGE`/`REVISION_LAST_STAGE` scheme only knows how to say "stages 1..N are all
+done," which can't represent "has Stage 7 but not Stage 6" or vice versa. Rather than force them
+onto the same linear axis, Stage 7's applied/not-applied state is detected independently by
+inspecting whatever `MailClient.Wine.dll` is actually installed (via the tool's existing
+`--find-member <dll> DnsConnectHelper` scan mode — present means Stage 7's real functional build
+is there, absent means it's still just a plain marker or doesn't exist yet) rather than through
+any revision number. This lets Stage 7 be added to (or left off) an otherwise fully up-to-date
+bottle with a plain re-run, no `--force` and no disturbance to the mandatory/Stage-6 axis, and
+lets a later plain re-run correctly avoid re-patching an already-patched bottle (verified live:
+a re-run after Stage 7 was applied correctly reported "already at revision 4 ... skipping the DLL
+patch pipeline" and left the real functional `MailClient.Wine.dll` in place rather than
+regressing it back to a plain marker rebuild).
+
+### Verification
+
+Decompile + `--dump-handlers` on every touched method (`InteractionController.CreateHttpClient`,
+`Credentials.GetAccessTokenRefreshResponse`, and the moved
+`__GetAccessTokenRefreshResponseCore`) — all clean. Applied via the real `deploy.sh` (not just
+manual `$ILP` commands) against `emClient_11_beta_win_11` (the local VM used for the preview-pane
+investigation, no Graph accounts configured there): full startup, account sync, and main window
+all completed with zero crashes — confirms the wiring itself is safe even where the DNS fix's
+own code path isn't specifically exercised by a Graph account.
+
+Then applied to the actual remote machine this investigation was run against (`emClient_11_beta`
+bottle, reached only via a file mount and the `emclient-runner.sh` marker protocol — no direct
+shell access) after resetting it from experimental-DNS-fix-applied back to pristine-plus-tracked-
+pipeline, confirming first that the classic-pipeline-only baseline still needed the fix (the user
+reproduced the freeze) and then that Stage 7 restores stability: clean startup under real host
+contention (load average ~5.3, 7.3GB swap in use), full sync, main window up, zero new crash
+reports. This is the first time this exact machine has run a build with these fixes coming from
+the TRACKED pipeline rather than a hand-maintained scratch fork.
+
+**Not yet re-confirmed on the remote machine**: a full reproduction of the original heavy-load
+"sync all folders for offline use" scenario specifically, to directly re-verify the DNS/socket
+fix holds under the same conditions the original untracked build was tested against. The basic
+startup-and-sync path is confirmed stable; the user's own follow-up testing under real working
+conditions is the next real signal.

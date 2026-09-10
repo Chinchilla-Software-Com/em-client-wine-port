@@ -274,7 +274,7 @@ but don't rely on that alone).
   as long as the patch content stays identical across versions.
   This introduced a real split worth understanding before touching the script again:
   `OUR_RELEASE_NUMBER_FOR_VERSION` (an associative array, currently
-  `["11.0.196"]=5 ["11.0.282"]=4`) is a PER-VERSION release-tag number, used only for
+  `["11.0.196"]=6 ["11.0.282"]=5`) is a PER-VERSION release-tag number, used only for
   `release/<version>-<N>` git tags and human-facing log messages — `11.0.282` started its own
   count at 1 even though the pipeline itself was already at stage 4 (now the mandatory pipeline's
   stage 3, plus optional stage 5 — see the Status section's `release/11.0.282-2` entry below for
@@ -299,7 +299,7 @@ but don't rely on that alone).
   decompile-diff plus a dry run of every stage against `original/em-11.0.282-x64/` (see
   `install-msix.sh`'s own bullet above for the file-level findings) — the patch content applies
   identically regardless of architecture.
-- **Status:** five DLL fixes so far, plus fonts, plus an install-time OS-dependency fix.
+- **Status:** six DLL fixes so far, plus fonts, plus an install-time OS-dependency fix.
   - `release/11.0.196-1` — a startup crash (PBKDF2 key derivation broken under Wine's
     `bcrypt.dll`, blocking `InitOnBackground` before the main window ever appears). Full
     root-cause and fix details: `reports/emclient11-pbkdf2-startup-crash-findings.md`. Fixed via
@@ -412,7 +412,39 @@ but don't rely on that alone).
     Deployed live to `emClient_11_beta_win_11` and **confirmed working by the user**: reproduced
     the freeze deliberately (mouse held outside the VM for 20-30s) and confirmed the pane now
     recovers on its own within about a second — "This looks like the fix for this issue."
-  All five DLL-patch flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every
+  - `release/11.0.196-6` / `release/11.0.282-5` — Microsoft 365 / Graph API DNS+socket sync-freeze
+    fix, promoted into the tracked pipeline as a new optional **Stage 7** (a genuinely separate bug
+    from Stage 6's classic IMAP/EWS Exchange sync freeze — Graph accounts hit the same Wine
+    `GetAddrInfoExW` defect through `HttpClient`'s own connection path instead). Full investigation,
+    every dead end (including a reverted concurrency-gate experiment and a third, unfixed, CPU-bound
+    freeze mechanism this stage does NOT address): `reports/emclient11-msgraph-sync-freeze-findings.md`
+    (see its final "Session N: promoted to the tracked pipeline (Stage 7)" section for what changed
+    from the original scratch-tool prototype). `--patch-http-dns-connect-callback` and
+    `--patch-token-refresh-retry` wire `MailClient.Wine.DnsConnectHelper`/`TimeoutBoundedNetworkStream`/
+    `TokenRefreshRetryHelper` (`il-patches/MailClient.Wine/`) into
+    `InteractionController.CreateHttpClient` and `Credentials.GetAccessTokenRefreshResponse` — the
+    first stage in this release line where `MailClient.Wine.dll` is a REAL loaded dependency rather
+    than an inert version-marker file, which surfaced two new problems fixed directly in `deploy.sh`
+    (a net8.0-vs-net10.0 target-framework mismatch, and a `MailClient.deps.json` entry that was
+    missing entirely on the first attempt, then present under the wrong version key on the second --
+    both caught only by an actual live launch test, not decompile/`--dump-handlers` alone). Tracked
+    on its OWN independent axis rather than through `REVISION_LAST_STAGE` -- Stage 6 and Stage 7 are
+    unrelated fixes a bottle can carry in any combination, detected instead by inspecting whatever
+    `MailClient.Wine.dll` is actually installed (`--find-member <dll> DnsConnectHelper`). Verified via
+    decompile + `--dump-handlers` on all three touched methods, applied identically against
+    `original/em-11.0.196/`, `original/em-11.0.282/`, and `original/em-11.0.282-x64/`, deployed via
+    the real `deploy.sh` (not manual commands) to `emClient_11_beta_win_11` (clean startup, full
+    sync, no crashes -- no Graph accounts there to exercise the fix directly, but confirms the
+    wiring itself is safe), and then to the actual remote machine the whole investigation was run
+    against (reached only via a file mount + the `emclient-runner.sh` marker protocol -- no direct
+    shell access): reset from its prior experimental-DNS-fix state back to pristine-plus-tracked-
+    pipeline first (confirming the freeze still needed the fix), then redeployed with Stage 7 via
+    the same manual-command sequence `deploy.sh` runs internally (its own bottle-discovery can't
+    reach a path outside `~/.cxoffice` on this machine) -- clean startup under real host contention
+    (load average ~5.3, 7.3GB swap), full sync, main window up, zero new crash reports. Deliberately
+    did NOT promote `AccountConcurrencyGate` (the reverted, ineffective mitigation for the separate
+    unfixed CPU-bound mechanism) -- only the two confirmed-solid DNS/socket fixes.
+  All six DLL fixes' patch flags live in the SAME tracked `il-patches/il-patcher-Program.cs` as every
   v10 patch flag (shared tooling, not duplicated per release line) — only the deploy scripts and
   release folders are kept separate, not the patcher tool itself. Also added (not DLL patches, so
   not part of the `REVISION_LAST_STAGE`/stage-number scheme, same as v10): vendored font

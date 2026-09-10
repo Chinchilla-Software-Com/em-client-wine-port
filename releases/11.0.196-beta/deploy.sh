@@ -55,6 +55,19 @@
 #   ./deploy.sh --skip-sync-freeze-fix
 #                                   leave the optional Exchange sync-freeze fix out, without the
 #                                   interactive prompt.
+#   ./deploy.sh --enable-msgraph-dns-fix
+#                                   include the optional Microsoft 365 / Graph API DNS+socket
+#                                   sync-freeze fix (Stage 7 -- a DIFFERENT bug/fix from Stage 6,
+#                                   see its own header comment further down) without the
+#                                   interactive prompt. Tracked on its own independent axis, not
+#                                   through --max-revision/REVISION_LAST_STAGE like every stage
+#                                   above -- detected instead by inspecting whatever
+#                                   MailClient.Wine.dll is actually installed (see Stage 7's own
+#                                   comment), so it can be added to or left off an otherwise
+#                                   up-to-date bottle without needing --force.
+#   ./deploy.sh --skip-msgraph-dns-fix
+#                                   leave the optional Microsoft 365 / Graph API sync-freeze fix
+#                                   out, without the interactive prompt.
 #   ./deploy.sh --install-fonts     install the vendored fonts/ without the license-consent prompt
 #   ./deploy.sh --no-fonts          skip font installation without the license-consent prompt
 #
@@ -69,10 +82,12 @@
 # before deploying. --install-fonts / --no-fonts answer that non-interactively -- for scripted or
 # repeated runs (e.g. a periodic check) where a prompt can't be answered by a human.
 #
-# Requires: dotnet SDK (checked below, prints install instructions if missing). No python3 --
-# unlike the 10.4.5674 pipeline's Stage 5, this fix adds no new sibling assembly, so there's no
-# MailClient.deps.json edit needed. No network access needed beyond ilspycmd/NuGet restore
-# (same as the sibling script).
+# Requires: dotnet SDK (checked below, prints install instructions if missing). python3 is only
+# needed if Stage 7 (the optional Microsoft 365 / Graph API fix) is accepted -- that's the first
+# stage in this release line to add a new sibling assembly MailClient.Wine.dll is genuinely
+# LOADED as (same MailClient.deps.json edit the 10.4.5674 pipeline's own Stage 5 needs); every
+# mandatory stage plus Stage 6 need neither. No network access needed beyond ilspycmd/NuGet
+# restore (same as the sibling script).
 
 set -euo pipefail
 
@@ -138,6 +153,8 @@ NO_FONTS=0
 MAX_REVISION=""
 ENABLE_SYNC_FREEZE_FIX=0
 SKIP_SYNC_FREEZE_FIX=0
+ENABLE_MSGRAPH_DNS_FIX=0
+SKIP_MSGRAPH_DNS_FIX=0
 
 print_help() {
     sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -152,6 +169,8 @@ while [[ $# -gt 0 ]]; do
         --max-revision) MAX_REVISION="${2:-}"; shift 2 ;;
         --enable-sync-freeze-fix) ENABLE_SYNC_FREEZE_FIX=1; shift ;;
         --skip-sync-freeze-fix) SKIP_SYNC_FREEZE_FIX=1; shift ;;
+        --enable-msgraph-dns-fix) ENABLE_MSGRAPH_DNS_FIX=1; shift ;;
+        --skip-msgraph-dns-fix) SKIP_MSGRAPH_DNS_FIX=1; shift ;;
         --install-fonts) INSTALL_FONTS=1; shift ;;
         --no-fonts) NO_FONTS=1; shift ;;
         -h|--help) print_help; exit 0 ;;
@@ -160,6 +179,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $ENABLE_SYNC_FREEZE_FIX -eq 1 && $SKIP_SYNC_FREEZE_FIX -eq 1 ]] && die "--enable-sync-freeze-fix and --skip-sync-freeze-fix are mutually exclusive"
+[[ $ENABLE_MSGRAPH_DNS_FIX -eq 1 && $SKIP_MSGRAPH_DNS_FIX -eq 1 ]] && die "--enable-msgraph-dns-fix and --skip-msgraph-dns-fix are mutually exclusive"
 
 # EFFECTIVE_TARGET_REVISION: what this run should end up at -- either this script's own latest
 # (PIPELINE_LATEST_STAGE, shared across every supported eM Client version) or, if --max-revision
@@ -469,9 +489,55 @@ if [[ -f "$MARKER_DLL" ]]; then
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# Optional: Stage 7, the Microsoft 365 / Graph API DNS+socket sync-freeze fix -- a genuinely
+# separate bug and fix from Stage 6's classic IMAP/EWS Exchange sync freeze (see Stage 7's own
+# header comment further down for what it does and why). Tracked on its OWN independent axis,
+# not through EFFECTIVE_TARGET_REVISION/REVISION_LAST_STAGE like every stage above: Stage 6 and
+# Stage 7 are two unrelated optional fixes a bottle can carry in any combination, which the
+# single linear "revision N means stages 1..N are all done" scheme above has no way to
+# represent. Detected instead by inspecting whatever MailClient.Wine.dll is ACTUALLY installed
+# right now, via the existing --find-member scan mode: a plain marker build (from any of Stages
+# 1-6) has no MailClient.Wine.DnsConnectHelper type at all; Stage 7's own build of that same
+# filename does, because it's genuinely a different, larger assembly (the version-marker
+# attributes plus real functional code the app loads and calls into) rather than just a
+# different FileVersion number.
+# ---------------------------------------------------------------------------
+
+MSGRAPH_DNS_FIX_ALREADY_APPLIED=0
+if [[ -f "$BOTTLE_APP_DIR/MailClient.Wine.dll" ]] \
+    && $ILP --find-member "$BOTTLE_APP_DIR/MailClient.Wine.dll" DnsConnectHelper 2>/dev/null | grep -q "^type "; then
+    MSGRAPH_DNS_FIX_ALREADY_APPLIED=1
+fi
+
+INCLUDE_MSGRAPH_DNS_FIX=$MSGRAPH_DNS_FIX_ALREADY_APPLIED
+if [[ -n "$MAX_REVISION" ]]; then
+    : # An explicit --max-revision is about the mandatory/Stage-6 axis only (see that flag's own
+      # doc comment) -- deliberately not touching Stage 7's independent already-applied/not
+      # state either way, same "don't ask, don't second-guess an explicit revision request"
+      # reasoning as Stage 6's own prompt.
+elif [[ $ENABLE_MSGRAPH_DNS_FIX -eq 1 ]]; then
+    INCLUDE_MSGRAPH_DNS_FIX=1
+elif [[ $SKIP_MSGRAPH_DNS_FIX -eq 1 ]]; then
+    INCLUDE_MSGRAPH_DNS_FIX=0
+elif [[ $MSGRAPH_DNS_FIX_ALREADY_APPLIED -eq 0 ]]; then
+    echo ""
+    echo "Stage 7 (optional): a fix for Microsoft 365 / Graph API account sync freezes -- a"
+    echo "DIFFERENT bug from Stage 6's classic IMAP/EWS Exchange sync freeze. Root cause: the"
+    echo "same broken Wine async DNS resolution, this time hit through HttpClient's own"
+    echo "connection path, plus a second hang in socket I/O found after fixing the first."
+    echo "Confirmed fixing a real, reproduced freeze live; not yet soaked broadly, so kept"
+    echo "optional. Skipping this leaves Microsoft 365 / Graph accounts exposed to the Wine"
+    echo "defect Stage 6 doesn't touch; you can opt in later with a plain re-run."
+    read -r -p "Include the Microsoft 365 / Graph API sync-freeze fix in this deploy? [y/N] " gfreply
+    [[ "$gfreply" =~ ^[Yy]$ ]] && INCLUDE_MSGRAPH_DNS_FIX=1
+fi
+NEEDS_MSGRAPH_DNS_FIX_WORK=0
+[[ $INCLUDE_MSGRAPH_DNS_FIX -eq 1 && $MSGRAPH_DNS_FIX_ALREADY_APPLIED -eq 0 ]] && NEEDS_MSGRAPH_DNS_FIX_WORK=1
+
 DLL_ALREADY_PATCHED=0
 START_STAGE=1
-if [[ $FORCE -eq 0 && "$CURRENT_REVISION" -ge "$EFFECTIVE_TARGET_REVISION" ]]; then
+if [[ $FORCE -eq 0 && "$CURRENT_REVISION" -ge "$EFFECTIVE_TARGET_REVISION" && $NEEDS_MSGRAPH_DNS_FIX_WORK -eq 0 ]]; then
     DLL_ALREADY_PATCHED=1
     log "already at $RELEASE_VERSION revision $CURRENT_REVISION (this run targets revision"
     log "$EFFECTIVE_TARGET_REVISION) -- skipping the DLL patch pipeline (pass"
@@ -480,6 +546,15 @@ elif [[ "$CURRENT_REVISION" -gt 0 && $FORCE -eq 0 ]]; then
     START_STAGE=$(( ${REVISION_LAST_STAGE[$CURRENT_REVISION]} + 1 ))
     log "install is at $RELEASE_VERSION revision $CURRENT_REVISION -- resuming from Stage $START_STAGE"
     log "(stages 1-$(( START_STAGE - 1 )) already applied, left as-is)."
+fi
+if [[ $DLL_ALREADY_PATCHED -eq 1 && $NEEDS_MSGRAPH_DNS_FIX_WORK -eq 1 ]]; then
+    # Can't actually happen (NEEDS_MSGRAPH_DNS_FIX_WORK is one of the conditions gating
+    # DLL_ALREADY_PATCHED itself above) -- defensive assertion, not a reachable state.
+    die "internal error: DLL_ALREADY_PATCHED and NEEDS_MSGRAPH_DNS_FIX_WORK both true"
+fi
+if [[ $NEEDS_MSGRAPH_DNS_FIX_WORK -eq 1 && $DLL_ALREADY_PATCHED -eq 0 && "$CURRENT_REVISION" -ge "$EFFECTIVE_TARGET_REVISION" ]]; then
+    log "mandatory pipeline (and Stage 6, if targeted) already at revision $CURRENT_REVISION --"
+    log "entering the patch pipeline solely to add Stage 7 (Microsoft 365 / Graph API fix)."
 fi
 
 if [[ $DLL_ALREADY_PATCHED -eq 0 ]]; then
@@ -827,13 +902,129 @@ else
     FINAL_DIR="$STAGE4_DIR"
 fi
 
-# The version marker is copied in here, unconditionally, regardless of which of the three
-# branches above produced FINAL_DIR -- it must always reflect EFFECTIVE_TARGET_REVISION (the
-# revision THIS run actually deploys), not just whichever stage happened to run last. Safe to
-# always overwrite: reaching this point at all means EFFECTIVE_TARGET_REVISION > CURRENT_REVISION
-# (the DLL_ALREADY_PATCHED short-circuit above already handled the "nothing to do" case), so this
-# is always a forward move to a higher revision than whatever marker (if any) was already there.
-cp "$MAILCLIENT_WINE_DLL" "$FINAL_DIR/"
+# ---------------------------------------------------------------------------
+# Stage 7 (OPTIONAL, independent axis -- see the detection/prompt block above): Microsoft 365 /
+# Graph API DNS+socket sync-freeze fix -- a genuinely separate bug from Stage 6's classic
+# IMAP/EWS Exchange sync freeze (see reports/emclient11-msgraph-sync-freeze-findings.md for the
+# full investigation, including two mitigations tried and found insufficient before this, and a
+# THIRD, different, CPU-bound freeze mechanism found and NOT fixed by this or anything else so
+# far -- this stage does not claim to fix every Microsoft 365 freeze, only the DNS/socket one).
+#
+# Root cause: the same Wine GetAddrInfoExW defect already behind Stage 6's Exchange-sync bug,
+# but reached through SocketsHttpHandler's own async DNS resolution when the Microsoft Graph SDK
+# makes its HTTP calls -- confirmed via a bracketed CX_DEBUGMSG=+winsock trace and measured live
+# as a single Graph HTTP call taking ~46 seconds with zero retries. A second hang, found live
+# after fixing DNS alone, moved to TLS handshake/request/response -- the same broken-async-I/O
+# defect family, one layer deeper. Fixed by MailClient.Wine.DnsConnectHelper/
+# TimeoutBoundedNetworkStream (il-patches/MailClient.Wine/DnsConnectHelper.cs): resolve DNS via
+# the older synchronous Dns.GetHostAddresses and connect directly by IP (sidestepping the broken
+# async DNS path entirely), then bound every subsequent Read/Write to a genuinely synchronous,
+# SO_RCVTIMEO/SO_SNDTIMEO-bounded socket call instead of .NET's broken async socket path.
+# MailClient.Wine.TokenRefreshRetryHelper (same directory) additionally adds a narrow 3-attempt
+# retry for OAuth2 token refresh (MailClient.Accounts.Credentials.GetAccessTokenRefreshResponse),
+# confirmed via decompile to have had zero retry of its own for exactly the network failures the
+# two fixes above can now surface as a clean timeout instead of an indefinite hang.
+#
+# Unlike every stage before it, MailClient.Wine.dll here is a REAL loaded dependency (both
+# --patch-http-dns-connect-callback and --patch-token-refresh-retry call into it directly), not
+# an inert marker file the app never actually loads -- so it must be built targeting net10.0
+# (matching this app's own target framework; the plain version-marker build above stays net8.0,
+# unaffected, since it's still never loaded by anything and the 10.4.5674 pipeline shares that
+# same csproj for its own net8.0 bottles), and MailClient.deps.json needs a real entry for it
+# (same mechanism as the 10.4.5674 pipeline's own BouncyCastle helper, Stage 5 there).
+# ---------------------------------------------------------------------------
+
+if [[ $INCLUDE_MSGRAPH_DNS_FIX -eq 1 ]]; then
+    if [[ $MSGRAPH_DNS_FIX_ALREADY_APPLIED -eq 1 ]]; then
+        log "Stage 7 (MS Graph DNS/socket fix) already applied -- carrying the existing functional"
+        log "MailClient.Wine.dll forward as-is (MailClient.dll/MailClient.Accounts.dll already"
+        log "have this baked in via the pass-through logic above)."
+        MAILCLIENT_WINE_DLL_OVERRIDE="$WORKDIR/original/MailClient.Wine.dll"
+    else
+        log "Stage 7: Microsoft 365 / Graph API DNS+socket sync-freeze fix..."
+        mkdir -p "$WORKDIR/tools/MailClient.Wine.Full"
+        cp "$IL_PATCHES_DIR/MailClient.Wine/VersionMarker.cs" \
+           "$IL_PATCHES_DIR/MailClient.Wine/DnsConnectHelper.cs" \
+           "$IL_PATCHES_DIR/MailClient.Wine/TokenRefreshRetryHelper.cs" \
+           "$WORKDIR/tools/MailClient.Wine.Full/"
+        # A fresh csproj, NOT a copy of the shared net8.0 one -- same reasoning and same pattern
+        # as the font-systemlink-writer step below builds its own net10.0 csproj rather than
+        # editing the shared net8.0 source file the 10.4.5674 pipeline still needs unchanged.
+        cat > "$WORKDIR/tools/MailClient.Wine.Full/MailClient.Wine.csproj" <<EOF
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>MailClient.Wine</RootNamespace>
+    <AssemblyName>MailClient.Wine</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="MailClient.Accounts">
+      <HintPath>$BOTTLE_APP_DIR/MailClient.Accounts.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
+EOF
+        dotnet build -c Release \
+            -p:AssemblyVersion="$RELEASE_VERSION.0" \
+            -p:FileVersion="$RELEASE_VERSION.$EFFECTIVE_TARGET_REVISION" \
+            "$WORKDIR/tools/MailClient.Wine.Full" >"$WORKDIR/build-mailclient-wine-full.log" 2>&1 \
+            || { cat "$WORKDIR/build-mailclient-wine-full.log" >&2; die "failed to build the full MailClient.Wine assembly for Stage 7 (log above)"; }
+        WINE_FULL_DLL="$WORKDIR/tools/MailClient.Wine.Full/bin/Release/net10.0/MailClient.Wine.dll"
+
+        $ILP --patch-http-dns-connect-callback "$FINAL_DIR" "$WINE_FULL_DLL" "$WORKDIR/output-stage7a"
+        $ILP --patch-token-refresh-retry "$WORKDIR/output-stage7a" "$WINE_FULL_DLL" "$WORKDIR/output-stage7-final"
+        FINAL_DIR="$WORKDIR/output-stage7-final"
+        MAILCLIENT_WINE_DLL_OVERRIDE="$WINE_FULL_DLL"
+    fi
+else
+    MAILCLIENT_WINE_DLL_OVERRIDE=""
+fi
+
+# Both Cecil patch invocations (any stage, not just Stage 7) only ever copy *.dll files forward --
+# non-dll files like MailClient.deps.json never make it into a stage's own output directory.
+# Backfill everything ELSE from $WORKDIR/original (the one directory guaranteed to hold a
+# complete, untouched copy of everything the live bottle had) unconditionally, regardless of
+# which stages ran this time -- --ignore-existing so no .dll actually patched this run is ever
+# clobbered back to its pre-patch bytes. Only ever actually changes anything when Stage 7 ran
+# (every other stage's own file set already has no non-dll gaps to fill), but doing it
+# unconditionally, every run, is simpler and cheaper than conditioning it on which stage(s) fired.
+rsync -a --ignore-existing "$WORKDIR/original"/ "$FINAL_DIR"/
+
+if [[ $INCLUDE_MSGRAPH_DNS_FIX -eq 1 && $MSGRAPH_DNS_FIX_ALREADY_APPLIED -eq 0 ]]; then
+    # MailClient.deps.json: MailClient.Wine is now a REAL loaded dependency (not just an inert
+    # marker file sitting alongside the app) -- needs an explicit entry, same mechanism as the
+    # 10.4.5674 pipeline's own BouncyCastle helper (Stage 5 there). VERSION here must match the
+    # AssemblyVersion actually baked into MailClient.Wine.dll ($RELEASE_VERSION.0, set via the
+    # -p:AssemblyVersion build property above) -- confirmed the hard way live: passing the
+    # BouncyCastle helper's own default "1.0.0" here (its AssemblyVersion happens to also default
+    # to 1.0.0.0 unless overridden, which is why that value worked fine there) built and deployed
+    # without any error, but crashed on first launch with
+    # System.IO.FileNotFoundException: Could not load ... 'MailClient.Wine, Version=11.0.196.0'
+    # -- the deps.json entry existed, but under the wrong version key, so runtime resolution for
+    # the version MailClient.dll's own AssemblyReference actually asks for still failed.
+    command -v python3 >/dev/null 2>&1 || die "python3 is required for Stage 7 (patching MailClient.deps.json) but wasn't found"
+    python3 "$IL_PATCHES_DIR/license-oaep-patcher-patch-deps-json.py" \
+        "$FINAL_DIR/MailClient.deps.json" "MailClient.Wine" "$RELEASE_VERSION.0" ".NETCoreApp,Version=v10.0/win-x86" \
+        || die "failed to patch MailClient.deps.json for MailClient.Wine (Stage 7)"
+fi
+
+# The version marker (or Stage 7's real functional build of the same filename, when included) is
+# copied in here, unconditionally, regardless of which branch above produced FINAL_DIR -- it must
+# always reflect EFFECTIVE_TARGET_REVISION (the revision THIS run actually deploys on the
+# mandatory/Stage-6 axis), not just whichever stage happened to run last. Safe to always
+# overwrite: either this is a forward move on that axis (the DLL_ALREADY_PATCHED short-circuit
+# above already handled "nothing to do on either axis"), or Stage 7 alone is what brought us into
+# this block, in which case the marker's own revision number is unchanged from what's already
+# installed -- still correct to (re)write, just not a "forward move" in that narrower sense.
+if [[ -n "$MAILCLIENT_WINE_DLL_OVERRIDE" ]]; then
+    cp "$MAILCLIENT_WINE_DLL_OVERRIDE" "$FINAL_DIR/MailClient.Wine.dll"
+else
+    cp "$MAILCLIENT_WINE_DLL" "$FINAL_DIR/"
+fi
 
 # ---------------------------------------------------------------------------
 # Verify -- run automatically before anything is deployed.
@@ -925,6 +1116,30 @@ if [[ $START_STAGE -le 6 && $EFFECTIVE_LAST_STAGE -ge 6 ]]; then
         || die "verification failed: --dump-handlers reported a handler-ordering violation in Folder.__folderSyncTaskEntry"
 fi
 
+# Stage 7 verification -- only meaningful (and only ran) when Stage 7 was newly applied this run
+# (a carry-forward of an already-applied Stage 7 has nothing new to verify -- MailClient.dll/
+# MailClient.Accounts.dll came from the untouched $WORKDIR/original pass-through, already proven
+# correct by whichever earlier run originally applied it).
+if [[ $INCLUDE_MSGRAPH_DNS_FIX -eq 1 && $MSGRAPH_DNS_FIX_ALREADY_APPLIED -eq 0 ]]; then
+    $ILSPY -t "MailClient.Protocols.InteractionController" "$FINAL_DIR/MailClient.dll" | grep -q "InstallConnectCallback" \
+        || die "verification failed: InteractionController.CreateHttpClient doesn't reference InstallConnectCallback -- MS Graph DNS fix missing"
+
+    $ILSPY -t "MailClient.Accounts.Credentials" "$FINAL_DIR/MailClient.Accounts.dll" | grep -q "__GetAccessTokenRefreshResponseCore" \
+        || die "verification failed: Credentials.__GetAccessTokenRefreshResponseCore not found -- token-refresh retry fix missing"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.dll" MailClient.Protocols.InteractionController CreateHttpClient 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in InteractionController.CreateHttpClient"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.Accounts.dll" MailClient.Accounts.Credentials GetAccessTokenRefreshResponse 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in Credentials.GetAccessTokenRefreshResponse"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.Accounts.dll" MailClient.Accounts.Credentials __GetAccessTokenRefreshResponseCore 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in Credentials.__GetAccessTokenRefreshResponseCore"
+
+    grep -q "\"MailClient.Wine/$RELEASE_VERSION.0\"" "$FINAL_DIR/MailClient.deps.json" \
+        || die "verification failed: MailClient.deps.json has no MailClient.Wine/$RELEASE_VERSION.0 entry -- Stage 7's helper assembly won't load at runtime"
+fi
+
 log "all verification checks passed."
 
 # ---------------------------------------------------------------------------
@@ -935,7 +1150,7 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="$BACKUPS_DIR/${BOTTLE_NAME}-${TIMESTAMP}"
 mkdir -p "$BACKUP_DIR"
 
-DEPLOY_FILES=(MailClient.dll MailClient.Abstractions.dll MailClient.Common.UI.dll MailClient.Accounts.dll MailClient.Wine.dll)
+DEPLOY_FILES=(MailClient.dll MailClient.Abstractions.dll MailClient.Common.UI.dll MailClient.Accounts.dll MailClient.Wine.dll MailClient.deps.json)
 
 log "backing up current files to $BACKUP_DIR ..."
 for f in "${DEPLOY_FILES[@]}"; do
@@ -982,6 +1197,7 @@ log "deploy complete."
 log "  bottle:   $BOTTLE_NAME"
 log "  version:  $FOUND_FILE_VERSION (release $RELEASE_VERSION-$OUR_RELEASE_NUMBER)"
 log "  revision: $EFFECTIVE_TARGET_REVISION"
+log "  MS Graph DNS/socket fix (Stage 7): $([[ $INCLUDE_MSGRAPH_DNS_FIX -eq 1 ]] && echo included || echo not included)"
 log "  backup:   $BACKUP_DIR"
 
 fi  # DLL_ALREADY_PATCHED

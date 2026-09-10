@@ -9,54 +9,54 @@
 // observed UI freeze.
 //
 // This callback sidesteps that entry point entirely: it resolves the target host itself via the
-// older, synchronous Dns.GetHostAddresses (believed, from the trace, to go through Wine's plain
-// non-cancellable getaddrinfo rather than the broken async path -- confirm this against a fresh
-// trace before relying on it further), caches the result, and connects by IP directly, so
-// SocketsHttpHandler's own internal DNS step never runs for a host this cache already knows.
+// older, synchronous Dns.GetHostAddresses (confirmed via trace to go through Wine's plain
+// non-cancellable getaddrinfo rather than the broken async path), caches the result, and connects
+// by IP directly, so SocketsHttpHandler's own internal DNS step never runs for a host this cache
+// already knows.
 //
-// Wired in from InteractionController.CreateHttpClient (MailClient.dll) via IL patch, onto the
-// SocketsHttpHandler already reached there by reflection for MaxConnectionsPerServer -- that
-// method is the single shared HttpClient factory every protocol in the app uses (IMAP, Exchange,
-// AirSync, CalDav, WebCal, MSGraph, chat/cloud-storage connectors, ...), so this cache and
-// callback are deliberately generic, not Graph-specific.
+// Wired in from InteractionController.CreateHttpClient (MailClient.dll) via
+// --patch-http-dns-connect-callback, which calls InstallConnectCallback below onto the
+// SocketsHttpHandler reached there by reflection -- that method is the single shared HttpClient
+// factory every protocol in the app uses (IMAP, Exchange, AirSync, CalDav, WebCal, MSGraph,
+// chat/cloud-storage connectors, ...), so this cache and callback are deliberately generic, not
+// Graph-specific, even though Microsoft Graph accounts are what surfaced the bug.
+//
+// The reflection-based property access (not a direct cast) matters: SocketsHttpHandler is only
+// reachable via HttpClientHandler's own PRIVATE "Handler" property under .NET's HttpClientHandler
+// abstraction -- there is no public API to reach it directly. This exact reflection pattern is
+// already used, unconditionally safe, by the app's own shipped authLog-gated code in the same
+// method (see CreateHttpClient's PlaintextStreamFilter hookup).
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
 
 namespace MailClient.Wine;
 
-// Must be public, not internal -- ConnectAsync is called from MailClient.dll (a different
-// assembly), and a public member on an internal type is still only as accessible as the type
-// itself from outside that assembly. Confirmed the hard way: this decompiled clean and built
-// without error when internal, but threw System.MethodAccessException the instant
-// InteractionController.CreateHttpClient (MailClient.dll) actually called it at runtime -- ilspycmd
-// doesn't check cross-assembly accessibility any more than it checks handler-region bounds
-// (CLAUDE.md IL-patching lesson 3) or generic self-instantiation (lesson 19); this is the same
-// "decompiling clean is not sufficient proof" shape, just a new trigger for it.
+// Must be public, not internal -- InstallConnectCallback/ConnectAsync are called from
+// MailClient.dll (a different assembly), and a public member on an internal type is still only
+// as accessible as the type itself from outside that assembly. Confirmed the hard way in an
+// earlier round: this decompiled clean and built without error when internal, but threw
+// System.MethodAccessException the instant InteractionController.CreateHttpClient actually called
+// it at runtime -- ilspycmd doesn't check cross-assembly accessibility any more than it checks
+// handler-region bounds (CLAUDE.md IL-patching lesson 3) or generic self-instantiation
+// (lesson 19); this is the same "decompiling clean is not sufficient proof" shape, a new trigger.
 public static class DnsConnectHelper
 {
-    // TEMPORARY diagnostic logging -- the freeze persisted after this fix deployed, so this
-    // proves/disproves two things at once: (1) does ConnectCallback actually get invoked at all
-    // (confirms the CreateHttpClient reflection hookup really took effect, not just decompiled
-    // clean -- see CLAUDE.md IL-patching lesson list for why that distinction matters), and
-    // (2) if it is invoked, where does the time actually go -- DNS resolution (would mean
-    // Dns.GetHostAddresses ISN'T safe from the same Wine bug after all, contrary to this file's
-    // header comment's working assumption) vs. the socket connect itself (a different hang
-    // entirely) vs. neither (meaning the freeze isn't in this code path at all). Strip once the
-    // real mechanism is confirmed. Safe-write pattern matches every other diagnostic in this
-    // project (try/catch-wrapped File.AppendAllText -- a dropped log line under contention is
-    // fine, crashing the app under investigation is not).
-    internal static void Log(string message)
+    // Called from InteractionController.CreateHttpClient (MailClient.dll) right after
+    // httpClientHandler is fully configured, regardless of whether the authLog/loggingWriter path
+    // is taken -- the DNS/connect bug affects every protocol and account, not just logged ones.
+    // No-ops silently if the private "Handler" property shape ever changes in a future .NET
+    // version (same fail-safe posture as the app's own existing authLog reflection block right
+    // next to this call site).
+    public static void InstallConnectCallback(HttpClientHandler handler)
     {
-        try
+        PropertyInfo? property = typeof(HttpClientHandler).GetProperty("Handler", BindingFlags.Instance | BindingFlags.NonPublic);
+        if (property?.GetValue(handler) is SocketsHttpHandler socketsHttpHandler)
         {
-            File.AppendAllText(@"C:\Temp\claude-dnsconnect.log",
-                $"{DateTime.Now:HH:mm:ss.fff} [tid={Environment.CurrentManagedThreadId}] {message}{Environment.NewLine}");
-        }
-        catch (Exception)
-        {
+            socketsHttpHandler.ConnectCallback = ConnectAsync;
         }
     }
 
@@ -64,42 +64,24 @@ public static class DnsConnectHelper
     {
         string host = context.DnsEndPoint.Host;
         int port = context.DnsEndPoint.Port;
-        Log($"ConnectAsync ENTER host={host} port={port}");
-        long start = Environment.TickCount64;
 
-        IPAddress[] addresses;
-        try
-        {
-            addresses = await DnsCache.ResolveAsync(host).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            Log($"ConnectAsync DNS FAILED host={host} elapsedMs={Environment.TickCount64 - start} ex={ex.GetType().Name}: {ex.Message}");
-            throw;
-        }
-        Log($"ConnectAsync DNS OK host={host} elapsedMs={Environment.TickCount64 - start} addressCount={addresses.Length}");
+        IPAddress[] addresses = await DnsCache.ResolveAsync(host).ConfigureAwait(false);
 
         Exception? lastError = null;
         foreach (IPAddress address in addresses)
         {
-            long connectStart = Environment.TickCount64;
             var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
             try
             {
-                Log($"ConnectAsync SOCKET CONNECT START host={host} address={address}");
                 await socket.ConnectAsync(address, port, cancellationToken).ConfigureAwait(false);
-                Log($"ConnectAsync SOCKET CONNECT OK host={host} address={address} elapsedMs={Environment.TickCount64 - connectStart} totalMs={Environment.TickCount64 - start}");
 
-                // Direct evidence (this session, live): with DNS+connect fixed, a Graph command
-                // still hung for 59.7 REAL seconds with zero retries -- confirmed via bracketing
-                // timestamps that nothing happened in DNS or connect during that window, so the
-                // hang moved to whatever runs on the stream AFTER connect succeeds: TLS handshake,
-                // request send, or response read. All of those go through .NET's normal async
-                // Stream.ReadAsync/WriteAsync on the stream returned here, which for a plain
-                // NetworkStream means Socket.ReceiveAsync/SendAsync -- the same overlapped-I/O-
-                // with-cancellation machinery family as the GetAddrInfoExW entry point already
-                // confirmed broken (fixme:winsock:GetAddrInfoExW "Unsupported cancel handle"), so
-                // it hanging too is a reasonable extension of the same root cause, not a new one.
+                // Direct evidence (see reports/emclient11-msgraph-sync-freeze-findings.md): with
+                // DNS+connect fixed, a Graph command still hung for ~60 real seconds with zero
+                // retries -- the hang moved to whatever runs on the stream AFTER connect succeeds
+                // (TLS handshake, request send, or response read), all of which go through
+                // .NET's normal async Stream.ReadAsync/WriteAsync -- for a plain NetworkStream,
+                // that's Socket.ReceiveAsync/SendAsync, the same overlapped-I/O-with-cancellation
+                // machinery family as the GetAddrInfoExW entry point already confirmed broken.
                 //
                 // TimeoutBoundedNetworkStream sidesteps it the same way DnsCache sidesteps the
                 // broken async DNS API: never call the async socket path at all. Every
@@ -112,13 +94,11 @@ public static class DnsConnectHelper
             }
             catch (Exception ex)
             {
-                Log($"ConnectAsync SOCKET CONNECT FAILED host={host} address={address} elapsedMs={Environment.TickCount64 - connectStart} ex={ex.GetType().Name}: {ex.Message}");
                 lastError = ex;
                 socket.Dispose();
             }
         }
 
-        Log($"ConnectAsync ALL ADDRESSES FAILED host={host} totalMs={Environment.TickCount64 - start}");
         throw new HttpRequestException(
             $"DnsConnectHelper: failed to connect to {host}:{port}",
             lastError);
@@ -143,12 +123,10 @@ internal sealed class TimeoutBoundedNetworkStream : Stream
     private const int TimeoutMs = 30000;
 
     private readonly Socket socket;
-    private readonly string host;
 
     public TimeoutBoundedNetworkStream(Socket socket, string host)
     {
         this.socket = socket;
-        this.host = host;
         socket.ReceiveTimeout = TimeoutMs;
         socket.SendTimeout = TimeoutMs;
     }
@@ -185,18 +163,7 @@ internal sealed class TimeoutBoundedNetworkStream : Stream
 
     public override int Read(byte[] buffer, int offset, int count)
     {
-        long start = Environment.TickCount64;
-        try
-        {
-            int n = socket.Receive(buffer, offset, count, SocketFlags.None);
-            DnsConnectHelper.Log($"StreamRead host={host} requested={count} got={n} elapsedMs={Environment.TickCount64 - start}");
-            return n;
-        }
-        catch (Exception ex)
-        {
-            DnsConnectHelper.Log($"StreamRead FAILED host={host} elapsedMs={Environment.TickCount64 - start} ex={ex.GetType().Name}: {ex.Message}");
-            throw;
-        }
+        return socket.Receive(buffer, offset, count, SocketFlags.None);
     }
 
     public override int Read(Span<byte> buffer)
@@ -209,17 +176,7 @@ internal sealed class TimeoutBoundedNetworkStream : Stream
 
     public override void Write(byte[] buffer, int offset, int count)
     {
-        long start = Environment.TickCount64;
-        try
-        {
-            socket.Send(buffer, offset, count, SocketFlags.None);
-            DnsConnectHelper.Log($"StreamWrite host={host} count={count} elapsedMs={Environment.TickCount64 - start}");
-        }
-        catch (Exception ex)
-        {
-            DnsConnectHelper.Log($"StreamWrite FAILED host={host} elapsedMs={Environment.TickCount64 - start} ex={ex.GetType().Name}: {ex.Message}");
-            throw;
-        }
+        socket.Send(buffer, offset, count, SocketFlags.None);
     }
 
     public override void Write(ReadOnlySpan<byte> buffer)
@@ -349,10 +306,7 @@ internal static class DnsCache
 
         // Task.Run: Dns.GetHostAddresses is the synchronous overload (see file header for why),
         // so it runs on a pool thread rather than blocking whichever caller reached ResolveAsync.
-        long start = Environment.TickCount64;
-        DnsConnectHelper.Log($"Dns.GetHostAddresses START host={host}");
         IPAddress[] addresses = await Task.Run(() => Dns.GetHostAddresses(host)).ConfigureAwait(false);
-        DnsConnectHelper.Log($"Dns.GetHostAddresses DONE host={host} elapsedMs={Environment.TickCount64 - start}");
         return new Entry(addresses, DateTime.UtcNow + Ttl);
     }
 

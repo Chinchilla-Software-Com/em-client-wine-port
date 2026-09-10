@@ -123,6 +123,16 @@ if (args.Length > 0 && args[0] == "--patch-preview-pane-periodic-repaint")
     return RunPatchPreviewPanePeriodicRepaint(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-http-dns-connect-callback")
+{
+    return RunPatchHttpDnsConnectCallback(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-token-refresh-retry")
+{
+    return RunPatchTokenRefreshRetry(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-notification-invalidate")
 {
     return RunPatchNotificationInvalidate(args);
@@ -9805,6 +9815,269 @@ static int RunPatchPreviewPanePeriodicRepaint(string[] args)
         }
 
         Console.WriteLine($"OK   {fileName}: {targetType} -- added __RedrawWindow (user32.dll P/Invoke), __previewPaneRepaintTimer ({repaintIntervalMs}ms, started once in the constructor), and __previewPaneRepaintTick, which forces RedrawWindow(webBrowser.NativeBrowserWindowHandle, NULL, NULL, RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW) whenever webBrowser is non-null, Visible, and has a real native handle");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-http-dns-connect-callback <input-dir> <mailclient-wine-dll-path> <output-dir>
+//
+// First of two fixes for the Microsoft 365 / Graph API account sync freeze investigated in
+// reports/emclient11-msgraph-sync-freeze-findings.md -- a DIFFERENT bug from the classic
+// IMAP/EWS Exchange sync freeze (Stage 6, --patch-account-manager-sync-async/
+// --patch-folder-sync-async), hit through HttpClient's own DNS/connection path instead of
+// AccountManager/Folder's own sync methods. Root cause: the same underlying Wine
+// GetAddrInfoExW defect already documented for the Exchange-sync bug, but reached via
+// SocketsHttpHandler's internal async DNS resolution -- confirmed via a bracketed
+// CX_DEBUGMSG=+winsock trace ("fixme:winsock:GetAddrInfoExW Unsupported namespace 0" /
+// "Unsupported cancel handle") and directly measured live as a single Graph HTTP call taking
+// ~46 seconds to return with zero retries.
+//
+// Fix: MailClient.Wine.DnsConnectHelper (il-patches/MailClient.Wine/DnsConnectHelper.cs) --
+// resolves DNS itself via the older synchronous Dns.GetHostAddresses (confirmed via trace to
+// avoid the broken async path) and connects directly by IP, plus TimeoutBoundedNetworkStream
+// (same file), which bounds every Read/Write after a successful connect with a genuinely
+// synchronous, SO_RCVTIMEO/SO_SNDTIMEO-bounded socket call instead of .NET's broken async
+// socket path -- a second hang, found live AFTER the DNS fix alone, moved to TLS handshake/
+// request/response, same underlying Wine defect family. Both verified live: DNS+connect
+// dropped from ~46s hangs to 40-120ms; a real ~30s stall was captured with the timeout firing
+// correctly and the UI heartbeat never stopping.
+//
+// This patch wires DnsConnectHelper.InstallConnectCallback(HttpClientHandler) into
+// MailClient.Protocols.InteractionController.CreateHttpClient (MailClient.dll) -- the single
+// shared HttpClient factory every protocol in the app uses (IMAP, Exchange, AirSync, CalDav,
+// WebCal, MSGraph, chat/cloud-storage connectors), so the fix is universal, not Graph-specific,
+// matching the systemic nature of the underlying Wine defect. Deliberately a real METHOD CALL
+// into a helper assembly rather than hand-authored delegate-construction IL: InstallConnectCallback
+// does the SocketsHttpHandler reflection + ConnectCallback assignment itself in ordinary compiled
+// C#, so this patch only needs to insert a trivial `ldloc; call` pair -- see DnsConnectHelper.cs's
+// own header comment for the full reasoning.
+//
+// Insertion point found by searching for the existing
+// HttpClientHandler::set_ServerCertificateCustomValidationCallback call (present in every
+// supported build) and inserting immediately after it, then walking BACKWARD from that same
+// call for the nearest preceding Ldloc/Ldloc_S to find which local holds httpClientHandler --
+// robust to that local's numeric slot changing across builds/recompiles, unlike hardcoding an
+// index. Confirmed via --dump-il that this exact instruction is never a branch target anywhere
+// else in the method and --dump-handlers that CreateHttpClient has no exception handlers at all,
+// so no retargeting is needed (IL-patching lessons 2/3 don't apply here).
+static int RunPatchHttpDnsConnectCallback(string[] args)
+{
+    if (args.Length < 4)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-http-dns-connect-callback <input-dir> <mailclient-wine-dll-path> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string wineDllPath = args[2];
+    string outDir = args[3];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.Protocols.InteractionController";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        string? wineDllDir = Path.GetDirectoryName(Path.GetFullPath(wineDllPath));
+        if (wineDllDir is not null) resolver.AddSearchDirectory(wineDllDir);
+
+        using var wineModule = ModuleDefinition.ReadModule(wineDllPath, new ReaderParameters { AssemblyResolver = resolver, ReadWrite = false });
+        var dnsConnectHelperType = wineModule.GetType("MailClient.Wine.DnsConnectHelper");
+        if (dnsConnectHelperType is null) { Console.Error.WriteLine("FAIL: MailClient.Wine.DnsConnectHelper not found in " + wineDllPath); return 1; }
+        var installMethodDef = dnsConnectHelperType.Methods.FirstOrDefault(m => m.Name == "InstallConnectCallback");
+        if (installMethodDef is null) { Console.Error.WriteLine("FAIL: InstallConnectCallback not found on DnsConnectHelper"); return 1; }
+
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters { AssemblyResolver = resolver, ReadWrite = false });
+        var installMethodRef = module.ImportReference(installMethodDef);
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var method = type.Methods.FirstOrDefault(m => m.Name == "CreateHttpClient" && m.HasBody);
+        if (method is null) { Console.Error.WriteLine("FAIL: CreateHttpClient not found"); return 1; }
+
+        var body = method.Body;
+        var il = body.GetILProcessor();
+        var instrs = body.Instructions;
+
+        Instruction? certCallbackCall = instrs.FirstOrDefault(i =>
+            i.OpCode == OpCodes.Callvirt &&
+            i.Operand is MethodReference mr &&
+            mr.Name == "set_ServerCertificateCustomValidationCallback" &&
+            mr.DeclaringType.Name == "HttpClientHandler");
+        if (certCallbackCall is null) { Console.Error.WriteLine("FAIL: set_ServerCertificateCustomValidationCallback call not found in CreateHttpClient"); return 1; }
+
+        // Walk backward from the callback-assignment call to find the nearest Ldloc/Ldloc_S --
+        // that's httpClientHandler being pushed as the receiver several instructions earlier
+        // (the Func<...> delegate for the second argument is built in between).
+        Instruction? handlerLoad = null;
+        for (Instruction? cur = certCallbackCall.Previous; cur is not null; cur = cur.Previous)
+        {
+            if (cur.OpCode == OpCodes.Ldloc || cur.OpCode == OpCodes.Ldloc_S)
+            {
+                handlerLoad = cur;
+                break;
+            }
+        }
+        if (handlerLoad is null) { Console.Error.WriteLine("FAIL: couldn't find the Ldloc/Ldloc_S loading httpClientHandler before the callback-assignment call"); return 1; }
+
+        var anchor = certCallbackCall.Next;
+        if (anchor is null) { Console.Error.WriteLine("FAIL: set_ServerCertificateCustomValidationCallback call is the method's last instruction -- unexpected shape"); return 1; }
+
+        var newInstrs = new List<Instruction>
+        {
+            Instruction.Create(handlerLoad.OpCode == OpCodes.Ldloc_S ? OpCodes.Ldloc_S : OpCodes.Ldloc, (VariableDefinition)handlerLoad.Operand),
+            Instruction.Create(OpCodes.Call, installMethodRef)
+        };
+        foreach (var i in newInstrs) { il.InsertBefore(anchor, i); }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::CreateHttpClient -- inserted a call to MailClient.Wine.DnsConnectHelper.InstallConnectCallback(httpClientHandler) immediately after the existing set_ServerCertificateCustomValidationCallback assignment");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-token-refresh-retry <input-dir> <mailclient-wine-dll-path> <output-dir>
+//
+// Second of two fixes for the Microsoft 365 / Graph API account sync freeze (see
+// --patch-http-dns-connect-callback above and
+// reports/emclient11-msgraph-sync-freeze-findings.md). With DNS+connect and socket I/O both
+// bounded, OAuth2 token refresh (MailClient.Accounts.Credentials.GetAccessTokenRefreshResponse,
+// the HTTP call against login.microsoftonline.com) was confirmed via decompile to have ZERO
+// retry for a network failure -- its only catch clauses handle UntrustedCertificateException
+// (a separate, unrelated user-trust-decision retry loop) and a generic catch-log-rethrow for
+// everything else. Directly observed live: this exact call hit the new 30-second socket
+// timeout and failed hard, immediately, with no recovery.
+//
+// Fix: MailClient.Wine.TokenRefreshRetryHelper (same directory) -- a small, narrowly-scoped
+// retry wrapper (3 attempts, 2s delay, only for SocketException/IOException/
+// HttpRequestException/TaskCanceledException) wired in via the same "move the body, give the
+// original name a new small wrapper" technique already used for the classic engine's
+// AccountManager.SendAndReceiveAll/Folder.Synchronize sync-freeze fix (Stage 6, CLAUDE.md
+// IL-patching lesson 13) -- here applied to an ASYNC method for the first time. An async
+// method's entire COMPILED body is just the state-machine-kickoff boilerplate (construct the
+// state machine struct, call MoveNext once, return the task); the real await-based logic lives
+// in the compiler-generated nested MoveNext(), untouched by moving the outer method -- so this
+// needs no special async handling beyond what lesson 13 already covers.
+//
+// WithRetryAsync takes the caller INSTANCE and re-invokes the moved core method via cached
+// reflection (MethodInfo.Invoke) rather than a strongly-typed delegate -- see
+// TokenRefreshRetryHelper.cs's own header comment for why this sidesteps hand-constructing a
+// Func<...> delegate object in raw Cecil-authored IL in exchange for a trivial 4-instruction
+// wrapper body (ldarg.0, ldarg.1, ldarg.2, call).
+static int RunPatchTokenRefreshRetry(string[] args)
+{
+    if (args.Length < 4)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-token-refresh-retry <input-dir> <mailclient-wine-dll-path> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string wineDllPath = args[2];
+    string outDir = args[3];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.Accounts.dll";
+    const string targetType = "MailClient.Accounts.Credentials";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        string? wineDllDir = Path.GetDirectoryName(Path.GetFullPath(wineDllPath));
+        if (wineDllDir is not null) resolver.AddSearchDirectory(wineDllDir);
+
+        using var wineModule = ModuleDefinition.ReadModule(wineDllPath, new ReaderParameters { AssemblyResolver = resolver, ReadWrite = false });
+        var retryHelperType = wineModule.GetType("MailClient.Wine.TokenRefreshRetryHelper");
+        if (retryHelperType is null) { Console.Error.WriteLine("FAIL: MailClient.Wine.TokenRefreshRetryHelper not found in " + wineDllPath); return 1; }
+        var withRetryMethodDef = retryHelperType.Methods.FirstOrDefault(m => m.Name == "WithRetryAsync");
+        if (withRetryMethodDef is null) { Console.Error.WriteLine("FAIL: WithRetryAsync not found on TokenRefreshRetryHelper"); return 1; }
+
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters { AssemblyResolver = resolver, ReadWrite = false });
+        var withRetryMethodRef = module.ImportReference(withRetryMethodDef);
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var originalMethod = type.Methods.FirstOrDefault(m => m.Name == "GetAccessTokenRefreshResponse" && m.Parameters.Count == 2 && !m.IsStatic);
+        if (originalMethod is null) { Console.Error.WriteLine("FAIL: GetAccessTokenRefreshResponse(IDictionary<string,string>, CancellationToken) not found"); return 1; }
+
+        // --- New method: __GetAccessTokenRefreshResponseCore -- takes over the original
+        // method's ORIGINAL body verbatim (see doc comment above).
+        var coreMethod = new MethodDefinition("__GetAccessTokenRefreshResponseCore", originalMethod.Attributes, originalMethod.ReturnType);
+        foreach (var p in originalMethod.Parameters)
+        {
+            coreMethod.Parameters.Add(new ParameterDefinition(p.Name, p.Attributes, p.ParameterType));
+        }
+        // Move (not copy) any custom attributes (e.g. [AsyncStateMachine]) -- purely decorative
+        // for the CLR (the real state-machine invocation is fully baked into the IL body being
+        // moved), but keeps `__GetAccessTokenRefreshResponseCore` decompiling as the recognizable
+        // "async" method it actually still is, rather than that description silently vanishing.
+        foreach (var ca in originalMethod.CustomAttributes)
+        {
+            coreMethod.CustomAttributes.Add(ca);
+        }
+        originalMethod.CustomAttributes.Clear();
+        coreMethod.Body = originalMethod.Body;
+        type.Methods.Add(coreMethod);
+
+        // --- Fresh, minimal body for GetAccessTokenRefreshResponse itself: just forwards to
+        // WithRetryAsync(this, parameters, cancellationToken) and returns its Task directly.
+        {
+            var body = originalMethod.Body = new MethodBody(originalMethod);
+            var il = body.GetILProcessor();
+            il.Append(Instruction.Create(OpCodes.Ldarg_0));
+            il.Append(Instruction.Create(OpCodes.Ldarg_1));
+            il.Append(Instruction.Create(OpCodes.Ldarg_2));
+            il.Append(Instruction.Create(OpCodes.Call, withRetryMethodRef));
+            il.Append(Instruction.Create(OpCodes.Ret));
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::GetAccessTokenRefreshResponse -- original body moved to __GetAccessTokenRefreshResponseCore, original name now forwards to MailClient.Wine.TokenRefreshRetryHelper.WithRetryAsync(this, parameters, cancellationToken)");
         patched = true;
 
         module.Write(destPath);
