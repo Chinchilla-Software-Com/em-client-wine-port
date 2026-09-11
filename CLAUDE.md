@@ -92,18 +92,32 @@
   `./deploy.sh --bottle NAME` skips interactive bottle selection; `-y`/`--yes` skips the
   version-mismatch confirmation prompt; `--install-fonts`/`--no-fonts` answer the fonts/ license
   consent prompt (see below) non-interactively, for scripted/repeated runs. Safe to re-run —
-  checks whether the target is already patched (an assembly-reference marker, not file size —
-  see `il-patcher --check-patched`'s doc comment) and exits cleanly if so; `--force` skips that.
-  Note this short-circuit only skips the DLL patch pipeline itself — fonts and file-type
-  associations (below) are independent of it and always still run, since most bottles this
-  script targets will already be patched from a previous run. `--install-associations`/
+  reads a `MailClient.Wine.dll` version marker whose `FileVersion` trailing component is a
+  **bitmask**, one bit per stage number (`STAGE_BIT` in the script — stages 8-14, the notification
+  chain, share one bit since the tool enforces they only ever move together; every other stage is
+  independently trackable), and skips any stage whose bit is already set; `--force` skips that.
+  `--max-revision N` caps the mandatory chain (stages 1-8) at stage N; `--patches 1,3,15`
+  applies exactly those stage numbers (mandatory or optional), bypassing the "stages 1-8 are
+  mandatory together" rule entirely — the only non-interactive way to include the optional
+  Stage 15 (sync-freeze fix; same fix as v11's own optional stage, kept optional here too since it
+  was found to behave differently across machines). The two flags are mutually exclusive.
+  **NOT backward compatible** with a bottle patched by an older, pre-bitmask version of this
+  script (which stored a plain linear revision count in the same field) — deliberately no
+  migration/bridging logic; reset such a bottle to pristine (fresh copy from
+  `original/em-<version>/`) before running this version against it.
+  Note the "already patched" short-circuit only skips the DLL patch pipeline itself — fonts and
+  file-type associations (below) are independent of it and always still run, since most bottles
+  this script targets will already be patched from a previous run. `--install-associations`/
   `--no-associations` answer the file-associations/ prompt non-interactively;
   `--force-associations` also overwrites extensions that already have some association set (see
   file-associations/** above and `reports/office-file-associations-findings.md`) — by default
   only extensions with no existing association are touched, checked individually against the
   target bottle's live registry, so a bottle with a real Office/LibreOffice install isn't
   disturbed.
-  Needs dotnet SDK (prints per-distro install instructions and exits if missing) and python3;
+  Needs a **.NET 10+ SDK** (prints per-distro install instructions and exits if missing — matching
+  the 11.0.196-beta sibling script's own requirement, even though every project this script itself
+  builds still targets net8.0; a net10 SDK builds net8.0-targeted projects fine, this is purely
+  about which SDK needs to be installed) and python3;
   fetches ilspycmd itself into a temp dir if not already installed. **When eM Client updates:** don't edit an existing `releases/<version>/deploy.sh` in
   place — copy the whole `releases/<version>/` folder to a new `releases/<new-version>/`, retest
   by hand against the new build (same process as "Investigation method" below — diff what
@@ -306,8 +320,8 @@ but don't rely on that alone).
   migration** from the old linear-count marker format — a bottle patched by a pre-bitmask version
   of this script needs a pristine reset (fresh copy from `original/em-<version>/`) before this
   version touches it; the old value gets silently reinterpreted as a raw bitmask otherwise, which
-  is normally wrong. (The v10.4.5674 pipeline is slated to get this same bitmask/`--patches`
-  treatment — see below for whether that's landed yet.)
+  is normally wrong. (The v10.4.5674 pipeline now has this same bitmask/`--patches` treatment —
+  see its own bullet earlier in this file, and the port note in its own Status section below.)
 
   **x64 support**: bottle discovery now checks both architectures' conventional install paths
   (`drive_c/Program Files (x86)/eM Client/` and plain `drive_c/Program Files/eM Client/`) rather
@@ -748,6 +762,40 @@ dependency on it either way. Both move their target method onto a dedicated guar
 reverted). Verified via decompile plus `--dump-handlers` (both add a `try`/`catch(Exception)`)
 before every deploy, and live end-to-end against `emClient_win_8_x64` twice — once resuming from
 revision 2 (only Stage 15 ran), once already at revision 3 (nothing ran) — both correct.
+
+**Stage tracking ported to a bitmask** (same treatment as the 11.0.196-beta sibling script, see
+its own "Stage tracking is now a bitmask" note above — this replaces `REVISION_LAST_STAGE`
+entirely, not just extends it): the on-bottle `MailClient.Wine.dll` marker's `FileVersion`
+trailing component is now a `STAGE_BIT` bitmask, one bit per stage number, rather than a linear
+count. Stages 1-7 and 15 each keep their own independent bit; stages 8-14 (the notification
+chain) share ONE bit, since the tool enforces they only ever move together as a single atomic
+unit — naming any of 8 through 14 via `--patches` means the whole chain. `PIPELINE_LATEST_STAGE`
+is now `8` (the mandatory chain: stages 1-7 individually, plus the notification chain as one
+unit) — **Stage 15 (the Exchange sync-freeze fix) is now OPTIONAL**, prompted interactively or
+via `--patches 15`, defaulting to NOT included under `-y` — this is the exact same fix the
+11.0.196-beta pipeline's own optional stage already found "behaves differently across machines"
+once shipped as mandatory; that finding applies equally here, so it's no longer applied
+unconditionally. New `--patches 1,3,15`-style flag for targeted patching (bypasses the "1-8 are
+mandatory together" rule), mutually exclusive with `--max-revision` (now bounding only the
+mandatory 0-8 range). `check_dotnet()` now requires a **.NET 10+ SDK** (matching the
+11.0.196-beta sibling script) — every project this script itself builds still targets net8.0
+unchanged (the `MailClient.Wine` marker, the BouncyCastle license helper, `font-systemlink-writer`
+all stay net8.0 to match the real eM Client 10.4.5674 process they load into); this is purely
+about which SDK needs to be *installed*. Confirmed v10's existing `MailClient.deps.json` handling
+(patched in place on the live deployed file via a separate `python3` call, not staged through a
+`DEPLOY_FILES` copy) does NOT have the "never reached the bottle" gap Stage 7 hit in the
+11.0.196-beta pipeline — no fix needed there. File-associations, the license-OAEP BouncyCastle
+Stage 5, and the single-hardcoded-version gate are all unchanged — this was a port of the v11
+pipeline's engineering patterns onto v10's own existing patch content, not a feature merge.
+**Deliberately no migration** from the old linear-count marker format, per the same reasoning as
+the sibling script — a bottle patched by a pre-bitmask version of this script needs a pristine
+reset (fresh copy from `original/em-10.4.5674/`) before this version touches it. Verified live
+against `emClient_win_8_x64` reset to pristine: a full fresh deploy reached mask 255 (all 8
+mandatory bits), a re-run correctly short-circuited, `--patches 15` correctly added just the
+optional stage (mask 511), mutual-exclusivity/invalid-stage/out-of-range errors all fire
+correctly, an in-range `--max-revision 0` against an already-ahead bottle correctly detected
+nothing to do, and the resulting build launched cleanly (main window + CEF renderer up, zero new
+crash reports, graceful close).
 
 ## Investigation method (what actually worked this round)
 
