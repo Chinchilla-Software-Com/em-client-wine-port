@@ -118,7 +118,38 @@
   the 11.0.196-beta sibling script's own requirement, even though every project this script itself
   builds still targets net8.0; a net10 SDK builds net8.0-targeted projects fine, this is purely
   about which SDK needs to be installed) and python3;
-  fetches ilspycmd itself into a temp dir if not already installed. **When eM Client updates:** don't edit an existing `releases/<version>/deploy.sh` in
+  fetches ilspycmd itself into a temp dir if not already installed.
+
+  **Works against Bottles (usebottles.com), not just CrossOver** — `--wine-manager crossover|
+  bottles` picks which; auto-detected when only one is installed, prompted for ("Are you using
+  CrossOver or Bottles?") when both or neither are found (required under `-y` in that case). Every
+  bottle-touching operation (discovery, running-instance detection, "run something inside the
+  bottle", registry edits) dispatches through this — see `wine_run()`/`wine_reg_add()` in the
+  script itself for the exact mechanism. All confirmed hands-on against a real Bottles install
+  (Flatpak, `com.usebottles.bottles`), which corrected several assumptions along the way: `-j`/
+  `--json` is a global flag that must precede the subcommand (`bottles-cli -j list bottles`, not
+  the other way round); a genuinely fresh Bottles data directory can crash on the very first
+  `list bottles` call (a real bug in bottles-cli itself, worked around by always running
+  `info bottles-path` first, which this script needs anyway to resolve bottle paths and which
+  doubles as the warm-up call); a bottle's real location and whether it's been relocated both come
+  straight from `list bottles --json`'s own `Path`/`Custom_Path` fields, no need to hand-parse a
+  `placeholder.yml`; `reg.exe import` via `bottles-cli run` does NOT reliably persist (confirmed:
+  silently fails), so every registry write goes through `bottles-cli reg add` instead (confirmed
+  reliable, including `HKEY_CLASSES_ROOT` default values and command strings with embedded
+  quotes) — the 10.4.5674 pipeline's file-associations feature applies each association's
+  key/value pairs individually under Bottles for exactly this reason (see its own bullet below);
+  and `bottles-cli run`'s own stdout isn't reliably forwarded back to the caller, so anything that
+  needs to read a launched program's OUTPUT (not just its exit code / on-disk side effects) can't
+  go through it under Bottles — the file-associations existing-value check is the one place this
+  mattered, worked around by reading the bottle's own `user.reg`/`system.reg` files directly
+  instead (Bottles bottles are plain Wine prefixes, so this works reliably). **`bottles-cli new`
+  was confirmed, hands-on, to populate a full `drive_c` synchronously** — no separate "init" step
+  needed on the Bottles version tested (67.3) — but a win64-arch bottle was also confirmed to
+  sometimes lack a working WoW64 split entirely (no `Program Files (x86)`, no `syswow64`) on this
+  same install, a real Bottles/runner inconsistency this project can't fix; bottle-discovery
+  checks both `Program Files (x86)` and plain `Program Files` under every Bottles bottle
+  defensively because of this, regardless of which architecture was requested at creation time.
+  **When eM Client updates:** don't edit an existing `releases/<version>/deploy.sh` in
   place — copy the whole `releases/<version>/` folder to a new `releases/<new-version>/`, retest
   by hand against the new build (same process as "Investigation method" below — diff what
   actually changed rather than assuming), and adjust whatever patch logic broke in the new
@@ -232,6 +263,31 @@ but don't rely on that alone).
   one's own `cxbottle.conf` `"Template"` setting isn't `win11_*` (confirmed reliable across every
   bottle checked — `win7_64`/`win8_64`/`win10_64`/`win11_64`), since Windows 11 is the only target
   confirmed working so far.
+
+  **Works against Bottles, not just CrossOver** — same `--wine-manager crossover|bottles`
+  mechanism as both `deploy.sh` scripts (see the sibling 10.4.5674 bullet above for the full
+  rationale and every hands-on-confirmed Bottles quirk it works around). `--new-bottle` under
+  Bottles creates one via `bottles-cli new --environment application --arch win64` instead of
+  `cxbottle --create --template win11_64` — no Core-Fonts-equivalent step needed, since `new`
+  already resolves Arial/Times New Roman/Courier New as part of its own normal dependency
+  install (confirmed hands-on). Two real bugs found and fixed via live testing: a bash dynamic-
+  scoping bug where a helper's own `read -r name path` loop (not declared `local`) clobbered the
+  calling function's own `local name` variable of the same name; and the Start Menu shortcut path
+  hardcoding `drive_c/users/crossover/...` — a plain Wine prefix (Bottles) names the user
+  directory after the real host user, not CrossOver's synthetic "crossover" one, fixed by
+  resolving it per manager. Also confirmed (and deliberately NOT worked around, since it's outside
+  this script's control) a real Bottles/Wine-runner limitation: `cscript.exe`'s VBScript
+  `CreateObject` calls silently do nothing on at least one Bottles runner build (confirmed even
+  for the simplest possible case, a bare `Scripting.FileSystemObject` write, with no error
+  surfaced anywhere) — so Start Menu shortcut generation is non-fatal specifically under Bottles
+  (still fatal under CrossOver, where it's proven reliable); `cxmenu --sync`'s host-wide menu
+  entry has no Bottles CLI equivalent either (confirmed: `bottles-cli add` registers the program
+  in Bottles' own list, launchable from its GUI/`bottles-cli run -p`, but generates no real
+  `.desktop` file) — used as the closest available substitute, documented as a known gap rather
+  than worked around. Live-verified end-to-end against a real Bottles install: bottle listing,
+  `--new-bottle` creation, and a full real install run (`.NET` runtimes, msixbundle, ICU DLLs,
+  Aptos/Roboto fonts, the WindowMetrics font fix) landing a working `MailClient.exe`, plus a
+  direct `bottles-cli add` registration against that real install.
   Right after the MSIX extraction, it also downloads and installs a set of **ICU DLLs** Wine
   doesn't provide but eM Client's spell-checker needs — see
   `reports/emclient11-icu-spellcheck-crash-findings.md` for the full investigation (a
@@ -331,6 +387,14 @@ but don't rely on that alone).
   decompile-diff plus a dry run of every stage against `original/em-11.0.282-x64/` (see
   `install-msix.sh`'s own bullet above for the file-level findings) — the patch content applies
   identically regardless of architecture.
+
+  **Works against Bottles, not just CrossOver** — same `--wine-manager crossover|bottles`
+  mechanism as the 10.4.5674 sibling script; see its own bullet above for the full rationale and
+  every hands-on-confirmed Bottles quirk it works around (this script shares the identical
+  `wine_run()`/`wine_reg_add()`/detection code). Live-verified end-to-end against a real Bottles
+  install: a full deploy against an eM Client 11 copy placed in a Bottles bottle reached mask 15
+  with all verification checks passing, and a follow-up `--install-fonts` run correctly launched
+  `font-systemlink-writer` inside the Bottles prefix and landed real registry entries.
 - **Status:** six DLL fixes so far, plus fonts, plus an install-time OS-dependency fix.
   - `release/11.0.196-1` — a startup crash (PBKDF2 key derivation broken under Wine's
     `bcrypt.dll`, blocking `InitOnBackground` before the main window ever appears). Full
