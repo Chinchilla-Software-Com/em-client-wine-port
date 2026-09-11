@@ -291,6 +291,24 @@ but don't rely on that alone).
   `OUR_RELEASE_NUMBER_FOR_VERSION` only after doing the same decompile-diff-plus-dry-run
   verification described above — never on faith.
 
+  **Stage tracking is now a bitmask, not a linear count** (replaces `REVISION_LAST_STAGE` and the
+  earlier revision-4/5 legacy-numbering special case entirely): the on-bottle
+  `MailClient.Wine.dll` marker's `FileVersion` trailing component is a `STAGE_BIT` bitmask (stage
+  *N* → bit `1 << (N-1)`) rather than a count of how many leading stages are done — this is what
+  lets Stage 6 and Stage 7 (two independent optional fixes a bottle can carry in ANY combination)
+  be represented natively, with no per-stage special-casing. `PIPELINE_LATEST_STAGE` still means
+  the same thing (the highest mandatory stage, currently `4`) and still bounds `--max-revision`'s
+  range — that flag is now purely about the mandatory 1-4 chain. **`--enable-sync-freeze-fix`/
+  `--skip-sync-freeze-fix` and `--enable-msgraph-dns-fix`/`--skip-msgraph-dns-fix` are gone** —
+  replaced by a single `--patches 1,3,4`-style flag that names exactly which stages (mandatory or
+  optional, any combination) to apply, bypassing the "1-4 are mandatory together" rule entirely
+  for targeted patching; it's mutually exclusive with `--max-revision`. **Deliberately no
+  migration** from the old linear-count marker format — a bottle patched by a pre-bitmask version
+  of this script needs a pristine reset (fresh copy from `original/em-<version>/`) before this
+  version touches it; the old value gets silently reinterpreted as a raw bitmask otherwise, which
+  is normally wrong. (The v10.4.5674 pipeline is slated to get this same bitmask/`--patches`
+  treatment — see below for whether that's landed yet.)
+
   **x64 support**: bottle discovery now checks both architectures' conventional install paths
   (`drive_c/Program Files (x86)/eM Client/` and plain `drive_c/Program Files/eM Client/`) rather
   than hardcoding the x86 one — everything downstream (`BOTTLE_APP_DIR`, the version gate, every

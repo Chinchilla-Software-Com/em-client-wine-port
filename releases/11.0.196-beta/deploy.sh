@@ -27,54 +27,43 @@
 #   ./deploy.sh                     interactive: lists bottles found, prompts for choice + confirms
 #   ./deploy.sh --bottle NAME       skip bottle selection (bottle dir name under ~/.cxoffice/)
 #   ./deploy.sh --list              list found bottles and their installed versions, then exit
-#   ./deploy.sh -y|--yes            don't prompt on a version mismatch, continue automatically
-#   ./deploy.sh --force             skip the "already at this revision" short-circuit
-#   ./deploy.sh --max-revision N    cap the deploy at revision N (e.g. 4 applies every mandatory
-#                                   stage, never the optional Stage 6) instead of this script's own
-#                                   default target (PIPELINE_LATEST_STAGE, or 6 if the optional
-#                                   Stage 6 was accepted -- see --enable-sync-freeze-fix below).
-#                                   Given explicitly, this ALSO skips the Stage 6 prompt entirely
-#                                   (an explicit revision is a stronger signal than the interactive
-#                                   default). Useful for reverting a bottle to an earlier,
-#                                   known-good revision (restore the bottle's files from
+#   ./deploy.sh -y|--yes            don't prompt on a version mismatch, continue automatically;
+#                                   also answers every optional-stage prompt (Stage 6, Stage 7)
+#                                   with its default of NOT included -- use --patches (below) to
+#                                   include one non-interactively instead.
+#   ./deploy.sh --force             skip the "already patched, nothing to do" short-circuit
+#   ./deploy.sh --max-revision N    cap the MANDATORY stage chain at stage N (0..4) instead of
+#                                   this script's own latest mandatory stage (PIPELINE_LATEST_STAGE).
+#                                   Purely about the mandatory 1-4 chain -- to include or exclude an
+#                                   optional stage (6, 7), use --patches instead; the two flags are
+#                                   mutually exclusive. Useful for reverting a bottle to an earlier,
+#                                   known-good mandatory stage (restore the bottle's files from
 #                                   original/em-<version>/ first, THEN run with --max-revision --
 #                                   this flag alone does not undo anything already installed) or
-#                                   for bisecting which stage introduced a regression. The
-#                                   MailClient.Wine.dll marker this run writes reflects the
-#                                   CAPPED revision, not this script's latest, so a later plain
-#                                   `./deploy.sh` run correctly resumes from Stage N+1 instead of
-#                                   thinking it has nothing to do. Must be <= this script's own
-#                                   latest revision (see REVISION_LAST_STAGE below) -- requesting
-#                                   a revision this script doesn't know how to build is an error.
-#                                   Revision 5 doesn't exist (reserved -- see PIPELINE_LATEST_STAGE
-#                                   below); the only valid values right now are 0, 1, 2, 3, 4, 6.
-#   ./deploy.sh --enable-sync-freeze-fix
-#                                   include the optional Exchange sync-freeze fix (Stage 6)
-#                                   without the interactive prompt. See Stage 6's own header
-#                                   comment further down for why this one is optional at all.
-#   ./deploy.sh --skip-sync-freeze-fix
-#                                   leave the optional Exchange sync-freeze fix out, without the
-#                                   interactive prompt.
-#   ./deploy.sh --enable-msgraph-dns-fix
-#                                   include the optional Microsoft 365 / Graph API DNS+socket
-#                                   sync-freeze fix (Stage 7 -- a DIFFERENT bug/fix from Stage 6,
-#                                   see its own header comment further down) without the
-#                                   interactive prompt. Tracked on its own independent axis, not
-#                                   through --max-revision/REVISION_LAST_STAGE like every stage
-#                                   above -- detected instead by inspecting whatever
-#                                   MailClient.Wine.dll is actually installed (see Stage 7's own
-#                                   comment), so it can be added to or left off an otherwise
-#                                   up-to-date bottle without needing --force.
-#   ./deploy.sh --skip-msgraph-dns-fix
-#                                   leave the optional Microsoft 365 / Graph API sync-freeze fix
-#                                   out, without the interactive prompt.
+#                                   for bisecting which stage introduced a regression.
+#   ./deploy.sh --patches 1,3,4     apply EXACTLY these stage numbers (mandatory or optional, any
+#                                   combination), bypassing the normal "stages 1-4 are mandatory"
+#                                   rule entirely -- for targeted patching. Only ever ADDS stages on
+#                                   top of whatever the bottle already has (never removes an
+#                                   already-applied one; that's what restoring from a backup or
+#                                   original/em-<version>/ is for). This is also the only
+#                                   non-interactive way to include an optional stage (6, 7) --
+#                                   e.g. --patches 6 includes the Exchange sync-freeze fix without
+#                                   answering its prompt. Mutually exclusive with --max-revision.
 #   ./deploy.sh --install-fonts     install the vendored fonts/ without the license-consent prompt
 #   ./deploy.sh --no-fonts          skip font installation without the license-consent prompt
 #
 # Safe to re-run: reads a MailClient.Wine.dll version marker (same mechanism as the 10.4.5674
-# pipeline -- see il-patches/MailClient.Wine/VersionMarker.cs) to tell whether this bottle is
-# already at this release, and skips the patch pipeline entirely if so. Fonts (below) are
-# independent of the DLL patch pipeline and always still checked, same as the sibling script.
+# pipeline -- see il-patches/MailClient.Wine/VersionMarker.cs) to tell which stages this bottle
+# already has (a bitmask, one bit per stage number -- see STAGE_BIT below) and skips any stage
+# whose bit is already set. Fonts (below) are independent of the DLL patch pipeline and always
+# still checked, same as the sibling script.
+#
+# NOT backward compatible with a bottle patched by an older (pre-bitmask) version of this script
+# -- that older marker encoded a linear stage COUNT, which this script now reads directly as a
+# raw bitmask instead (deliberately no migration/bridging logic -- see CLAUDE.md). Reset such a
+# bottle to pristine (fresh copy from original/em-<version>/) before running this version against
+# it.
 #
 # Fonts: if fonts/*.ttf exist in this repo (genuine Microsoft fonts -- Segoe UI, Tahoma, Calibri
 # -- vendored by whoever holds a valid license to use them; see reports/splash-tip-icon-findings.md),
@@ -83,7 +72,7 @@
 # repeated runs (e.g. a periodic check) where a prompt can't be answered by a human.
 #
 # Requires: dotnet SDK (checked below, prints install instructions if missing). python3 is only
-# needed if Stage 7 (the optional Microsoft 365 / Graph API fix) is accepted -- that's the first
+# needed if Stage 7 (the optional Microsoft 365 / Graph API fix) is included -- that's the first
 # stage in this release line to add a new sibling assembly MailClient.Wine.dll is genuinely
 # LOADED as (same MailClient.deps.json edit the 10.4.5674 pipeline's own Stage 5 needs); every
 # mandatory stage plus Stage 6 need neither. No network access needed beyond ilspycmd/NuGet
@@ -108,27 +97,34 @@ declare -A OUR_RELEASE_NUMBER_FOR_VERSION=( ["11.0.196"]=5 ["11.0.282"]=4 )
 
 # Highest MANDATORY pipeline stage number this script builds by default -- shared across every
 # supported eM Client version above. This (not OUR_RELEASE_NUMBER_FOR_VERSION) is what controls
-# how far a fresh deploy goes absent any opt-in, and what the on-bottle MailClient.Wine.dll
-# marker's own revision number means (see REVISION_LAST_STAGE below) -- purely mechanical "how
-# far through the shared pipeline has this bottle progressed" bookkeeping, unrelated to which eM
-# Client build it's on.
+# how far a fresh deploy goes absent any opt-in, unrelated to which eM Client build it's on.
 #
-# Stage 4 is now the preview-pane periodic-repaint fix (mandatory) -- see its own header comment
+# Stage 4 is the preview-pane periodic-repaint fix (mandatory) -- see its own header comment
 # further down and reports/emclient11-preview-pane-blank-findings.md. It took the slot that used
 # to be deliberately vacant (reserved for exactly this: "whatever the next real mandatory patch
-# turns out to be"). Filling it pushed the optional Exchange sync-freeze fix from Stage 5 to
-# Stage 6 (its own REVISION_LAST_STAGE entry and CLI flags renumbered to match) -- optional
-# stages always sit at the highest number(s), past every mandatory one -- and left a FRESH vacant
-# Stage 5 reserved for whatever the next real mandatory patch turns out to be. Repeat this same
-# shuffle every time a new mandatory patch is added (fill the vacant slot, bump
-# PIPELINE_LATEST_STAGE, shift every still-optional stage up by one, leave a new vacant slot
-# behind), so optional stages never end up sandwiched between mandatory ones.
+# turns out to be"), leaving a fresh vacant Stage 5 behind for the next one. Optional stages (6,
+# 7) always sit at the highest number(s), past every mandatory one, so a future mandatory patch
+# takes the vacant slot and shifts every still-optional stage up by one again, same shuffle as
+# last time.
 PIPELINE_LATEST_STAGE=4
 
-# revision (= pipeline stage count applied so far, NOT a release number) -> last stage number
-# that revision introduced. Same "resume mid-pipeline" logic as the 10.4.5674 script. No entry
-# for 5 (see PIPELINE_LATEST_STAGE's own comment above) -- revision 5 doesn't exist yet.
-declare -A REVISION_LAST_STAGE=( [0]=0 [1]=1 [2]=2 [3]=3 [4]=4 [6]=6 )
+# Each stage tracks as its OWN bit in a single mask, stored directly as the on-bottle
+# MailClient.Wine.dll marker's FileVersion trailing component -- e.g. a bottle with Stages
+# 1,2,3,4 applied reads back as mask 15 (0b1111); one with 1-4 plus Stage 7 (but not 6) reads
+# back as 79 (0b1001111). This is what lets Stage 6 and Stage 7 -- two independent optional
+# fixes a bottle can carry in ANY combination -- be represented natively, with no per-stage
+# special-casing needed (a plain linear "revision N means stages 1..N are done" count has no way
+# to express "has 7 but not 6"). No entry for Stage 5 -- it's a vacant slot, nothing to track.
+#
+# Deliberately no migration from the older, pre-bitmask linear-count scheme this same marker
+# field used to hold -- see the header comment's own note. A bottle patched by an older script
+# needs a pristine reset before this version touches it.
+declare -A STAGE_BIT=( [1]=1 [2]=2 [3]=4 [4]=8 [6]=32 [7]=64 )
+MANDATORY_MASK=0
+for _n in 1 2 3 4; do MANDATORY_MASK=$(( MANDATORY_MASK | STAGE_BIT[$_n] )); done
+ALL_KNOWN_MASK=0
+for _n in "${!STAGE_BIT[@]}"; do ALL_KNOWN_MASK=$(( ALL_KNOWN_MASK | STAGE_BIT[$_n] )); done
+unset _n
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -151,10 +147,7 @@ FORCE=0
 INSTALL_FONTS=0
 NO_FONTS=0
 MAX_REVISION=""
-ENABLE_SYNC_FREEZE_FIX=0
-SKIP_SYNC_FREEZE_FIX=0
-ENABLE_MSGRAPH_DNS_FIX=0
-SKIP_MSGRAPH_DNS_FIX=0
+PATCHES_ARG=""
 
 print_help() {
     sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -167,10 +160,7 @@ while [[ $# -gt 0 ]]; do
         --list) LIST_ONLY=1; shift ;;
         --force) FORCE=1; shift ;;
         --max-revision) MAX_REVISION="${2:-}"; shift 2 ;;
-        --enable-sync-freeze-fix) ENABLE_SYNC_FREEZE_FIX=1; shift ;;
-        --skip-sync-freeze-fix) SKIP_SYNC_FREEZE_FIX=1; shift ;;
-        --enable-msgraph-dns-fix) ENABLE_MSGRAPH_DNS_FIX=1; shift ;;
-        --skip-msgraph-dns-fix) SKIP_MSGRAPH_DNS_FIX=1; shift ;;
+        --patches) PATCHES_ARG="${2:-}"; shift 2 ;;
         --install-fonts) INSTALL_FONTS=1; shift ;;
         --no-fonts) NO_FONTS=1; shift ;;
         -h|--help) print_help; exit 0 ;;
@@ -178,23 +168,35 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ $ENABLE_SYNC_FREEZE_FIX -eq 1 && $SKIP_SYNC_FREEZE_FIX -eq 1 ]] && die "--enable-sync-freeze-fix and --skip-sync-freeze-fix are mutually exclusive"
-[[ $ENABLE_MSGRAPH_DNS_FIX -eq 1 && $SKIP_MSGRAPH_DNS_FIX -eq 1 ]] && die "--enable-msgraph-dns-fix and --skip-msgraph-dns-fix are mutually exclusive"
+[[ -n "$MAX_REVISION" && -n "$PATCHES_ARG" ]] && die "--max-revision and --patches are mutually exclusive"
 
-# EFFECTIVE_TARGET_REVISION: what this run should end up at -- either this script's own latest
-# (PIPELINE_LATEST_STAGE, shared across every supported eM Client version) or, if --max-revision
-# was given, that lower cap. Computed here (right after arg parsing, before the installed eM
-# Client version is even known -- deliberately: this is about pipeline stages, not about which
-# version's release-number is being tagged) rather than inline at each use site, since it needs
-# validating exactly once regardless of how many places below read it.
+# MANDATORY_TARGET_MASK: how far up the mandatory 1-4 chain this run should reach -- either this
+# script's own latest (PIPELINE_LATEST_STAGE) or, if --max-revision was given, that lower cap.
+# Computed here (right after arg parsing, before the installed eM Client version is even known --
+# deliberately: this is about pipeline stages, not about which version's release-number is being
+# tagged) rather than inline at each use site, since it needs validating exactly once.
 if [[ -n "$MAX_REVISION" ]]; then
     [[ "$MAX_REVISION" =~ ^[0-9]+$ ]] || die "--max-revision must be a non-negative integer, got: $MAX_REVISION"
-    [[ -n "${REVISION_LAST_STAGE[$MAX_REVISION]+x}" ]] || die "--max-revision $MAX_REVISION is not a revision this script knows how to build (valid: ${!REVISION_LAST_STAGE[*]})"
-    EFFECTIVE_TARGET_REVISION="$MAX_REVISION"
+    [[ "$MAX_REVISION" -ge 0 && "$MAX_REVISION" -le "$PIPELINE_LATEST_STAGE" ]] || die "--max-revision must be between 0 and $PIPELINE_LATEST_STAGE (the mandatory chain only -- use --patches to include an optional stage), got: $MAX_REVISION"
+    MANDATORY_TARGET_MASK=0
+    for _n in $(seq 1 "$MAX_REVISION"); do MANDATORY_TARGET_MASK=$(( MANDATORY_TARGET_MASK | STAGE_BIT[$_n] )); done
+    unset _n
 else
-    EFFECTIVE_TARGET_REVISION="$PIPELINE_LATEST_STAGE"
+    MANDATORY_TARGET_MASK=$MANDATORY_MASK
 fi
-EFFECTIVE_LAST_STAGE="${REVISION_LAST_STAGE[$EFFECTIVE_TARGET_REVISION]}"
+
+# PATCHES_MASK: the exact set of stages --patches named, validated against STAGE_BIT's known
+# domain. Empty (0) if --patches wasn't given.
+PATCHES_MASK=0
+if [[ -n "$PATCHES_ARG" ]]; then
+    IFS=',' read -ra _patch_list <<< "$PATCHES_ARG"
+    for _n in "${_patch_list[@]}"; do
+        [[ "$_n" =~ ^[0-9]+$ ]] || die "--patches: '$_n' is not a stage number"
+        [[ -n "${STAGE_BIT[$_n]+x}" ]] || die "--patches: stage $_n doesn't exist (known stages: ${!STAGE_BIT[*]})"
+        PATCHES_MASK=$(( PATCHES_MASK | STAGE_BIT[$_n] ))
+    done
+    unset _n _patch_list
+fi
 
 # ---------------------------------------------------------------------------
 # dotnet check
@@ -331,42 +333,6 @@ if [[ $LIST_ONLY -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Optional: Stage 6, the Exchange sync-freeze fix -- see its own header comment further down for
-# what it does. Confirmed fixing severe multi-minute freezes during Exchange sync on some
-# machines, but not yet confirmed to behave the same way on every machine -- kept optional
-# (default: NOT included) rather than risking a regression on a machine that was never affected
-# by the freeze this fixes in the first place. Skipped entirely if --max-revision was given
-# explicitly (a directly-requested revision is a stronger signal than this default, and asking
-# afterward would be confusing -- e.g. `--max-revision 4` explicitly asking to stay mandatory-only
-# shouldn't then prompt to go to 6 anyway).
-# ---------------------------------------------------------------------------
-
-if [[ -n "$MAX_REVISION" ]]; then
-    log "explicit --max-revision $MAX_REVISION given -- not prompting for the optional Exchange sync-freeze fix."
-else
-    include_sync_freeze_fix=0
-    if [[ $ENABLE_SYNC_FREEZE_FIX -eq 1 ]]; then
-        include_sync_freeze_fix=1
-    elif [[ $SKIP_SYNC_FREEZE_FIX -eq 1 ]]; then
-        include_sync_freeze_fix=0
-    else
-        echo ""
-        echo "Stage 6 (optional): a fix for severe, recurring multi-minute freezes during Exchange"
-        echo "sync. Confirmed working on some machines, but not yet confirmed to behave the same"
-        echo "way on every machine -- kept optional until that's better understood. Skipping this"
-        echo "keeps the bottle on the mandatory pipeline only (revision $PIPELINE_LATEST_STAGE); you"
-        echo "can opt in later with a plain re-run once you're ready to try it."
-        read -r -p "Include the Exchange sync-freeze fix in this deploy? [y/N] " sfreply
-        [[ "$sfreply" =~ ^[Yy]$ ]] && include_sync_freeze_fix=1
-    fi
-    if [[ $include_sync_freeze_fix -eq 1 ]]; then
-        EFFECTIVE_TARGET_REVISION=6
-        EFFECTIVE_LAST_STAGE="${REVISION_LAST_STAGE[$EFFECTIVE_TARGET_REVISION]}"
-        log "including the optional Exchange sync-freeze fix (targeting revision 6)."
-    fi
-fi
-
-# ---------------------------------------------------------------------------
 # Select bottle
 # ---------------------------------------------------------------------------
 
@@ -431,96 +397,67 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Revision check -- MailClient.Wine.dll marker, same mechanism (and same tracked source,
-# il-patches/MailClient.Wine/VersionMarker.cs) as the 10.4.5674 pipeline, just built with this
-# release line's own version numbers. This revision number is the pipeline stage count (see
-# PIPELINE_LATEST_STAGE above), NOT the per-version OUR_RELEASE_NUMBER looked up above -- a
-# bottle with no marker, or a marker for a different eM Client version (e.g. it was last patched
-# on 11.0.196 and has since been upgraded to 11.0.282 in place), is simply revision 0: the
-# assemblies are different binaries even where the patch content happens to be identical, so a
-# full fresh-patch pass is the safe default rather than assuming stage completion carries over.
+# Read the MailClient.Wine.dll marker -- same mechanism (and same tracked source,
+# il-patches/MailClient.Wine/VersionMarker.cs) as the 10.4.5674 pipeline, just interpreted as a
+# bitmask (see STAGE_BIT above) rather than a linear stage count. A bottle with no marker, or a
+# marker for a different eM Client version (e.g. it was last patched on 11.0.196 and has since
+# been upgraded to 11.0.282 in place), is simply mask 0: the assemblies are different binaries
+# even where the patch content happens to be identical, so a full fresh-patch pass is the safe
+# default rather than assuming any stage's completion carries over. No legacy-scheme handling --
+# see the header comment's own note on why a bottle patched by an older, pre-bitmask version of
+# this script needs a pristine reset first rather than being auto-migrated.
 # ---------------------------------------------------------------------------
 
-CURRENT_REVISION=0
+INSTALLED_MASK=0
 MARKER_DLL="$BOTTLE_APP_DIR/MailClient.Wine.dll"
 if [[ -f "$MARKER_DLL" ]]; then
     marker_line=$($ILP --version "$MARKER_DLL" 2>/dev/null || true)
     marker_file_version=$(echo "$marker_line" | awk -F'\t' '{print $3}' | sed 's/FileVersion=//')
     marker_emclient_version="${marker_file_version%.*}"
-    marker_revision="${marker_file_version##*.}"
-    if [[ "$marker_emclient_version" == "$RELEASE_VERSION" && "$marker_revision" =~ ^[0-9]+$ ]]; then
-        CURRENT_REVISION="$marker_revision"
-        # Compatibility check: revision 5 ONLY ever existed under the EARLIER stage numbering
-        # that predates today's Stage 4 (preview-pane periodic-repaint fix, see its own header
-        # comment further down) -- back when Stage 5 was the (optional) Exchange sync-freeze fix.
-        # Today's REVISION_LAST_STAGE has no [5] entry (it jumps 4 -> 6), so no version of this
-        # script starting from this one will ever WRITE a revision-5 marker again -- any bottle
-        # showing 5 here can only have gotten it from an OLDER script, and unambiguously means
-        # "mandatory Stages 1-3 plus the (now Stage 6) sync-freeze fix, but NOT the new mandatory
-        # Stage 4" -- a gap this script's linear single-revision resume logic
-        # (START_STAGE = REVISION_LAST_STAGE[revision] + 1) can't safely represent. Rather than
-        # guess (silently skip the new Stage 4 -- wrong -- or silently re-run stages that already
-        # ran -- also wrong), fail loudly and point at the safe way out.
-        #
-        # Revision 4 is deliberately NOT included in this check, even though it also predates
-        # Stage 4 under the OLDER numbering (where Stage 4 was itself the always-mandatory
-        # Exchange sync-freeze fix) -- unlike 5, that ambiguity is now purely historical: any
-        # bottle that hit old-revision-4 would already have been remapped forward to 5 the very
-        # first time a post-282-2 script ran against it (that script generation's own "eq 4 ->
-        # remap to 5" logic, since replaced by this same check on 5 above), so a live revision-4
-        # marker today can only mean what THIS script just wrote: mandatory Stages 1-4 done, the
-        # normal, common, and completely valid "already at the latest, nothing to do" case. Feed
-        # revision 4 through the ordinary DLL_ALREADY_PATCHED/resume logic below like any other
-        # entry in REVISION_LAST_STAGE.
-        if [[ "$CURRENT_REVISION" -eq 5 ]] && [[ $FORCE -eq 0 ]]; then
-            warn "this bottle is marked revision 5 under an EARLIER pipeline numbering, from"
-            warn "before today's Stage 4 (preview-pane periodic-repaint fix) existed -- it has"
-            warn "mandatory Stages 1-3 plus the optional Exchange sync-freeze fix (now Stage 6),"
-            warn "but NOT the new mandatory Stage 4. Re-run with --force to fully regenerate the"
-            warn "pipeline from the currently installed assemblies through your target revision"
-            warn "(safe -- it derives fresh output from what's actually installed, it doesn't"
-            warn "touch original/)."
-            die "revision 5 (pre-Stage-4 numbering) needs --force to proceed."
-        fi
-        log "found MailClient.Wine.dll: this install is at $RELEASE_VERSION revision $CURRENT_REVISION."
+    marker_mask="${marker_file_version##*.}"
+    if [[ "$marker_emclient_version" == "$RELEASE_VERSION" && "$marker_mask" =~ ^[0-9]+$ ]]; then
+        INSTALLED_MASK="$marker_mask"
+        log "found MailClient.Wine.dll: this install has stage mask $INSTALLED_MASK ($RELEASE_VERSION)."
     else
         warn "MailClient.Wine.dll present but for a different eM Client version"
-        warn "($marker_file_version, expected $RELEASE_VERSION.N) -- ignoring it, treating as revision 0."
+        warn "($marker_file_version, expected $RELEASE_VERSION.N) -- ignoring it, treating as unpatched."
     fi
 fi
 
 # ---------------------------------------------------------------------------
-# Optional: Stage 7, the Microsoft 365 / Graph API DNS+socket sync-freeze fix -- a genuinely
-# separate bug and fix from Stage 6's classic IMAP/EWS Exchange sync freeze (see Stage 7's own
-# header comment further down for what it does and why). Tracked on its OWN independent axis,
-# not through EFFECTIVE_TARGET_REVISION/REVISION_LAST_STAGE like every stage above: Stage 6 and
-# Stage 7 are two unrelated optional fixes a bottle can carry in any combination, which the
-# single linear "revision N means stages 1..N are all done" scheme above has no way to
-# represent. Detected instead by inspecting whatever MailClient.Wine.dll is ACTUALLY installed
-# right now, via the existing --find-member scan mode: a plain marker build (from any of Stages
-# 1-6) has no MailClient.Wine.DnsConnectHelper type at all; Stage 7's own build of that same
-# filename does, because it's genuinely a different, larger assembly (the version-marker
-# attributes plus real functional code the app loads and calls into) rather than just a
-# different FileVersion number.
+# Optional stages: Stage 6 (Exchange sync-freeze fix) and Stage 7 (Microsoft 365 / Graph API
+# DNS+socket sync-freeze fix) -- see each one's own header comment further down for what they do
+# and why they're optional. Both decided here, identically: already applied -> carry forward with
+# no prompt; named explicitly via --patches -> included with no prompt; otherwise, with -y and no
+# --patches, default to NOT included; otherwise ask interactively.
 # ---------------------------------------------------------------------------
 
-MSGRAPH_DNS_FIX_ALREADY_APPLIED=0
-if [[ -f "$BOTTLE_APP_DIR/MailClient.Wine.dll" ]] \
-    && $ILP --find-member "$BOTTLE_APP_DIR/MailClient.Wine.dll" DnsConnectHelper 2>/dev/null | grep -q "^type "; then
-    MSGRAPH_DNS_FIX_ALREADY_APPLIED=1
+OPTIONAL_TARGET_MASK=0
+
+if (( INSTALLED_MASK & STAGE_BIT[6] )); then
+    OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[6] ))
+elif (( PATCHES_MASK & STAGE_BIT[6] )); then
+    OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[6] ))
+    log "including the optional Exchange sync-freeze fix (Stage 6, named via --patches)."
+elif [[ $ASSUME_YES -eq 0 ]]; then
+    echo ""
+    echo "Stage 6 (optional): a fix for severe, recurring multi-minute freezes during Exchange"
+    echo "sync. Confirmed working on some machines, but not yet confirmed to behave the same"
+    echo "way on every machine -- kept optional until that's better understood. Skipping this"
+    echo "keeps the bottle on the mandatory pipeline only; you can opt in later with a plain"
+    echo "re-run (or --patches 6) once you're ready to try it."
+    read -r -p "Include the Exchange sync-freeze fix in this deploy? [y/N] " sfreply
+    if [[ "$sfreply" =~ ^[Yy]$ ]]; then
+        OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[6] ))
+    fi
 fi
 
-INCLUDE_MSGRAPH_DNS_FIX=$MSGRAPH_DNS_FIX_ALREADY_APPLIED
-if [[ -n "$MAX_REVISION" ]]; then
-    : # An explicit --max-revision is about the mandatory/Stage-6 axis only (see that flag's own
-      # doc comment) -- deliberately not touching Stage 7's independent already-applied/not
-      # state either way, same "don't ask, don't second-guess an explicit revision request"
-      # reasoning as Stage 6's own prompt.
-elif [[ $ENABLE_MSGRAPH_DNS_FIX -eq 1 ]]; then
-    INCLUDE_MSGRAPH_DNS_FIX=1
-elif [[ $SKIP_MSGRAPH_DNS_FIX -eq 1 ]]; then
-    INCLUDE_MSGRAPH_DNS_FIX=0
-elif [[ $MSGRAPH_DNS_FIX_ALREADY_APPLIED -eq 0 ]]; then
+if (( INSTALLED_MASK & STAGE_BIT[7] )); then
+    OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[7] ))
+elif (( PATCHES_MASK & STAGE_BIT[7] )); then
+    OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[7] ))
+    log "including the optional Microsoft 365 / Graph API sync-freeze fix (Stage 7, named via --patches)."
+elif [[ $ASSUME_YES -eq 0 ]]; then
     echo ""
     echo "Stage 7 (optional): a fix for Microsoft 365 / Graph API account sync freezes -- a"
     echo "DIFFERENT bug from Stage 6's classic IMAP/EWS Exchange sync freeze. Root cause: the"
@@ -528,33 +465,39 @@ elif [[ $MSGRAPH_DNS_FIX_ALREADY_APPLIED -eq 0 ]]; then
     echo "connection path, plus a second hang in socket I/O found after fixing the first."
     echo "Confirmed fixing a real, reproduced freeze live; not yet soaked broadly, so kept"
     echo "optional. Skipping this leaves Microsoft 365 / Graph accounts exposed to the Wine"
-    echo "defect Stage 6 doesn't touch; you can opt in later with a plain re-run."
+    echo "defect Stage 6 doesn't touch; you can opt in later with a plain re-run (or --patches 7)."
     read -r -p "Include the Microsoft 365 / Graph API sync-freeze fix in this deploy? [y/N] " gfreply
-    [[ "$gfreply" =~ ^[Yy]$ ]] && INCLUDE_MSGRAPH_DNS_FIX=1
+    if [[ "$gfreply" =~ ^[Yy]$ ]]; then
+        OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[7] ))
+    fi
 fi
-NEEDS_MSGRAPH_DNS_FIX_WORK=0
-[[ $INCLUDE_MSGRAPH_DNS_FIX -eq 1 && $MSGRAPH_DNS_FIX_ALREADY_APPLIED -eq 0 ]] && NEEDS_MSGRAPH_DNS_FIX_WORK=1
+
+# ---------------------------------------------------------------------------
+# TARGET_MASK: every stage this run should end up with -- the mandatory chain up to
+# MANDATORY_TARGET_MASK, whichever optional stages were just decided above, and anything named
+# directly via --patches (covers naming a MANDATORY stage number too, e.g. --patches 3 alone,
+# which bypasses the normal "1-4 are all mandatory together" rule entirely -- targeted patching,
+# not a full mandatory run). NEEDS_WORK_MASK is what's actually missing right now; masks only
+# ever grow (a stage already applied is never re-applied, never removed by a later run).
+# ---------------------------------------------------------------------------
+
+TARGET_MASK=$(( MANDATORY_TARGET_MASK | OPTIONAL_TARGET_MASK | PATCHES_MASK ))
+NEEDS_WORK_MASK=$(( TARGET_MASK & ~INSTALLED_MASK & ALL_KNOWN_MASK ))
+# What the marker should read AFTER this run -- masks only ever grow, so this is always at least
+# INSTALLED_MASK even in the (already-handled-above) case where nothing new gets applied.
+NEW_MASK=$(( INSTALLED_MASK | TARGET_MASK ))
 
 DLL_ALREADY_PATCHED=0
-START_STAGE=1
-if [[ $FORCE -eq 0 && "$CURRENT_REVISION" -ge "$EFFECTIVE_TARGET_REVISION" && $NEEDS_MSGRAPH_DNS_FIX_WORK -eq 0 ]]; then
+if [[ $FORCE -eq 0 && $NEEDS_WORK_MASK -eq 0 ]]; then
     DLL_ALREADY_PATCHED=1
-    log "already at $RELEASE_VERSION revision $CURRENT_REVISION (this run targets revision"
-    log "$EFFECTIVE_TARGET_REVISION) -- skipping the DLL patch pipeline (pass"
-    log "--force to attempt patching anyway)."
-elif [[ "$CURRENT_REVISION" -gt 0 && $FORCE -eq 0 ]]; then
-    START_STAGE=$(( ${REVISION_LAST_STAGE[$CURRENT_REVISION]} + 1 ))
-    log "install is at $RELEASE_VERSION revision $CURRENT_REVISION -- resuming from Stage $START_STAGE"
-    log "(stages 1-$(( START_STAGE - 1 )) already applied, left as-is)."
-fi
-if [[ $DLL_ALREADY_PATCHED -eq 1 && $NEEDS_MSGRAPH_DNS_FIX_WORK -eq 1 ]]; then
-    # Can't actually happen (NEEDS_MSGRAPH_DNS_FIX_WORK is one of the conditions gating
-    # DLL_ALREADY_PATCHED itself above) -- defensive assertion, not a reachable state.
-    die "internal error: DLL_ALREADY_PATCHED and NEEDS_MSGRAPH_DNS_FIX_WORK both true"
-fi
-if [[ $NEEDS_MSGRAPH_DNS_FIX_WORK -eq 1 && $DLL_ALREADY_PATCHED -eq 0 && "$CURRENT_REVISION" -ge "$EFFECTIVE_TARGET_REVISION" ]]; then
-    log "mandatory pipeline (and Stage 6, if targeted) already at revision $CURRENT_REVISION --"
-    log "entering the patch pipeline solely to add Stage 7 (Microsoft 365 / Graph API fix)."
+    log "already has every requested stage (mask $INSTALLED_MASK) -- skipping the DLL patch"
+    log "pipeline (pass --force to attempt patching anyway)."
+elif [[ $FORCE -eq 0 ]]; then
+    log "install has stage mask $INSTALLED_MASK -- applying what's missing (mask $NEEDS_WORK_MASK)."
+else
+    NEEDS_WORK_MASK=$(( TARGET_MASK & ALL_KNOWN_MASK ))
+    log "--force given -- re-applying every targeted stage (mask $NEEDS_WORK_MASK) regardless of"
+    log "what's already installed."
 fi
 
 if [[ $DLL_ALREADY_PATCHED -eq 0 ]]; then
@@ -676,26 +619,20 @@ log "ilspycmd ready: $ILSPY"
 # with the ACTUALLY DETECTED eM Client build's own version numbers (RELEASE_VERSION, resolved
 # above from the real installed FileVersion, not a hardcoded constant -- this is what lets the
 # same script support multiple eM Client builds): AssemblyVersion is "$RELEASE_VERSION.0",
-# FileVersion's leading three components match that with the 4th being EFFECTIVE_TARGET_REVISION
-# (normally PIPELINE_LATEST_STAGE, but a lower --max-revision cap if one was given -- the marker
-# must reflect what THIS run actually deploys, not this script's latest, otherwise a later plain
-# `./deploy.sh` run would see the marker already at the latest stage and wrongly skip the
-# pipeline instead of applying the stages this run deliberately capped away) -- the exact same
-# scheme the 10.4.5674 pipeline uses, just against a different base version, so the same
-# revision-detection logic above (and in any future Stage 5+ this version gets) keeps working
-# unchanged regardless of which supported eM Client build it's running against.
+# FileVersion's leading three components match that with the 4th being NEW_MASK -- the stage
+# bitmask this run leaves the bottle at (see STAGE_BIT above), not just this script's own latest.
 # ---------------------------------------------------------------------------
 
-log "building MailClient.Wine version marker ($RELEASE_VERSION revision $EFFECTIVE_TARGET_REVISION)..."
+log "building MailClient.Wine version marker ($RELEASE_VERSION mask $NEW_MASK)..."
 mkdir -p "$WORKDIR/tools/MailClient.Wine"
 cp "$IL_PATCHES_DIR/MailClient.Wine/MailClient.Wine.csproj" "$IL_PATCHES_DIR/MailClient.Wine/VersionMarker.cs" "$WORKDIR/tools/MailClient.Wine/"
 dotnet build -c Release \
     -p:AssemblyVersion="$RELEASE_VERSION.0" \
-    -p:FileVersion="$RELEASE_VERSION.$EFFECTIVE_TARGET_REVISION" \
+    -p:FileVersion="$RELEASE_VERSION.$NEW_MASK" \
     "$WORKDIR/tools/MailClient.Wine" >"$WORKDIR/build-mailclient-wine.log" 2>&1 \
     || { cat "$WORKDIR/build-mailclient-wine.log" >&2; die "failed to build MailClient.Wine marker (log above)"; }
 MAILCLIENT_WINE_DLL="$WORKDIR/tools/MailClient.Wine/bin/Release/net8.0/MailClient.Wine.dll"
-log "MailClient.Wine marker built ($RELEASE_VERSION.$EFFECTIVE_TARGET_REVISION)."
+log "MailClient.Wine marker built ($RELEASE_VERSION.$NEW_MASK)."
 
 # ---------------------------------------------------------------------------
 # Stage 1: PBKDF2 startup crash fix (see reports/emclient11-pbkdf2-startup-crash-findings.md).
@@ -716,23 +653,22 @@ log "MailClient.Wine marker built ($RELEASE_VERSION.$EFFECTIVE_TARGET_REVISION).
 # or fewer -- the tool fails loudly if it finds zero, but doesn't hardcode an exact count.
 # ---------------------------------------------------------------------------
 
-if [[ $START_STAGE -le 1 && $EFFECTIVE_LAST_STAGE -ge 1 ]]; then
+if (( NEEDS_WORK_MASK & STAGE_BIT[1] )); then
     log "Stage 1: PBKDF2 startup crash fix (bcrypt-backed static Pbkdf2 -> working instance API)..."
     $ILP --patch-pbkdf2-instance-api "$WORKDIR/original" "$WORKDIR/output-stage1"
     STAGE1_DIR="$WORKDIR/output-stage1"
-elif [[ $START_STAGE -gt 1 ]]; then
-    # Resuming past Stage 1: already baked into what's actually installed ($WORKDIR/original is
-    # already a full, complete copy of it) -- re-running would be redundant (and, unlike Stage 1
-    # of the 10.4.5674 pipeline, this patch has no "expected pristine, found already-patched"
-    # guard of its own, so a re-run wouldn't even fail loudly -- skipping outright is the safe
-    # choice, same reasoning as the sibling script's own post-hoc stage guards).
-    log "Stage 1 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+elif (( INSTALLED_MASK & STAGE_BIT[1] )); then
+    # Already baked into what's actually installed ($WORKDIR/original is already a full,
+    # complete copy of it) -- re-running would be redundant (and, unlike Stage 1 of the
+    # 10.4.5674 pipeline, this patch has no "expected pristine, found already-patched" guard of
+    # its own, so a re-run wouldn't even fail loudly -- skipping outright is the safe choice).
+    log "Stage 1 already applied -- using the installed files as-is."
     STAGE1_DIR="$WORKDIR/original"
 else
-    # EFFECTIVE_LAST_STAGE < 1: --max-revision capped this run below Stage 1 (i.e. revision 0 --
-    # deliberately deploying nothing). Nothing to carry forward from (Stage 1 is the first),
-    # so this is the one case where "capped" and "not yet started" coincide with plain original.
-    log "Stage 1 skipped -- --max-revision caps this deploy at revision $EFFECTIVE_TARGET_REVISION."
+    # Not wanted this run at all (e.g. --max-revision capped below Stage 1). Nothing to carry
+    # forward from (Stage 1 is the first), so this is the one case where "not wanted" and "not
+    # yet started" coincide with plain original.
+    log "Stage 1 skipped -- not targeted this run."
     STAGE1_DIR="$WORKDIR/original"
 fi
 
@@ -752,15 +688,15 @@ fi
 # C2 A0 C2 A0 (two non-breaking spaces) afterward.
 # ---------------------------------------------------------------------------
 
-if [[ $START_STAGE -le 2 && $EFFECTIVE_LAST_STAGE -ge 2 ]]; then
+if (( NEEDS_WORK_MASK & STAGE_BIT[2] )); then
     log "Stage 2: splash-screen tip label icon fix (same tofu-box bug/fix as the 10.4.5674 pipeline)..."
     $ILP --patch-splash-tip-icon "$STAGE1_DIR" "$WORKDIR/output-stage2"
     STAGE2_DIR="$WORKDIR/output-stage2"
-elif [[ $START_STAGE -gt 2 ]]; then
-    log "Stage 2 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+elif (( INSTALLED_MASK & STAGE_BIT[2] )); then
+    log "Stage 2 already applied -- using the installed files as-is."
     STAGE2_DIR="$WORKDIR/original"
 else
-    log "Stage 2 skipped -- --max-revision caps this deploy at revision $EFFECTIVE_TARGET_REVISION."
+    log "Stage 2 skipped -- not targeted this run."
     STAGE2_DIR="$STAGE1_DIR"
 fi
 
@@ -795,7 +731,7 @@ fi
 # fresh-from-pristine chain re-run).
 # ---------------------------------------------------------------------------
 
-if [[ $START_STAGE -le 3 && $EFFECTIVE_LAST_STAGE -ge 3 ]]; then
+if (( NEEDS_WORK_MASK & STAGE_BIT[3] )); then
     log "Stage 3: notification toast empty-until-fade fix (same bug/fix as the 10.4.5674 pipeline's Stages 8-14)..."
     $ILP --patch-notification-click-resubscribe "$STAGE2_DIR" "$WORKDIR/output-stage3a"
     $ILP --patch-notification-content-padding "$WORKDIR/output-stage3a" "$WORKDIR/output-stage3b"
@@ -812,11 +748,11 @@ if [[ $START_STAGE -le 3 && $EFFECTIVE_LAST_STAGE -ge 3 ]]; then
     $ILP --patch-notification-hover-forward "$WORKDIR/output-stage3l" "$WORKDIR/output-stage3m"
     $ILP --patch-notification-toolbar-icons "$WORKDIR/output-stage3m" "$WORKDIR/output-final"
     STAGE3_DIR="$WORKDIR/output-final"
-elif [[ $START_STAGE -gt 3 ]]; then
-    log "Stage 3 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+elif (( INSTALLED_MASK & STAGE_BIT[3] )); then
+    log "Stage 3 already applied -- using the installed files as-is."
     STAGE3_DIR="$WORKDIR/original"
 else
-    log "Stage 3 skipped -- --max-revision caps this deploy at revision $EFFECTIVE_TARGET_REVISION."
+    log "Stage 3 skipped -- not targeted this run."
     STAGE3_DIR="$STAGE2_DIR"
 fi
 
@@ -852,15 +788,15 @@ fi
 # issue."
 # ---------------------------------------------------------------------------
 
-if [[ $START_STAGE -le 4 && $EFFECTIVE_LAST_STAGE -ge 4 ]]; then
+if (( NEEDS_WORK_MASK & STAGE_BIT[4] )); then
     log "Stage 4: message preview pane periodic-repaint fix..."
     $ILP --patch-preview-pane-periodic-repaint "$STAGE3_DIR" "$WORKDIR/output-stage4"
     STAGE4_DIR="$WORKDIR/output-stage4"
-elif [[ $START_STAGE -gt 4 ]]; then
-    log "Stage 4 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+elif (( INSTALLED_MASK & STAGE_BIT[4] )); then
+    log "Stage 4 already applied -- using the installed files as-is."
     STAGE4_DIR="$WORKDIR/original"
 else
-    log "Stage 4 skipped -- --max-revision caps this deploy at revision $EFFECTIVE_TARGET_REVISION."
+    log "Stage 4 skipped -- not targeted this run."
     STAGE4_DIR="$STAGE3_DIR"
 fi
 
@@ -889,16 +825,16 @@ fi
 # the previous vacant slot; see its own header comment above).
 # ---------------------------------------------------------------------------
 
-if [[ $START_STAGE -le 6 && $EFFECTIVE_LAST_STAGE -ge 6 ]]; then
+if (( NEEDS_WORK_MASK & STAGE_BIT[6] )); then
     log "Stage 6: Exchange sync-freeze fix (same bug/fix as the 10.4.5674 pipeline's Stage 15)..."
     $ILP --patch-account-manager-sync-async "$STAGE4_DIR" "$WORKDIR/output-stage6a"
     $ILP --patch-folder-sync-async "$WORKDIR/output-stage6a" "$WORKDIR/output-final"
     FINAL_DIR="$WORKDIR/output-final"
-elif [[ $START_STAGE -gt 6 ]]; then
-    log "Stage 6 already applied (revision $CURRENT_REVISION) -- using the installed files as-is."
+elif (( INSTALLED_MASK & STAGE_BIT[6] )); then
+    log "Stage 6 already applied -- using the installed files as-is."
     FINAL_DIR="$WORKDIR/original"
 else
-    log "Stage 6 skipped (not included in this deploy -- revision $EFFECTIVE_TARGET_REVISION)."
+    log "Stage 6 not included in this deploy."
     FINAL_DIR="$STAGE4_DIR"
 fi
 
@@ -934,8 +870,8 @@ fi
 # (same mechanism as the 10.4.5674 pipeline's own BouncyCastle helper, Stage 5 there).
 # ---------------------------------------------------------------------------
 
-if [[ $INCLUDE_MSGRAPH_DNS_FIX -eq 1 ]]; then
-    if [[ $MSGRAPH_DNS_FIX_ALREADY_APPLIED -eq 1 ]]; then
+if (( TARGET_MASK & STAGE_BIT[7] )); then
+    if (( INSTALLED_MASK & STAGE_BIT[7] )); then
         log "Stage 7 (MS Graph DNS/socket fix) already applied -- carrying the existing functional"
         log "MailClient.Wine.dll forward as-is (MailClient.dll/MailClient.Accounts.dll already"
         log "have this baked in via the pass-through logic above)."
@@ -970,7 +906,7 @@ if [[ $INCLUDE_MSGRAPH_DNS_FIX -eq 1 ]]; then
 EOF
         dotnet build -c Release \
             -p:AssemblyVersion="$RELEASE_VERSION.0" \
-            -p:FileVersion="$RELEASE_VERSION.$EFFECTIVE_TARGET_REVISION" \
+            -p:FileVersion="$RELEASE_VERSION.$NEW_MASK" \
             "$WORKDIR/tools/MailClient.Wine.Full" >"$WORKDIR/build-mailclient-wine-full.log" 2>&1 \
             || { cat "$WORKDIR/build-mailclient-wine-full.log" >&2; die "failed to build the full MailClient.Wine assembly for Stage 7 (log above)"; }
         WINE_FULL_DLL="$WORKDIR/tools/MailClient.Wine.Full/bin/Release/net10.0/MailClient.Wine.dll"
@@ -994,7 +930,7 @@ fi
 # unconditionally, every run, is simpler and cheaper than conditioning it on which stage(s) fired.
 rsync -a --ignore-existing "$WORKDIR/original"/ "$FINAL_DIR"/
 
-if [[ $INCLUDE_MSGRAPH_DNS_FIX -eq 1 && $MSGRAPH_DNS_FIX_ALREADY_APPLIED -eq 0 ]]; then
+if (( NEEDS_WORK_MASK & STAGE_BIT[7] )); then
     # MailClient.deps.json: MailClient.Wine is now a REAL loaded dependency (not just an inert
     # marker file sitting alongside the app) -- needs an explicit entry, same mechanism as the
     # 10.4.5674 pipeline's own BouncyCastle helper (Stage 5 there). VERSION here must match the
@@ -1014,12 +950,10 @@ fi
 
 # The version marker (or Stage 7's real functional build of the same filename, when included) is
 # copied in here, unconditionally, regardless of which branch above produced FINAL_DIR -- it must
-# always reflect EFFECTIVE_TARGET_REVISION (the revision THIS run actually deploys on the
-# mandatory/Stage-6 axis), not just whichever stage happened to run last. Safe to always
-# overwrite: either this is a forward move on that axis (the DLL_ALREADY_PATCHED short-circuit
-# above already handled "nothing to do on either axis"), or Stage 7 alone is what brought us into
-# this block, in which case the marker's own revision number is unchanged from what's already
-# installed -- still correct to (re)write, just not a "forward move" in that narrower sense.
+# always reflect NEW_MASK (every stage this run leaves the bottle with), not just whichever stage
+# happened to run last. Safe to always overwrite: NEW_MASK is always >= INSTALLED_MASK (masks
+# only ever grow), so this is never a regression even in the "nothing new to apply" case (which
+# the DLL_ALREADY_PATCHED short-circuit above already handles by skipping this whole block).
 if [[ -n "$MAILCLIENT_WINE_DLL_OVERRIDE" ]]; then
     cp "$MAILCLIENT_WINE_DLL_OVERRIDE" "$FINAL_DIR/MailClient.Wine.dll"
 else
@@ -1052,7 +986,7 @@ $ILP --dump-handlers "$FINAL_DIR/MailClient.Abstractions.dll" 'MailClient.UI.Fil
 # 10.4.5674 pipeline's own Stages 6-7 check) -- checked against STAGE2_DIR specifically, not
 # FINAL_DIR, since Stage 3 (notification chain) is real IL insertion that legitimately grows the
 # file. Only meaningful (and only ran) when Stage 2 actually ran this time.
-if [[ $START_STAGE -le 2 && $EFFECTIVE_LAST_STAGE -ge 2 ]]; then
+if (( NEEDS_WORK_MASK & STAGE_BIT[2] )); then
     STAGE1_SIZE=$(stat -c%s "$STAGE1_DIR/MailClient.dll")
     STAGE2_SIZE=$(stat -c%s "$STAGE2_DIR/MailClient.dll")
     [[ "$STAGE1_SIZE" -eq "$STAGE2_SIZE" ]] \
@@ -1065,7 +999,7 @@ fi
 
 # Stage 3 verification -- mirrors the 10.4.5674 pipeline's own equivalent checks (see its Stages
 # 8-14 verification block), only meaningful (and only ran) when Stage 3 actually ran this time.
-if [[ $START_STAGE -le 3 && $EFFECTIVE_LAST_STAGE -ge 3 ]]; then
+if (( NEEDS_WORK_MASK & STAGE_BIT[3] )); then
     $ILSPY -t "MailClient.UI.Forms.NotificationForms.FormGenericNotification" "$FINAL_DIR/MailClient.dll" | grep -q "__drawNotificationTextIntoBitmap" \
         || die "verification failed: __drawNotificationTextIntoBitmap not found -- notification text-in-bitmap fix missing"
 
@@ -1089,7 +1023,7 @@ if [[ $START_STAGE -le 3 && $EFFECTIVE_LAST_STAGE -ge 3 ]]; then
 fi
 
 # Stage 4 verification -- only meaningful (and only ran) when Stage 4 actually ran this time.
-if [[ $START_STAGE -le 4 && $EFFECTIVE_LAST_STAGE -ge 4 ]]; then
+if (( NEEDS_WORK_MASK & STAGE_BIT[4] )); then
     $ILSPY -t "MailClient.UI.Controls.ControlMessageDetail.ControlMessageDetail" "$FINAL_DIR/MailClient.dll" | grep -q "__previewPaneRepaintTick" \
         || die "verification failed: ControlMessageDetail.__previewPaneRepaintTick not found -- preview pane periodic-repaint fix missing"
 
@@ -1102,7 +1036,7 @@ fi
 
 # Stage 6 verification -- mirrors the 10.4.5674 pipeline's own equivalent checks (see its Stage
 # 15 verification block), only meaningful (and only ran) when Stage 6 actually ran this time.
-if [[ $START_STAGE -le 6 && $EFFECTIVE_LAST_STAGE -ge 6 ]]; then
+if (( NEEDS_WORK_MASK & STAGE_BIT[6] )); then
     $ILSPY -t "MailClient.Accounts.AccountManager" "$FINAL_DIR/MailClient.Accounts.dll" | grep -q "__RunSendAndReceiveAllCore" \
         || die "verification failed: AccountManager.__RunSendAndReceiveAllCore not found -- sync freeze fix missing"
 
@@ -1120,7 +1054,7 @@ fi
 # (a carry-forward of an already-applied Stage 7 has nothing new to verify -- MailClient.dll/
 # MailClient.Accounts.dll came from the untouched $WORKDIR/original pass-through, already proven
 # correct by whichever earlier run originally applied it).
-if [[ $INCLUDE_MSGRAPH_DNS_FIX -eq 1 && $MSGRAPH_DNS_FIX_ALREADY_APPLIED -eq 0 ]]; then
+if (( NEEDS_WORK_MASK & STAGE_BIT[7] )); then
     $ILSPY -t "MailClient.Protocols.InteractionController" "$FINAL_DIR/MailClient.dll" | grep -q "InstallConnectCallback" \
         || die "verification failed: InteractionController.CreateHttpClient doesn't reference InstallConnectCallback -- MS Graph DNS fix missing"
 
@@ -1194,11 +1128,12 @@ for f in "${DEPLOY_FILES[@]}"; do
 done
 
 log "deploy complete."
-log "  bottle:   $BOTTLE_NAME"
-log "  version:  $FOUND_FILE_VERSION (release $RELEASE_VERSION-$OUR_RELEASE_NUMBER)"
-log "  revision: $EFFECTIVE_TARGET_REVISION"
-log "  MS Graph DNS/socket fix (Stage 7): $([[ $INCLUDE_MSGRAPH_DNS_FIX -eq 1 ]] && echo included || echo not included)"
-log "  backup:   $BACKUP_DIR"
+log "  bottle:      $BOTTLE_NAME"
+log "  version:     $FOUND_FILE_VERSION (release $RELEASE_VERSION-$OUR_RELEASE_NUMBER)"
+log "  stage mask:  $NEW_MASK"
+log "  Exchange sync-freeze fix (Stage 6):  $([[ $(( NEW_MASK & STAGE_BIT[6] )) -ne 0 ]] && echo included || echo not included)"
+log "  MS Graph DNS/socket fix (Stage 7):   $([[ $(( NEW_MASK & STAGE_BIT[7] )) -ne 0 ]] && echo included || echo not included)"
+log "  backup:      $BACKUP_DIR"
 
 fi  # DLL_ALREADY_PATCHED
 
