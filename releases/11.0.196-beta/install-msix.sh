@@ -24,7 +24,9 @@
 # Usage:
 #   ./install-msix.sh                interactive: offers to create a fresh bottle (see below),
 #                                    then lists existing bottles found and prompts for choice
-#   ./install-msix.sh --bottle NAME  skip bottle selection (bottle dir name under ~/.cxoffice/)
+#   ./install-msix.sh --bottle NAME  skip bottle selection (bottle name, however the wine manager
+#                                    in use names it -- CrossOver's ~/.cxoffice/ dir name, or
+#                                    Bottles' own bottle name)
 #   ./install-msix.sh --new-bottle NAME  skip the create/reuse prompt: always create a new
 #                                    win11_64 bottle named NAME (must not already exist) and
 #                                    install the Core Fonts prerequisite into it before proceeding
@@ -79,6 +81,27 @@
 # ./install-msix.sh --install-fonts   install this repo's vendored fonts/*.ttf without the
 #                                      license-consent prompt (same as deploy.sh's own flag)
 # ./install-msix.sh --no-fonts        skip vendored font installation without the prompt
+# ./install-msix.sh --wine-manager crossover|bottles   which Wine-prefix manager to install into.
+#                                      Auto-detected when only one is installed; prompted for
+#                                      ("Are you using CrossOver or Bottles?") when both or
+#                                      neither are found and this flag isn't given (under -y with
+#                                      neither/both found, this flag is required). Under Bottles,
+#                                      --new-bottle creates a bottle via `bottles-cli new`
+#                                      (win64 environment/arch, matching CrossOver's own win11_64
+#                                      template) instead of `cxbottle --create` -- Bottles' own
+#                                      `new` already installs Arial/Times/Courier as part of its
+#                                      normal dependency resolution, so there's no separate
+#                                      Core-Fonts-equivalent step needed there. Every "run
+#                                      something inside the bottle" step (the .NET runtime
+#                                      installers, ICU DLL overrides, font registration, the
+#                                      shortcut-generating cscript call) works the same either
+#                                      way. The one real gap: Bottles has no CLI equivalent to
+#                                      `cxmenu --sync`'s host-wide Start Menu / app-launcher
+#                                      entry -- under Bottles this script instead registers eM
+#                                      Client as a program via `bottles-cli add` (confirmed
+#                                      hands-on: makes it launchable via Bottles' own GUI/
+#                                      `bottles-cli run -p`, but does NOT generate a host
+#                                      `.desktop` file the way `cxmenu --sync` does).
 
 set -euo pipefail
 
@@ -128,9 +151,10 @@ LIST_ONLY=0
 INSTALL_FONTS=0
 NO_FONTS=0
 ARCH="x86"
+WINE_MANAGER_ARG=""
 
 print_help() {
-    sed -n '2,81p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,96p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -142,6 +166,7 @@ while [[ $# -gt 0 ]]; do
         --install-fonts) INSTALL_FONTS=1; shift ;;
         --no-fonts) NO_FONTS=1; shift ;;
         --arch) ARCH="${2:-}"; shift 2 ;;
+        --wine-manager) WINE_MANAGER_ARG="${2:-}"; shift 2 ;;
         -h|--help) print_help; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -152,13 +177,101 @@ done
 [[ -n "$BOTTLE_OVERRIDE" && -n "$NEW_BOTTLE_NAME" ]] && die "--bottle and --new-bottle are mutually exclusive"
 
 # ---------------------------------------------------------------------------
+# Wine-prefix manager: CrossOver or Bottles (usebottles.com, the FOSS/Flatpak Wine-prefix
+# manager). Auto-detected when only one is present; --wine-manager or an interactive prompt
+# settles it when both or neither are found. See releases/*/deploy.sh's own copy of this same
+# block for the full rationale and the hands-on-confirmed Bottles quirks it works around
+# (-j/--json must precede the subcommand, a fresh data directory needs a warm-up call before
+# `list bottles` works, reg.exe import via `bottles-cli run` doesn't reliably persist).
+# ---------------------------------------------------------------------------
+
+HAVE_CROSSOVER=0
+[[ -x "$CXSTART_WINE" ]] && HAVE_CROSSOVER=1
+
+HAVE_BOTTLES=0
+BOTTLES_CLI_CMD=()
+if command -v bottles-cli >/dev/null 2>&1; then
+    HAVE_BOTTLES=1
+    BOTTLES_CLI_CMD=(bottles-cli)
+elif command -v flatpak >/dev/null 2>&1 && flatpak list --app --columns=application 2>/dev/null | grep -qx "com.usebottles.bottles"; then
+    HAVE_BOTTLES=1
+    BOTTLES_CLI_CMD=(flatpak run --command=bottles-cli com.usebottles.bottles)
+fi
+
+print_bottles_install_instructions() {
+    echo "  Flatpak (recommended, works on any distro):"
+    echo "    flatpak install flathub com.usebottles.bottles"
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        case "${ID:-}" in
+            arch|manjaro) echo "  Or from the AUR:  yay -S bottles" ;;
+        esac
+    fi
+}
+
+if [[ -n "$WINE_MANAGER_ARG" ]]; then
+    WINE_MANAGER="$WINE_MANAGER_ARG"
+    [[ "$WINE_MANAGER" == "crossover" || "$WINE_MANAGER" == "bottles" ]] \
+        || die "--wine-manager must be 'crossover' or 'bottles', got: $WINE_MANAGER"
+    [[ "$WINE_MANAGER" == "crossover" && $HAVE_CROSSOVER -eq 0 ]] && die "--wine-manager crossover given but CrossOver's wine binary wasn't found at $CXSTART_WINE"
+    [[ "$WINE_MANAGER" == "bottles" && $HAVE_BOTTLES -eq 0 ]] && die "--wine-manager bottles given but Bottles wasn't found (neither a native bottles-cli nor the com.usebottles.bottles Flatpak)"
+elif [[ $HAVE_CROSSOVER -eq 1 && $HAVE_BOTTLES -eq 0 ]]; then
+    WINE_MANAGER=crossover
+elif [[ $HAVE_CROSSOVER -eq 0 && $HAVE_BOTTLES -eq 1 ]]; then
+    WINE_MANAGER=bottles
+elif [[ $HAVE_CROSSOVER -eq 0 && $HAVE_BOTTLES -eq 0 ]]; then
+    err "neither CrossOver nor Bottles was found on this system."
+    err "Install CrossOver (https://www.codeweavers.com/crossover) or Bottles:"
+    print_bottles_install_instructions
+    die "install one of the two and re-run this script."
+else
+    if [[ $ASSUME_YES -eq 1 ]]; then
+        die "both CrossOver and Bottles were found -- pass --wine-manager crossover|bottles to pick one (required under -y)."
+    fi
+    echo ""
+    echo "Both CrossOver and Bottles were found on this system."
+    read -r -p "Are you using CrossOver or Bottles for this bottle? [c/b] " wmreply
+    case "$wmreply" in
+        [Cc]*) WINE_MANAGER=crossover ;;
+        [Bb]*) WINE_MANAGER=bottles ;;
+        *) die "please answer 'c' (CrossOver) or 'b' (Bottles), or pass --wine-manager." ;;
+    esac
+fi
+log "wine manager: $WINE_MANAGER"
+
+bottles_cli() { "${BOTTLES_CLI_CMD[@]}" "$@"; }
+
+# wine_run <bottle-name> <windows-path-to-exe> [args...] -- see releases/*/deploy.sh's own copy
+# for the full rationale (DOTNET_ROOT stripping, Bottles' stdout-forwarding gap).
+wine_run() {
+    local name="$1"; shift
+    local exe="$1"; shift
+    if [[ "$WINE_MANAGER" == "crossover" ]]; then
+        CX_BOTTLE="$name" env -u DOTNET_ROOT "$CXSTART_WINE" "$exe" "$@"
+    else
+        env -u DOTNET_ROOT "${BOTTLES_CLI_CMD[@]}" run -b "$name" -e "$exe" "$@"
+    fi
+}
+
+# wine_reg_add <bottle-name> <key> <value-name> <type> <data> -- see releases/*/deploy.sh's own
+# copy for the full rationale.
+wine_reg_add() {
+    local name="$1" key="$2" valname="$3" type="$4" data="$5"
+    if [[ "$WINE_MANAGER" == "crossover" ]]; then
+        CX_BOTTLE="$name" "$CXSTART_WINE" reg add "$key" /v "$valname" /t "$type" /d "$data" /f >/dev/null
+    else
+        bottles_cli reg add -b "$name" -k "$key" -v "$valname" -t "$type" -d "$data" >/dev/null
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Tool checks
 # ---------------------------------------------------------------------------
 
 for tool in curl python3 unzip tar; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found -- required by this script."
 done
-[[ -x "$CXSTART_WINE" ]] || die "CrossOver's wine binary not found at $CXSTART_WINE"
 
 # ---------------------------------------------------------------------------
 # Workdir -- everything downloaded/extracted lives here. Cleaned up on success; left in place
@@ -202,6 +315,36 @@ bottle_template() {
     grep -oP '^"Template"\s*=\s*"\K[^"]+' "$HOME/.cxoffice/$1/cxbottle.conf" 2>/dev/null || echo "?"
 }
 
+# Bottles: enumerate every existing bottle (name -> real drive_c-containing directory), same
+# Path/Custom_Path resolution as releases/*/deploy.sh's own Bottles discovery. Populates
+# BOTTLES_DIR_FOR_NAME (an associative array) as a side effect; returns the bottle names as
+# plain lines on stdout, one per bottle, in whatever order `list bottles` returned them.
+declare -A BOTTLES_DIR_FOR_NAME
+bottles_list_all() {
+    # local name/path: bash's `local` scoping is dynamic, not lexical -- without declaring these
+    # local to THIS function, `read -r name path` below would instead reuse (and clobber) a
+    # caller's own `local name`/`local path` variable of the same name if one is in scope (hit
+    # for real: create_bottle_bottles()'s own `local name="$1"` was being overwritten by this
+    # loop's last-read value, corrupting the bottle name it was trying to look itself up by).
+    local base json name path
+    base="$(bottles_cli info bottles-path 2>/dev/null)"
+    [[ -n "$base" ]] || die "'bottles-cli info bottles-path' returned nothing -- is Bottles set up correctly?"
+    json="$(bottles_cli -j list bottles 2>/dev/null | tail -1)"
+    while IFS=$'\t' read -r name path; do
+        [[ -n "$name" ]] || continue
+        BOTTLES_DIR_FOR_NAME["$name"]="$path"
+        echo "$name"
+    done < <(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+base = sys.argv[2]
+for name, info in data.items():
+    path = info.get('Path', name)
+    real = path if info.get('Custom_Path') else base + '/' + path
+    print(name + '\t' + real)
+" "$json" "$base")
+}
+
 create_bottle_with_core_fonts() {
     local name="$1"
     local bottle_dir="$HOME/.cxoffice/$name"
@@ -222,7 +365,7 @@ create_bottle_with_core_fonts() {
     # ones -- matches this project's habit of getting a fresh bottle to a known-good baseline
     # before eM Client itself ever touches it.
     log "disabling window-manager decorations (X11 Driver\\Decorated -> N) for '$name'..."
-    CX_BOTTLE="$name" "$CXSTART_WINE" reg add "HKCU\\Software\\Wine\\X11 Driver" /v "Decorated" /t REG_SZ /d "N" /f >/dev/null \
+    wine_reg_add "$name" "HKCU\\Software\\Wine\\X11 Driver" "Decorated" REG_SZ "N" \
         || warn "failed to disable window-manager decorations for '$name' -- continuing anyway (cosmetic only)."
 
     # See the header comment's IMPORTANT note: this opens a real window and pre-fills it, but
@@ -254,8 +397,49 @@ create_bottle_with_core_fonts() {
     fi
 }
 
+# Bottles: `bottles-cli new --environment application --arch win64` -- aiming for the same
+# WoW64-split layout ("Program Files (x86)" + plain "Program Files") CrossOver's own win11_64
+# template gives, so eM Client's x86 package installs to the conventional location either way.
+# Confirmed hands-on this session that `new` populates a full drive_c synchronously (no separate
+# "init" step needed, unlike some ad hoc testing done before this was verified) -- but ALSO
+# confirmed a win64-arch bottle can end up without a working WoW64 split at all (no "Program
+# Files (x86)", no syswow64 -- a real Bottles/runner inconsistency, not something this script
+# can fix), so this checks what actually got created rather than assuming, and warns clearly if
+# the x86-appropriate location isn't there. No Core-Fonts-equivalent step needed: `new` already
+# resolves Arial/Times New Roman/Courier New as part of its own normal dependency installation.
+create_bottle_bottles() {
+    local name="$1"
+    log "creating new Bottles bottle '$name' (environment: application, arch: win64)..."
+    bottles_cli new --bottle-name "$name" --environment application --arch win64 \
+        || die "'bottles-cli new' failed for '$name'"
+
+    bottles_list_all >/dev/null
+    local bottle_dir="${BOTTLES_DIR_FOR_NAME[$name]:-}"
+    [[ -n "$bottle_dir" && -d "$bottle_dir/drive_c" ]] \
+        || die "'bottles-cli new' reported success for '$name' but its drive_c wasn't found afterward -- inspect the bottle by hand before retrying."
+
+    if [[ "$ARCH" == "x86" && ! -d "$bottle_dir/drive_c/Program Files (x86)" ]]; then
+        warn "this Bottles bottle has no 'Program Files (x86)' directory -- its runner may not"
+        warn "have WoW64 (32-bit) support, which the x86 eM Client package (this script's"
+        warn "default) needs. If installation fails below, try --arch x64 instead, or recreate"
+        warn "the bottle by hand with a runner confirmed to support WoW64."
+    fi
+
+    log "disabling window-manager decorations (X11 Driver\\Decorated -> N) for '$name'..."
+    wine_reg_add "$name" "HKCU\\Software\\Wine\\X11 Driver" "Decorated" REG_SZ "N" \
+        || warn "failed to disable window-manager decorations for '$name' -- continuing anyway (cosmetic only)."
+}
+
+create_bottle() {
+    if [[ "$WINE_MANAGER" == "crossover" ]]; then
+        create_bottle_with_core_fonts "$1"
+    else
+        create_bottle_bottles "$1"
+    fi
+}
+
 if [[ -n "$NEW_BOTTLE_NAME" ]]; then
-    create_bottle_with_core_fonts "$NEW_BOTTLE_NAME"
+    create_bottle "$NEW_BOTTLE_NAME"
     BOTTLE_NAME="$NEW_BOTTLE_NAME"
 elif [[ -z "$BOTTLE_OVERRIDE" && $LIST_ONLY -eq 0 && $ASSUME_YES -eq 0 ]]; then
     echo ""
@@ -266,27 +450,36 @@ elif [[ -z "$BOTTLE_OVERRIDE" && $LIST_ONLY -eq 0 && $ASSUME_YES -eq 0 ]]; then
             read -r -p "Name for the new bottle (required -- no default suggested): " name
             [[ -z "$name" ]] && warn "a bottle name is required -- try again."
         done
-        create_bottle_with_core_fonts "$name"
+        create_bottle "$name"
         BOTTLE_NAME="$name"
     fi
 fi
 
 if [[ -z "${BOTTLE_NAME:-}" ]]; then
-    shopt -s nullglob
     BOTTLES=()
-    for d in "$HOME"/.cxoffice/*/; do
-        [[ -f "${d}cxbottle.conf" ]] && BOTTLES+=("$(basename "$d")")
-    done
-    shopt -u nullglob
-    [[ ${#BOTTLES[@]} -gt 0 ]] || die "no CrossOver bottles found under ~/.cxoffice/"
+    if [[ "$WINE_MANAGER" == "crossover" ]]; then
+        shopt -s nullglob
+        for d in "$HOME"/.cxoffice/*/; do
+            [[ -f "${d}cxbottle.conf" ]] && BOTTLES+=("$(basename "$d")")
+        done
+        shopt -u nullglob
+        [[ ${#BOTTLES[@]} -gt 0 ]] || die "no CrossOver bottles found under ~/.cxoffice/"
 
-    log "found ${#BOTTLES[@]} bottle(s):"
-    for b in "${BOTTLES[@]}"; do
-        tmpl="$(bottle_template "$b")"
-        note=""
-        [[ "$tmpl" != win11_* ]] && note="  <- not Windows 11"
-        log "  - $b  (template: $tmpl)$note"
-    done
+        log "found ${#BOTTLES[@]} bottle(s):"
+        for b in "${BOTTLES[@]}"; do
+            tmpl="$(bottle_template "$b")"
+            note=""
+            [[ "$tmpl" != win11_* ]] && note="  <- not Windows 11"
+            log "  - $b  (template: $tmpl)$note"
+        done
+    else
+        while IFS= read -r b; do BOTTLES+=("$b"); done < <(bottles_list_all)
+        [[ ${#BOTTLES[@]} -gt 0 ]] || die "no Bottles bottles found -- create one first (--new-bottle NAME)."
+        log "found ${#BOTTLES[@]} bottle(s):"
+        for b in "${BOTTLES[@]}"; do
+            log "  - $b"
+        done
+    fi
 
     if [[ $LIST_ONLY -eq 1 ]]; then
         exit 0
@@ -294,7 +487,11 @@ if [[ -z "${BOTTLE_NAME:-}" ]]; then
 
     if [[ -n "$BOTTLE_OVERRIDE" ]]; then
         BOTTLE_NAME="$BOTTLE_OVERRIDE"
-        [[ -d "$HOME/.cxoffice/$BOTTLE_NAME" ]] || die "--bottle $BOTTLE_NAME not found under ~/.cxoffice/"
+        if [[ "$WINE_MANAGER" == "crossover" ]]; then
+            [[ -d "$HOME/.cxoffice/$BOTTLE_NAME" ]] || die "--bottle $BOTTLE_NAME not found under ~/.cxoffice/"
+        else
+            [[ -n "${BOTTLES_DIR_FOR_NAME[$BOTTLE_NAME]:-}" ]] || die "--bottle $BOTTLE_NAME not found among Bottles' own bottles"
+        fi
     elif [[ ${#BOTTLES[@]} -eq 1 ]]; then
         BOTTLE_NAME="${BOTTLES[0]}"
     else
@@ -307,10 +504,16 @@ if [[ -z "${BOTTLE_NAME:-}" ]]; then
     fi
 fi
 
-BOTTLE_DIR="$HOME/.cxoffice/$BOTTLE_NAME"
+if [[ "$WINE_MANAGER" == "crossover" ]]; then
+    BOTTLE_DIR="$HOME/.cxoffice/$BOTTLE_NAME"
+else
+    [[ -n "${BOTTLES_DIR_FOR_NAME[$BOTTLE_NAME]:-}" ]] || bottles_list_all >/dev/null
+    BOTTLE_DIR="${BOTTLES_DIR_FOR_NAME[$BOTTLE_NAME]:-}"
+    [[ -n "$BOTTLE_DIR" ]] || die "couldn't resolve a real directory for Bottles bottle '$BOTTLE_NAME'"
+fi
 BOTTLE_FONTS_DIR="$BOTTLE_DIR/drive_c/windows/Fonts"
-TEMPLATE="$(bottle_template "$BOTTLE_NAME")"
-if [[ "$TEMPLATE" != win11_* ]]; then
+TEMPLATE="$([[ "$WINE_MANAGER" == "crossover" ]] && bottle_template "$BOTTLE_NAME" || echo "?")"
+if [[ "$WINE_MANAGER" == "crossover" && "$TEMPLATE" != win11_* ]]; then
     warn "bottle '$BOTTLE_NAME' has template '$TEMPLATE', not a Windows 11 one."
     warn "eM Client 11 has only been confirmed working on a Windows 11 bottle so far."
     if [[ $ASSUME_YES -eq 1 ]]; then
@@ -351,7 +554,7 @@ install_runtime() {
     local exe="$1"
     local win_path="Z:$(echo "$exe" | sed 's/\//\\/g')"
     log "installing $(basename "$exe") into $BOTTLE_NAME (silent)..."
-    CX_BOTTLE="$BOTTLE_NAME" env -u DOTNET_ROOT "$CXSTART_WINE" "$win_path" /install /quiet /norestart \
+    wine_run "$BOTTLE_NAME" "$win_path" /install /quiet /norestart \
         || die "failed to install $(basename "$exe") -- see any Wine output above"
 }
 install_runtime "$TMPDIR/windowsdesktop-runtime-10.0.11-win-x64.exe"
@@ -473,7 +676,7 @@ cp "$TMPDIR/icu-extract/windows/globalization/ICU/"* "$BOTTLE_DIR/drive_c/window
 # just-installed files instead of anything it would otherwise try to resolve internally.
 log "setting DLL overrides to native for icu/icuin/icuuc..."
 for dll in icu icuin icuuc; do
-    CX_BOTTLE="$BOTTLE_NAME" "$CXSTART_WINE" reg add "HKCU\\Software\\Wine\\DllOverrides" /v "$dll" /t REG_SZ /d native /f >/dev/null \
+    wine_reg_add "$BOTTLE_NAME" "HKCU\\Software\\Wine\\DllOverrides" "$dll" REG_SZ native \
         || die "failed to set the Wine DLL override for $dll"
 done
 log "ICU DLLs installed and DLL overrides set."
@@ -545,9 +748,9 @@ for f in sorted(glob.glob(os.path.join(bottle_fonts, "Aptos*.ttf"))):
     base = os.path.basename(f)
     value_name = f"{full_name} (TrueType)"
     print(
-        'CX_BOTTLE=' + shlex.quote(bottle_name) +
-        ' "$CXSTART_WINE" reg add "HKLM\\\\Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Fonts"'
-        ' /v ' + shlex.quote(value_name) + ' /t REG_SZ /d ' + shlex.quote(base) + ' /f >/dev/null'
+        'wine_reg_add ' + shlex.quote(bottle_name) +
+        ' "HKLM\\\\Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Fonts"'
+        ' ' + shlex.quote(value_name) + ' REG_SZ ' + shlex.quote(base) +
         ' || die ' + shlex.quote(f"failed to register Aptos font: {full_name}")
     )
 PYEOF
@@ -585,7 +788,7 @@ done
 for suffix_name in "Regular:Roboto" "Bold:Roboto Bold" "Italic:Roboto Italic" "BoldItalic:Roboto Bold Italic"; do
     suffix="${suffix_name%%:*}"
     fullname="${suffix_name##*:}"
-    CX_BOTTLE="$BOTTLE_NAME" "$CXSTART_WINE" reg add "HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" /v "$fullname (TrueType)" /t REG_SZ /d "Roboto-$suffix.ttf" /f >/dev/null \
+    wine_reg_add "$BOTTLE_NAME" "HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" "$fullname (TrueType)" REG_SZ "Roboto-$suffix.ttf" \
         || die "failed to register Roboto font: $fullname"
 done
 log "Roboto fonts installed and registered."
@@ -625,7 +828,7 @@ height = -round(9.0 * 96 / 72)
 blob = struct.pack('<iiiii8B', height, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0) + face
 print(blob.hex())
 ")
-CX_BOTTLE="$BOTTLE_NAME" "$CXSTART_WINE" reg add "HKCU\\Control Panel\\Desktop\\WindowMetrics" /v "MessageFont" /t REG_BINARY /d "$MESSAGEFONT_LOGFONT_HEX" /f >/dev/null \
+wine_reg_add "$BOTTLE_NAME" "HKCU\\Control Panel\\Desktop\\WindowMetrics" "MessageFont" REG_BINARY "$MESSAGEFONT_LOGFONT_HEX" \
     || die "failed to set the WindowMetrics MessageFont registry value"
 log "default message-box font set to Segoe UI."
 
@@ -683,9 +886,9 @@ EOF
             if dotnet publish -c Release "$TMPDIR/tools/font-systemlink-writer" >"$TMPDIR/build-fontwriter.log" 2>&1; then
                 FONTWRITER_EXE="$TMPDIR/tools/font-systemlink-writer/bin/Release/net10.0/win-x86/publish/font-systemlink-writer.exe"
                 WIN_FONTWRITER_PATH="Z:$(echo "$FONTWRITER_EXE" | sed 's/\//\\/g')"
-                # -u DOTNET_ROOT: see the .NET runtime installer step above -- same leak-through
-                # issue, same fix.
-                if CX_BOTTLE="$BOTTLE_NAME" env -u DOTNET_ROOT "$CXSTART_WINE" "$WIN_FONTWRITER_PATH"; then
+                # wine_run() strips DOTNET_ROOT -- see the .NET runtime installer step above for
+                # why (same leak-through issue, same fix).
+                if wine_run "$BOTTLE_NAME" "$WIN_FONTWRITER_PATH"; then
                     log "fonts registered and SystemLink fallback entries set."
                 else
                     warn "font-systemlink-writer failed -- font files were copied but not registered in the registry."
@@ -716,7 +919,7 @@ fi
 
 log "disabling Wine's windows.ui.dll (Chromium's WinRT text-scale-factor query recurses"
 log "unboundedly through it under Wine -- see reports/emclient11-startup-stack-overflow-findings.md)..."
-CX_BOTTLE="$BOTTLE_NAME" "$CXSTART_WINE" reg add "HKCU\\Software\\Wine\\DllOverrides" /v "windows.ui" /t REG_SZ /d "" /f >/dev/null \
+wine_reg_add "$BOTTLE_NAME" "HKCU\\Software\\Wine\\DllOverrides" "windows.ui" REG_SZ "" \
     || die "failed to set the windows.ui DLL override"
 
 # ---------------------------------------------------------------------------
@@ -759,7 +962,7 @@ if [[ -z "$SANS_SOURCE" ]]; then
 else
     python3 "$SCRIPT_DIR/make-sans-fallback-font.py" "$SANS_SOURCE" "$BOTTLE_FONTS_DIR/sans.ttf" \
         || die "make-sans-fallback-font.py failed against $SANS_SOURCE"
-    CX_BOTTLE="$BOTTLE_NAME" "$CXSTART_WINE" reg add "HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" /v "sans (TrueType)" /t REG_SZ /d "sans.ttf" /f >/dev/null \
+    wine_reg_add "$BOTTLE_NAME" "HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" "sans (TrueType)" REG_SZ "sans.ttf" \
         || die "failed to register the \"sans\" fallback font"
     log "\"sans\" fallback font generated from $(basename "$SANS_SOURCE") and registered."
 fi
@@ -783,7 +986,15 @@ else
     WIN_APP_DIR="C:\\Program Files (x86)\\eM Client"
 fi
 
-STARTMENU_DIR="$BOTTLE_DIR/drive_c/users/crossover/AppData/Roaming/Microsoft/Windows/Start Menu/Programs"
+# CrossOver always creates a synthetic "crossover" user regardless of the host username; a plain
+# Wine prefix (Bottles) uses the real one instead (confirmed hands-on: drive_c/users/$USER, not
+# .../crossover) -- resolve this per manager rather than hardcoding either.
+if [[ "$WINE_MANAGER" == "crossover" ]]; then
+    BOTTLE_USER="crossover"
+else
+    BOTTLE_USER="$USER"
+fi
+STARTMENU_DIR="$BOTTLE_DIR/drive_c/users/$BOTTLE_USER/AppData/Roaming/Microsoft/Windows/Start Menu/Programs"
 mkdir -p "$STARTMENU_DIR"
 WIN_LNK_PATH="Z:$(echo "$STARTMENU_DIR/eM Client.lnk" | sed 's/\//\\/g')"
 cat > "$TMPDIR/make-shortcut.vbs" <<VBSEOF
@@ -794,23 +1005,69 @@ oLink.WorkingDirectory = "$WIN_APP_DIR"
 oLink.Save
 VBSEOF
 WIN_VBS_PATH="Z:$(echo "$TMPDIR/make-shortcut.vbs" | sed 's/\//\\/g')"
-CX_BOTTLE="$BOTTLE_NAME" "$CXSTART_WINE" cscript //nologo "$WIN_VBS_PATH" >/dev/null \
-    || die "failed to generate the Start Menu shortcut via cscript"
-[[ -f "$STARTMENU_DIR/eM Client.lnk" ]] || die "cscript reported success but $STARTMENU_DIR/eM Client.lnk doesn't exist"
-log "Start Menu shortcut installed."
-
-# ---------------------------------------------------------------------------
-# Ask CrossOver to rescan this bottle's Start Menu / Desktop and update its own native menu
-# entries accordingly, so the new shortcut actually shows up without a manual "Install Application
-# into Bottle" pass. Non-fatal if it fails -- the app is already fully installed and can still be
-# launched directly (or the shortcut re-synced later by hand).
-# ---------------------------------------------------------------------------
-
-if [[ -x "$CXMENU" ]]; then
-    log "syncing CrossOver's menu for this bottle..."
-    "$CXMENU" --sync --bottle "$BOTTLE_NAME" || warn "cxmenu --sync failed -- the app is still installed, but its shortcut may need a manual menu refresh."
+# Full path to cscript.exe, not a bare "cscript" relying on PATH resolution inside the prefix --
+# wine_run()'s Bottles branch passes this straight through as -e/--executable, which (unlike a
+# plain `wine <cmd>` invocation) expects a real path rather than something to resolve via PATH.
+wine_run "$BOTTLE_NAME" "C:\\windows\\system32\\cscript.exe" //nologo "$WIN_VBS_PATH" >/dev/null
+if [[ -f "$STARTMENU_DIR/eM Client.lnk" ]]; then
+    log "Start Menu shortcut installed."
+elif [[ "$WINE_MANAGER" == "crossover" ]]; then
+    # Proven reliable under CrossOver -- a failure here is a real regression, not a known
+    # environment limitation, so it stays fatal.
+    die "cscript reported success but $STARTMENU_DIR/eM Client.lnk doesn't exist"
 else
-    warn "cxmenu not found at $CXMENU -- skipping menu sync. The app is still installed; refresh CrossOver's menu by hand if the shortcut doesn't appear."
+    # Confirmed hands-on (this session, against a real Bottles runner): cscript.exe itself
+    # launches fine, but VBScript's CreateObject -- for WScript.Shell here, and separately
+    # confirmed for the simpler Scripting.FileSystemObject too -- silently fails to actually run
+    # anything under at least one Bottles runner build, with no error surfaced anywhere (cscript
+    # exits 0; there's no separate crash/err output to see, `bottles-cli run`'s own stdout isn't
+    # forwarded either way -- see the WINE_MANAGER detection block's own note). Whether this is a
+    # WSH/COM gap specific to this runner or Bottles Wine builds generally isn't established --
+    # not something this script can work around. Non-fatal here (unlike the CrossOver branch
+    # above): the app itself is already fully installed and usable at this point, just without a
+    # generated shortcut -- launch it directly, or via Bottles' own program registration below.
+    warn "couldn't generate a Start Menu shortcut via cscript -- this is a known limitation on"
+    warn "at least some Bottles Wine runners (VBScript's CreateObject silently doing nothing),"
+    warn "not a sign anything else went wrong. The app is still fully installed; launch it"
+    warn "directly, or via the Bottles program registration below."
+fi
+
+# ---------------------------------------------------------------------------
+# Ask the wine manager to make the app launchable from outside a manual `wine MailClient.exe`.
+#
+# CrossOver: rescans this bottle's Start Menu / Desktop and updates its own native (host-wide)
+# menu entries, so the new shortcut actually shows up without a manual "Install Application into
+# Bottle" pass. Non-fatal if it fails -- the app is already fully installed and can still be
+# launched directly (or the shortcut re-synced later by hand).
+#
+# Bottles: registers eM Client as a program via `bottles-cli add` -- confirmed hands-on this is
+# the closest available equivalent (makes it appear in Bottles' own program list, launchable via
+# the GUI or `bottles-cli run -p "eM Client" -b <bottle>`), but confirmed NOT to generate a real
+# host-wide `.desktop`/app-launcher entry the way `cxmenu --sync` does -- the Bottles CLI has no
+# exposed equivalent for that (its GUI has a separate, manual "Create desktop entry" action per
+# program that isn't reachable from the CLI). Documented here rather than worked around, since
+# there's no reliable CLI-only way to replicate it.
+# ---------------------------------------------------------------------------
+
+if [[ "$WINE_MANAGER" == "crossover" ]]; then
+    if [[ -x "$CXMENU" ]]; then
+        log "syncing CrossOver's menu for this bottle..."
+        "$CXMENU" --sync --bottle "$BOTTLE_NAME" || warn "cxmenu --sync failed -- the app is still installed, but its shortcut may need a manual menu refresh."
+    else
+        warn "cxmenu not found at $CXMENU -- skipping menu sync. The app is still installed; refresh CrossOver's menu by hand if the shortcut doesn't appear."
+    fi
+else
+    log "registering eM Client as a Bottles program..."
+    if bottles_cli add -b "$BOTTLE_NAME" -n "eM Client" -p "$WIN_APP_DIR\\MailClient.exe" >/dev/null 2>&1; then
+        log "registered. Launch it via Bottles' own GUI/program list, or:"
+        log "  bottles-cli run -b $BOTTLE_NAME -p \"eM Client\""
+        warn "Bottles has no CLI equivalent to CrossOver's host-wide Start Menu entry -- if you"
+        warn "want a real desktop/app-launcher entry, add one by hand from Bottles' own GUI"
+        warn "(right-click the program -> Create desktop entry)."
+    else
+        warn "'bottles-cli add' failed to register eM Client as a Bottles program -- the app is"
+        warn "still installed; launch it directly or add it by hand from Bottles' own GUI."
+    fi
 fi
 
 log "done."
@@ -838,14 +1095,20 @@ if [[ -x "$DEPLOY_SH" ]]; then
         [[ -z "$reply" || "$reply" =~ ^[Yy]$ ]] && run_deploy=1
     fi
 
+    # Pass --wine-manager through explicitly -- deploy.sh would otherwise re-detect (and, with
+    # both CrossOver and Bottles installed, re-prompt or die under -y) rather than just using
+    # what was already decided here for the exact same bottle.
+    DEPLOY_SH_ARGS=(--bottle "$BOTTLE_NAME" --wine-manager "$WINE_MANAGER")
+    [[ $ASSUME_YES -eq 1 ]] && DEPLOY_SH_ARGS+=(-y)
+
     if [[ $run_deploy -eq 1 ]]; then
-        log "running deploy.sh --bottle $BOTTLE_NAME ..."
-        "$DEPLOY_SH" --bottle "$BOTTLE_NAME"
+        log "running deploy.sh ${DEPLOY_SH_ARGS[*]} ..."
+        "$DEPLOY_SH" "${DEPLOY_SH_ARGS[@]}"
     else
         log "skipped. Run it later with:"
-        log "  $DEPLOY_SH --bottle $BOTTLE_NAME"
+        log "  $DEPLOY_SH ${DEPLOY_SH_ARGS[*]}"
     fi
 else
     warn "deploy.sh not found at $DEPLOY_SH -- skipping the offer to run it. Find it and run:"
-    warn "  <that path>/deploy.sh --bottle $BOTTLE_NAME"
+    warn "  <that path>/deploy.sh --bottle $BOTTLE_NAME --wine-manager $WINE_MANAGER"
 fi
