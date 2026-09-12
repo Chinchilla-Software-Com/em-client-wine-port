@@ -20,9 +20,11 @@
 #                                   in use names it -- CrossOver's ~/.cxoffice/ dir name, or
 #                                   Bottles' own bottle name)
 #   ./deploy.sh --list              list found bottles and their installed versions, then exit
-#   ./deploy.sh -y|--yes            don't prompt on a version mismatch, continue automatically;
-#                                   also answers the optional-patch prompt (patch 5) with its
-#                                   default of NOT included -- use --patches (below) to include it
+#   ./deploy.sh -y|--yes            don't prompt on a version mismatch, continue automatically.
+#                                   The optional-patch prompt (patch 5) is only ever shown on a
+#                                   fully plain invocation (no -y, no --max-revision, no
+#                                   --patches) -- -y, --max-revision, or --patches all skip it and
+#                                   default to NOT included; use --patches (below) to include it
 #                                   non-interactively instead.
 #   ./deploy.sh --force             skip the "already patched, nothing to do" short-circuit
 #   ./deploy.sh --max-revision N    cap the MANDATORY patches at patch N (0..4) instead of this
@@ -209,9 +211,12 @@ done
 
 [[ -n "$MAX_REVISION" && -n "$PATCHES_ARG" ]] && die "--max-revision and --patches are mutually exclusive"
 
-# MANDATORY_TARGET_MASK: how far up the mandatory patches (1 through 4) this run should reach --
-# either this script's own latest (PIPELINE_LATEST_PATCH) or, if --max-revision was given, that
-# lower cap. --max-revision takes a PATCH number (see PATCH_STAGES above), same unit as --patches.
+# MANDATORY_TARGET_MASK: how far up the mandatory patches (1 through 4) this run should reach.
+# Three cases: --max-revision given -> that lower cap; --patches given (no --max-revision) ->
+# ZERO -- --patches means targeted patching, bypassing the "mandatory patches apply together"
+# default entirely, so nothing mandatory is implied just because it wasn't named (the only
+# patches this run targets are whatever's in PATCHES_MASK below); neither flag given -> this
+# script's own latest (PIPELINE_LATEST_PATCH), the plain "just run it" default.
 if [[ -n "$MAX_REVISION" ]]; then
     [[ "$MAX_REVISION" =~ ^[0-9]+$ ]] || die "--max-revision must be a non-negative integer, got: $MAX_REVISION"
     [[ "$MAX_REVISION" -ge 0 && "$MAX_REVISION" -le "$PIPELINE_LATEST_PATCH" ]] || die "--max-revision must be between 0 and $PIPELINE_LATEST_PATCH (the mandatory patches only -- use --patches to include the optional patch 5), got: $MAX_REVISION"
@@ -220,6 +225,8 @@ if [[ -n "$MAX_REVISION" ]]; then
         for _s in ${PATCH_STAGES[$_p]}; do MANDATORY_TARGET_MASK=$(( MANDATORY_TARGET_MASK | STAGE_BIT[$_s] )); done
     done
     unset _p _s
+elif [[ -n "$PATCHES_ARG" ]]; then
+    MANDATORY_TARGET_MASK=0
 else
     MANDATORY_TARGET_MASK=$MANDATORY_MASK
 fi
@@ -615,7 +622,11 @@ if (( INSTALLED_MASK & STAGE_BIT[15] )); then
 elif (( PATCHES_MASK & STAGE_BIT[15] )); then
     OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[15] ))
     log "including the optional sync-freeze fix (patch 5, named via --patches)."
-elif [[ $ASSUME_YES -eq 0 ]]; then
+elif [[ $ASSUME_YES -eq 0 && -z "$MAX_REVISION" && -z "$PATCHES_ARG" ]]; then
+    # Only prompt in the fully-default invocation (no --max-revision, no --patches) -- if the
+    # user gave either flag, they've already told this script exactly what they want; prompting
+    # about something they didn't ask for would ignore that. Falls through to "not included"
+    # (same as the -y default) when either flag was given without naming patch 5 explicitly.
     echo ""
     echo "Patch 5 (optional): a fix for severe, recurring multi-minute freezes during account/"
     echo "folder sync (see reports/exchange-sync-freeze-findings.md). The 11.0.196-beta sibling"
@@ -1145,13 +1156,27 @@ fi
 # offset table must be identical before and after a byte-level edit regardless of which other
 # stages did or didn't run alongside it this time.
 if (( NEEDS_WORK_MASK & (STAGE_BIT[6] | STAGE_BIT[7]) )); then
-    PRE_BYTE_EDIT_SIZE=$(stat -c%s "$STAGE5_DIR/MailClient.dll")
-    POST_BYTE_EDIT_DIR="$STAGE7_DIR"
-    [[ "$POST_BYTE_EDIT_DIR" == "$WORKDIR/original" ]] && POST_BYTE_EDIT_DIR="$STAGE6_DIR"
-    [[ "$POST_BYTE_EDIT_DIR" == "$WORKDIR/original" ]] && POST_BYTE_EDIT_DIR="$STAGE5_DIR"
-    POST_BYTE_EDIT_SIZE=$(stat -c%s "$POST_BYTE_EDIT_DIR/MailClient.dll")
-    [[ "$PRE_BYTE_EDIT_SIZE" -eq "$POST_BYTE_EDIT_SIZE" ]] \
-        || die "verification failed: Stages 6-7 should not change MailClient.dll's byte size (was $PRE_BYTE_EDIT_SIZE, now $POST_BYTE_EDIT_SIZE) -- .resources offset table may be corrupted"
+    # Only a valid apples-to-apples comparison when at least one of stages 1-5 ALSO ran fresh
+    # this pass -- that's the only case STAGE5_DIR is guaranteed to be a real Mono.Cecil-
+    # serialized output, same as whatever stage 6/7 produced. If none of 1-5 ran this pass (e.g.
+    # a bottle already has them, or they were never targeted), STAGE5_DIR is instead the
+    # pristine, NEVER-Cecil-touched original -- Cecil's own writer re-serializes the WHOLE PE
+    # file on any patch pass (metadata table layout, debug info, etc. can shift by tens of KB),
+    # producing a size delta that's an artifact of the Cecil round-trip itself, unrelated to
+    # whether stage 6/7's OWN resource edit preserved length (confirmed hands-on against the
+    # 11.0.196-beta sibling script's own equivalent check: a real ~107KB "mismatch" with the
+    # resource bytes underneath already correct). Currently unreachable through this script's own
+    # patch grouping (patch 1 always bundles stages 1, 6, 7 together, so stage 1 is always fresh
+    # whenever 6/7 are), but guarded defensively rather than relying on that staying true.
+    if (( NEEDS_WORK_MASK & (STAGE_BIT[1] | STAGE_BIT[2] | STAGE_BIT[3] | STAGE_BIT[4] | STAGE_BIT[5]) )); then
+        PRE_BYTE_EDIT_SIZE=$(stat -c%s "$STAGE5_DIR/MailClient.dll")
+        POST_BYTE_EDIT_DIR="$STAGE7_DIR"
+        [[ "$POST_BYTE_EDIT_DIR" == "$WORKDIR/original" ]] && POST_BYTE_EDIT_DIR="$STAGE6_DIR"
+        [[ "$POST_BYTE_EDIT_DIR" == "$WORKDIR/original" ]] && POST_BYTE_EDIT_DIR="$STAGE5_DIR"
+        POST_BYTE_EDIT_SIZE=$(stat -c%s "$POST_BYTE_EDIT_DIR/MailClient.dll")
+        [[ "$PRE_BYTE_EDIT_SIZE" -eq "$POST_BYTE_EDIT_SIZE" ]] \
+            || die "verification failed: Stages 6-7 should not change MailClient.dll's byte size (was $PRE_BYTE_EDIT_SIZE, now $POST_BYTE_EDIT_SIZE) -- .resources offset table may be corrupted"
+    fi
 fi
 
 if (( NEEDS_WORK_MASK & STAGE_BIT[8] )); then

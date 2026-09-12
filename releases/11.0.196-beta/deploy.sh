@@ -29,9 +29,11 @@
 #                                   in use names it -- CrossOver's ~/.cxoffice/ dir name, or
 #                                   Bottles' own bottle name)
 #   ./deploy.sh --list              list found bottles and their installed versions, then exit
-#   ./deploy.sh -y|--yes            don't prompt on a version mismatch, continue automatically;
-#                                   also answers the optional-patch prompt (patch 5) with its
-#                                   default of NOT included -- use --patches (below) to include it
+#   ./deploy.sh -y|--yes            don't prompt on a version mismatch, continue automatically.
+#                                   The optional-patch prompt (patch 5) is only ever shown on a
+#                                   fully plain invocation (no -y, no --max-revision, no
+#                                   --patches) -- -y, --max-revision, or --patches all skip it and
+#                                   default to NOT included; use --patches (below) to include it
 #                                   non-interactively instead.
 #   ./deploy.sh --force             skip the "already patched, nothing to do" short-circuit
 #   ./deploy.sh --max-revision N    cap the MANDATORY patches at patch N (0..4) instead of this
@@ -201,12 +203,15 @@ done
 
 [[ -n "$MAX_REVISION" && -n "$PATCHES_ARG" ]] && die "--max-revision and --patches are mutually exclusive"
 
-# MANDATORY_TARGET_MASK: how far up the mandatory patches (1 through 4) this run should reach --
-# either this script's own latest (PIPELINE_LATEST_PATCH) or, if --max-revision was given, that
-# lower cap. --max-revision takes a PATCH number (see PATCH_STAGES above), same unit as --patches.
-# Computed here (right after arg parsing, before the installed eM Client version is even known --
-# deliberately: this is about pipeline patches, not about which version's release-number is being
-# tagged) rather than inline at each use site, since it needs validating exactly once.
+# MANDATORY_TARGET_MASK: how far up the mandatory patches (1 through 4) this run should reach.
+# Three cases: --max-revision given -> that lower cap; --patches given (no --max-revision) ->
+# ZERO -- --patches means targeted patching, bypassing the "mandatory patches apply together"
+# default entirely, so nothing mandatory is implied just because it wasn't named (the only
+# patches this run targets are whatever's in PATCHES_MASK below); neither flag given -> this
+# script's own latest (PIPELINE_LATEST_PATCH), the plain "just run it" default. Computed here
+# (right after arg parsing, before the installed eM Client version is even known -- deliberately:
+# this is about pipeline patches, not about which version's release-number is being tagged)
+# rather than inline at each use site, since it needs validating exactly once.
 if [[ -n "$MAX_REVISION" ]]; then
     [[ "$MAX_REVISION" =~ ^[0-9]+$ ]] || die "--max-revision must be a non-negative integer, got: $MAX_REVISION"
     [[ "$MAX_REVISION" -ge 0 && "$MAX_REVISION" -le "$PIPELINE_LATEST_PATCH" ]] || die "--max-revision must be between 0 and $PIPELINE_LATEST_PATCH (the mandatory patches only -- use --patches to include the optional patch 5), got: $MAX_REVISION"
@@ -215,6 +220,8 @@ if [[ -n "$MAX_REVISION" ]]; then
         for _s in ${PATCH_STAGES[$_p]}; do MANDATORY_TARGET_MASK=$(( MANDATORY_TARGET_MASK | STAGE_BIT[$_s] )); done
     done
     unset _p _s
+elif [[ -n "$PATCHES_ARG" ]]; then
+    MANDATORY_TARGET_MASK=0
 else
     MANDATORY_TARGET_MASK=$MANDATORY_MASK
 fi
@@ -620,7 +627,11 @@ if (( (INSTALLED_MASK & PATCH5_STAGE_MASK) == PATCH5_STAGE_MASK )); then
 elif (( PATCHES_MASK & PATCH5_STAGE_MASK )); then
     OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | PATCH5_STAGE_MASK ))
     log "including the optional sync-freeze fixes (patch 5, named via --patches)."
-elif [[ $ASSUME_YES -eq 0 ]]; then
+elif [[ $ASSUME_YES -eq 0 && -z "$MAX_REVISION" && -z "$PATCHES_ARG" ]]; then
+    # Only prompt in the fully-default invocation (no --max-revision, no --patches) -- if the
+    # user gave either flag, they've already told this script exactly what they want; prompting
+    # about something they didn't ask for would ignore that. Falls through to "not included"
+    # (same as the -y default) when either flag was given without naming patch 5 explicitly.
     echo ""
     echo "Patch 5 (optional): two related sync-freeze fixes. One for severe, recurring"
     echo "multi-minute freezes during classic IMAP/EWS Exchange sync. The other for Microsoft"
@@ -1131,31 +1142,50 @@ fi
 
 log "verifying..."
 
-aes_encryptor_out=$($ILSPY -t "MailClient.Utils.Security.Cryptography.AESEncryptor" "$FINAL_DIR/MailClient.dll")
-new_rfc_count=$(echo "$aes_encryptor_out" | grep -c "new Rfc2898DeriveBytes(" || true)
-[[ "$new_rfc_count" -ge 2 ]] \
-    || die "verification failed: expected >=2 'new Rfc2898DeriveBytes(' call sites in AESEncryptor, found $new_rfc_count"
-echo "$aes_encryptor_out" | grep -q "Rfc2898DeriveBytes.Pbkdf2(" \
-    && die "verification failed: AESEncryptor still calls the broken static Rfc2898DeriveBytes.Pbkdf2(...) -- patch did not fully apply"
+# Stage 1 (PBKDF2 startup crash fix) -- only meaningful (and only ran) when Stage 1 actually ran
+# this time. Previously unguarded (Stage 1 used to always be in scope, since --patches couldn't
+# yet bypass the mandatory chain to reach a run that skips it) -- now that it can, this needs the
+# same "only check what was actually touched" gating every other stage's verification already has.
+if (( NEEDS_WORK_MASK & STAGE_BIT[1] )); then
+    aes_encryptor_out=$($ILSPY -t "MailClient.Utils.Security.Cryptography.AESEncryptor" "$FINAL_DIR/MailClient.dll")
+    new_rfc_count=$(echo "$aes_encryptor_out" | grep -c "new Rfc2898DeriveBytes(" || true)
+    [[ "$new_rfc_count" -ge 2 ]] \
+        || die "verification failed: expected >=2 'new Rfc2898DeriveBytes(' call sites in AESEncryptor, found $new_rfc_count"
+    echo "$aes_encryptor_out" | grep -q "Rfc2898DeriveBytes.Pbkdf2(" \
+        && die "verification failed: AESEncryptor still calls the broken static Rfc2898DeriveBytes.Pbkdf2(...) -- patch did not fully apply"
 
-filebasedcache_out=$($ILSPY -t 'MailClient.UI.FileBasedCache`1' "$FINAL_DIR/MailClient.Abstractions.dll")
-echo "$filebasedcache_out" | grep -q "new Rfc2898DeriveBytes(" \
-    || die "verification failed: FileBasedCache\`1.Initialize doesn't use the instance Rfc2898DeriveBytes API -- fix missing"
-echo "$filebasedcache_out" | grep -q "Rfc2898DeriveBytes.Pbkdf2(" \
-    && die "verification failed: FileBasedCache\`1 still calls the broken static Rfc2898DeriveBytes.Pbkdf2(...) -- patch did not fully apply"
+    filebasedcache_out=$($ILSPY -t 'MailClient.UI.FileBasedCache`1' "$FINAL_DIR/MailClient.Abstractions.dll")
+    echo "$filebasedcache_out" | grep -q "new Rfc2898DeriveBytes(" \
+        || die "verification failed: FileBasedCache\`1.Initialize doesn't use the instance Rfc2898DeriveBytes API -- fix missing"
+    echo "$filebasedcache_out" | grep -q "Rfc2898DeriveBytes.Pbkdf2(" \
+        && die "verification failed: FileBasedCache\`1 still calls the broken static Rfc2898DeriveBytes.Pbkdf2(...) -- patch did not fully apply"
 
-$ILP --dump-handlers "$FINAL_DIR/MailClient.Abstractions.dll" 'MailClient.UI.FileBasedCache`1' Initialize 2>&1 | tail -1 | grep -q "^OK:" \
-    || die "verification failed: --dump-handlers reported a handler-ordering violation in FileBasedCache\`1.Initialize"
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.Abstractions.dll" 'MailClient.UI.FileBasedCache`1' Initialize 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in FileBasedCache\`1.Initialize"
+fi
 
 # Stage 2 is a raw resource byte edit and must not change file size (same rationale as the
 # 10.4.5674 pipeline's own Stages 6-7 check) -- checked against STAGE2_DIR specifically, not
 # FINAL_DIR, since Stage 3 (notification chain) is real IL insertion that legitimately grows the
 # file. Only meaningful (and only ran) when Stage 2 actually ran this time.
 if (( NEEDS_WORK_MASK & STAGE_BIT[2] )); then
-    STAGE1_SIZE=$(stat -c%s "$STAGE1_DIR/MailClient.dll")
-    STAGE2_SIZE=$(stat -c%s "$STAGE2_DIR/MailClient.dll")
-    [[ "$STAGE1_SIZE" -eq "$STAGE2_SIZE" ]] \
-        || die "verification failed: Stage 2 should not change MailClient.dll's byte size (was $STAGE1_SIZE, now $STAGE2_SIZE) -- .resources offset table may be corrupted"
+    if (( NEEDS_WORK_MASK & STAGE_BIT[1] )); then
+        # The size comparison below is only a valid apples-to-apples check when Stage 1 ALSO ran
+        # fresh this pass -- that's the only case where STAGE1_DIR is guaranteed to be a real
+        # Mono.Cecil-serialized output, same as STAGE2_DIR. When Stage 1 was skipped or already
+        # applied, STAGE1_DIR is instead the pristine, NEVER-Cecil-touched original -- Cecil's own
+        # writer re-serializes the WHOLE PE file on any patch pass (metadata table layout, debug
+        # info, etc. can all shift by tens of KB), producing a size delta that's a real artifact
+        # of the Cecil round-trip itself, unrelated to whether Stage 2's OWN resource edit
+        # preserved length (confirmed hands-on: a real ~107KB "mismatch" here, with the resource
+        # bytes underneath already verified correct by the content check below). The content
+        # check is the real, always-reliable verification either way; this is a supplementary
+        # check that only makes sense with a comparable baseline.
+        STAGE1_SIZE=$(stat -c%s "$STAGE1_DIR/MailClient.dll")
+        STAGE2_SIZE=$(stat -c%s "$STAGE2_DIR/MailClient.dll")
+        [[ "$STAGE1_SIZE" -eq "$STAGE2_SIZE" ]] \
+            || die "verification failed: Stage 2 should not change MailClient.dll's byte size (was $STAGE1_SIZE, now $STAGE2_SIZE) -- .resources offset table may be corrupted"
+    fi
     ilspycmd_tip_out=$($ILSPY --resource "MailClient.UI.Forms.FormSplashScreen.resources/labelTip.Text" -o "$WORKDIR" "$STAGE2_DIR/MailClient.dll" 2>&1) || die "verification failed: couldn't extract labelTip.Text resource ($ilspycmd_tip_out)"
     tip_hex=$(xxd -p "$WORKDIR/labelTip.Text" | tr -d '\n')
     [[ "$tip_hex" == "c2a0c2a0" ]] \
