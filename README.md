@@ -28,21 +28,51 @@ install and does nothing.
 Needs the [.NET SDK](https://dotnet.microsoft.com/download) and `python3` — the script checks
 for both and tells you how to install whichever is missing.
 
-## What's fixed
+## `releases/10.4.5674/deploy.sh` flags
 
-| Bug | Root cause | Report |
-|---|---|---|
-| Splash screen banner rendered wrong | Wine's `gdiplus` doesn't implement `InterpolationMode.HighQualityBicubic` | [gdiplus-interpolation-findings.md](reports/gdiplus-interpolation-findings.md) |
-| Settings dialog's left category panel was completely blank | `formSettings`'s `Load` event never fires under Wine | [settings-panel-clip-region-findings.md](reports/settings-panel-clip-region-findings.md) |
-| Settings crashed when clicking a category | Wine throws the wrong exception type from a Shell COM API eM Client already handles for the *expected* type | [default-mail-client-notimplemented-findings.md](reports/default-mail-client-notimplemented-findings.md) |
-| License Activation silently failed (spinner, then nothing) | RSA-OAEP decrypt fails inside Wine's `bcrypt.dll`/GnuTLS backend | [license-activation-oaep-findings.md](reports/license-activation-oaep-findings.md) |
-| License dialog's "Get a license" button showed two tofu boxes | Corrupted control characters baked into eM Client's own resource data (not a Wine bug) | [license-icon-findings.md](reports/license-icon-findings.md) |
-| Splash screen tip line showed two tofu boxes | A real emoji character Wine has no glyph for (a genuine Wine gap, investigated at length) | [splash-tip-icon-findings.md](reports/splash-tip-icon-findings.md) |
-| Docx attachments (and other extensions) wouldn't open — "no Windows program configured" | Fresh CrossOver bottles ship no file-type association for most attachment extensions (not an eM Client bug) | [office-file-associations-findings.md](reports/office-file-associations-findings.md) |
-| New-mail notification toast didn't display correctly until it faded out — invisible text/icons, no hover-pause, unclickable icons | `this` form's own window doesn't reliably paint or receive input under Wine; content only ever appeared during the fade animation ticks | [notification-empty-until-fade-findings.md](reports/notification-empty-until-fade-findings.md) |
-| Severe, recurring multi-minute freezes during Exchange sync, especially while composing/replying | Wine can't honor async DNS lookup cancellation, so two fully-synchronous, UI-thread-reachable sync entry points could each block for a 20s completion-port fallback | [exchange-sync-freeze-findings.md](reports/exchange-sync-freeze-findings.md) |
+| Flag | Description |
+|---|---|
+| *(none)* | Interactive: lists bottles found, prompts for choice, confirms before deploying |
+| `--bottle NAME` | Skip bottle selection — target a specific bottle non-interactively |
+| `--list` | List found bottles and their installed versions, then exit (patches nothing) |
+| `-y`, `--yes` | Skip the version-mismatch confirmation; also defaults the optional patch (patch 5) to **not** included — use `--patches` to include it non-interactively instead |
+| `--force` | Skip the "already patched, nothing to do" short-circuit and re-apply anyway |
+| `--max-revision N` | Cap the *mandatory* patches at patch N (0–4) instead of the latest. Doesn't touch optional patch 5 — use `--patches` for that. Mutually exclusive with `--patches` |
+| `--patches 1,3,5` | Apply exactly these patch numbers (mandatory or optional, any combination), bypassing the "mandatory patches apply together" rule — the only non-interactive way to add the optional patch. Only ever adds patches, never removes one already applied. Mutually exclusive with `--max-revision` |
+| `--install-fonts` | Install the vendored `fonts/` without the license-consent prompt |
+| `--no-fonts` | Skip font installation without the license-consent prompt |
+| `--install-associations` | Add file-type associations (see `file-associations/` below) without the prompt |
+| `--no-associations` | Skip file-type associations without the prompt |
+| `--force-associations` | Also overwrite extensions that already have some association set |
+| `--wine-manager crossover\|bottles` | Which Wine-prefix manager the target bottle lives under — [CrossOver](https://www.codeweavers.com/crossover) or [Bottles](https://usebottles.com/). Auto-detected when only one is installed; prompted for otherwise (required under `-y` in that case) |
+| `-h`, `--help` | Full usage |
 
-All nine confirmed fixed and working, tested across Windows 7/8/10/11 CrossOver bottles.
+## eM Client 10
+
+`releases/10.4.5674/deploy.sh` groups its fixes into 5 numbered **patches** — patch 5 is
+optional, patches 1–4 are applied by default. A patch is a curated bundle of one or more related
+fixes (e.g. patch 1 bundles every "tofu box" icon/font glyph fix together); the table below shows
+which bugs each patch covers. Use `--patches N` to apply one targeted patch on its own (e.g.
+`--patches 5` to add just the Exchange sync-freeze fix to an already-patched bottle), or
+`--patches 1,3` for several at once — see `./deploy.sh --help`.
+
+| Patch # | Bug | Root cause | Report |
+|---|---|---|---|
+| 1 | Splash screen banner rendered wrong, Settings icon resizing looked wrong | Wine's `gdiplus` doesn't implement `InterpolationMode.HighQualityBicubic` | [gdiplus-interpolation-findings.md](reports/gdiplus-interpolation-findings.md) |
+| 1 | License dialog's "Get a license" button showed two tofu boxes | Corrupted control characters baked into eM Client's own resource data (not a Wine bug) | [license-icon-findings.md](reports/license-icon-findings.md) |
+| 1 | Splash screen tip line showed two tofu boxes | A real emoji character Wine has no glyph for (a genuine Wine gap, investigated at length) | [splash-tip-icon-findings.md](reports/splash-tip-icon-findings.md) |
+| 2 | Settings grid occasionally failed to paint | A Wine clip-region bug silently discards some paint calls | [settings-panel-clip-region-findings.md](reports/settings-panel-clip-region-findings.md) |
+| 2 | Settings dialog's left category panel was completely blank | `formSettings`'s `Load` event never fires under Wine | [settings-panel-clip-region-findings.md](reports/settings-panel-clip-region-findings.md) |
+| 2 | Settings crashed when clicking a category | Wine throws the wrong exception type from a Shell COM API eM Client already handles for the *expected* type | [default-mail-client-notimplemented-findings.md](reports/default-mail-client-notimplemented-findings.md) |
+| 3 | License Activation silently failed (spinner, then nothing) | RSA-OAEP decrypt fails inside Wine's `bcrypt.dll`/GnuTLS backend | [license-activation-oaep-findings.md](reports/license-activation-oaep-findings.md) |
+| 4 | New-mail notification toast didn't display correctly until it faded out — invisible text/icons, no hover-pause, unclickable icons | `this` form's own window doesn't reliably paint or receive input under Wine; content only ever appeared during the fade animation ticks | [notification-empty-until-fade-findings.md](reports/notification-empty-until-fade-findings.md) |
+| **5 (optional)** | Severe, recurring multi-minute freezes during Exchange sync, especially while composing/replying | Wine can't honor async DNS lookup cancellation, so two fully-synchronous, UI-thread-reachable sync entry points could each block for a 20s completion-port fallback | [exchange-sync-freeze-findings.md](reports/exchange-sync-freeze-findings.md) |
+| — (`--install-associations`) | Docx attachments (and other extensions) wouldn't open — "no Windows program configured" | Fresh CrossOver bottles ship no file-type association for most attachment extensions (not an eM Client bug) | [office-file-associations-findings.md](reports/office-file-associations-findings.md) |
+
+All confirmed fixed and working, tested across Windows 7/8/10/11 CrossOver bottles. Patch 5 is
+opt-in because the same underlying fix was found to behave differently across machines in
+testing; file-type associations are a separate feature entirely, controlled by
+`--install-associations`, not part of the patch numbering.
 
 ## eM Client 11 (beta)
 
@@ -52,12 +82,44 @@ own `releases/11.0.196-beta/deploy.sh`, its own findings reports. See `CLAUDE.md
 (beta) — separate release line" section for the full breakdown of what's shared (the patcher
 tool) versus kept separate (everything else).
 
-| Bug | Root cause | Report |
-|---|---|---|
-| App wouldn't start at all — crashed during its own background init | .NET 10's new PBKDF2 API always routes through Wine's `bcrypt.dll`, which throws on the exact call the app makes to derive its local-cache encryption key | [emclient11-pbkdf2-startup-crash-findings.md](reports/emclient11-pbkdf2-startup-crash-findings.md) |
-| Splash screen tip line showed two tofu boxes | Same bug as the 10.4.5674 fix above — confirmed identical, not just similar | [emclient11-splash-tip-icon-findings.md](reports/emclient11-splash-tip-icon-findings.md) |
-| New-mail notification toast empty until fade | Same bug and same fix as the 10.4.5674 fix above; two of the seven sub-fixes needed real adaptation for structural changes in this build | [emclient11-notification-empty-until-fade-findings.md](reports/emclient11-notification-empty-until-fade-findings.md) |
-| Severe, recurring multi-minute freezes during Exchange sync | Same bug and same fix as the 10.4.5674 fix above — confirmed identical, applied completely unmodified, no adaptation needed | [exchange-sync-freeze-findings.md](reports/exchange-sync-freeze-findings.md) |
+### `releases/11.0.196-beta/install-msix.sh` flags
+
+eM Client 11 ships as an MSIX package, which CrossOver/Wine can't install directly — run this
+*first* to get a clean install in place (see below), then `deploy.sh` to patch it.
+
+| Flag | Description |
+|---|---|
+| *(none)* | Interactive: offers to create a fresh bottle, then lists existing bottles and prompts for choice |
+| `--bottle NAME` | Skip bottle selection — install into a specific existing bottle |
+| `--new-bottle NAME` | Skip the create/reuse prompt: always create a new bottle named NAME (must not already exist) |
+| `-y`, `--yes` | Don't prompt on the Windows-11-template check, or on whether to run `deploy.sh` afterward — answers yes to both |
+| `--list` | List found bottles, then exit (installs nothing) |
+| `--arch x86\|x64` | Which package to extract from the MSIX bundle (default: `x86`, matching every previously-tested install) |
+| `--install-fonts` | Install the vendored `fonts/` without the license-consent prompt |
+| `--no-fonts` | Skip font installation without the license-consent prompt |
+| `--wine-manager crossover\|bottles` | Which Wine-prefix manager to install into — [CrossOver](https://www.codeweavers.com/crossover) or [Bottles](https://usebottles.com/). Auto-detected when only one is installed; prompted for otherwise (required under `-y` in that case). Under Bottles, `--new-bottle` creates one via `bottles-cli new` instead of `cxbottle --create` |
+| `-h`, `--help` | Full usage |
+
+### `releases/11.0.196-beta/deploy.sh` flags
+
+Same flag set as the 10.4.5674 script above, minus the three file-associations flags (not a
+feature of this release line) — `--bottle`, `--list`, `-y`/`--yes`, `--force`, `--max-revision N`,
+`--patches LIST`, `--install-fonts`, `--no-fonts`, `--wine-manager crossover|bottles`, `-h`/`--help`
+all work identically, same 5-patch shape as the 10.4.5674 script (patches 1–4 mandatory, patch 5
+optional) — though which bugs land in which patch number is its own, independently-curated
+grouping (see the table below), not the same numbering as the 10.4.5674 script's own patches.
+
+| Patch # | Bug | Root cause | Report |
+|---|---|---|---|
+| 1 | Splash screen tip line showed two tofu boxes | Same bug as the 10.4.5674 fix above — confirmed identical, not just similar | [emclient11-splash-tip-icon-findings.md](reports/emclient11-splash-tip-icon-findings.md) |
+| 2 | Message preview pane intermittently went completely blank | Wine stops delivering `WM_PAINT` to the CEF-hosted preview pane for an arbitrary length of time; exact trigger mechanism not pinned down, so this periodically forces a repaint instead | [emclient11-preview-pane-blank-findings.md](reports/emclient11-preview-pane-blank-findings.md) |
+| 3 | App wouldn't start at all — crashed during its own background init | .NET 10's new PBKDF2 API always routes through Wine's `bcrypt.dll`, which throws on the exact call the app makes to derive its local-cache encryption key | [emclient11-pbkdf2-startup-crash-findings.md](reports/emclient11-pbkdf2-startup-crash-findings.md) |
+| 4 | New-mail notification toast empty until fade | Same bug and same fix as the 10.4.5674 fix above; two of the seven sub-fixes needed real adaptation for structural changes in this build | [emclient11-notification-empty-until-fade-findings.md](reports/emclient11-notification-empty-until-fade-findings.md) |
+| **5 (optional)** | Severe, recurring multi-minute freezes during Exchange sync | Same bug and same fix as the 10.4.5674 fix above — confirmed identical, applied completely unmodified, no adaptation needed | [exchange-sync-freeze-findings.md](reports/exchange-sync-freeze-findings.md) |
+| **5 (optional)** | Freezes syncing Microsoft 365 / Graph API accounts specifically (a different bug from the classic IMAP/EWS freeze above) | Same underlying Wine DNS defect, hit through `HttpClient`'s own connection path instead, plus a second hang in socket send/receive | [emclient11-msgraph-sync-freeze-findings.md](reports/emclient11-msgraph-sync-freeze-findings.md) |
+
+Patch 5 bundles both sync-freeze fixes together — they're decided and applied as one unit
+(`--patches 5` includes both; there's no way to request just one).
 
 Unlike the 10.4.5674 pipeline, eM Client 11 ships as an MSIX package, which CrossOver/Wine can't
 install directly — there's no classic installer to run inside the bottle. Get a clean install in
