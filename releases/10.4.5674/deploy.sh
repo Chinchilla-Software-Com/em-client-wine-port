@@ -858,7 +858,7 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[2] )); then
     STAGE2_DIR="$WORKDIR/output-stage2"
 elif (( INSTALLED_MASK & STAGE_BIT[2] )); then
     log "Stage 2 already applied -- using the installed files as-is."
-    STAGE2_DIR="$WORKDIR/original"
+    STAGE2_DIR="$STAGE1_DIR"
 else
     log "Stage 2 skipped -- not targeted this run."
     STAGE2_DIR="$STAGE1_DIR"
@@ -875,7 +875,7 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[3] )); then
     STAGE3_DIR="$WORKDIR/output-stage3"
 elif (( INSTALLED_MASK & STAGE_BIT[3] )); then
     log "Stage 3 already applied -- using the installed files as-is."
-    STAGE3_DIR="$WORKDIR/original"
+    STAGE3_DIR="$STAGE2_DIR"
 else
     log "Stage 3 skipped -- not targeted this run."
     STAGE3_DIR="$STAGE2_DIR"
@@ -892,7 +892,7 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[4] )); then
     STAGE4_DIR="$WORKDIR/output-stage4"
 elif (( INSTALLED_MASK & STAGE_BIT[4] )); then
     log "Stage 4 already applied -- using the installed files as-is."
-    STAGE4_DIR="$WORKDIR/original"
+    STAGE4_DIR="$STAGE3_DIR"
 else
     log "Stage 4 skipped -- not targeted this run."
     STAGE4_DIR="$STAGE3_DIR"
@@ -977,7 +977,7 @@ EOF
 elif (( INSTALLED_MASK & STAGE_BIT[5] )); then
     log "Stage 5 already applied -- using the installed files as-is."
     BOUNCYCASTLEPATCH_DLL="$WORKDIR/original/MailClient.Licensing.BouncyCastlePatch.dll"
-    STAGE5_DIR="$WORKDIR/original"
+    STAGE5_DIR="$STAGE4_DIR"
 else
     log "Stage 5 skipped -- not targeted this run."
     STAGE5_DIR="$STAGE4_DIR"
@@ -1000,7 +1000,7 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[6] )); then
     STAGE6_DIR="$WORKDIR/output-stage6"
 elif (( INSTALLED_MASK & STAGE_BIT[6] )); then
     log "Stage 6 already applied -- using the installed files as-is."
-    STAGE6_DIR="$WORKDIR/original"
+    STAGE6_DIR="$STAGE5_DIR"
 else
     log "Stage 6 skipped -- not targeted this run."
     STAGE6_DIR="$STAGE5_DIR"
@@ -1019,7 +1019,7 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[7] )); then
     STAGE7_DIR="$WORKDIR/output-stage7"
 elif (( INSTALLED_MASK & STAGE_BIT[7] )); then
     log "Stage 7 already applied -- using the installed files as-is."
-    STAGE7_DIR="$WORKDIR/original"
+    STAGE7_DIR="$STAGE6_DIR"
 else
     log "Stage 7 skipped -- not targeted this run."
     STAGE7_DIR="$STAGE6_DIR"
@@ -1068,7 +1068,7 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[8] )); then
     STAGE14_DIR="$WORKDIR/output-stage14"
 elif (( INSTALLED_MASK & STAGE_BIT[8] )); then
     log "Stages 8-14 already applied -- using the installed files as-is."
-    STAGE14_DIR="$WORKDIR/original"
+    STAGE14_DIR="$STAGE7_DIR"
 else
     log "Stages 8-14 skipped -- not targeted this run."
     STAGE14_DIR="$STAGE7_DIR"
@@ -1100,7 +1100,7 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[15] )); then
     FINAL_DIR="$WORKDIR/output-final"
 elif (( INSTALLED_MASK & STAGE_BIT[15] )); then
     log "Stage 15 already applied -- using the installed files as-is."
-    FINAL_DIR="$WORKDIR/original"
+    FINAL_DIR="$STAGE14_DIR"
 else
     log "Stage 15 not included in this deploy."
     FINAL_DIR="$STAGE14_DIR"

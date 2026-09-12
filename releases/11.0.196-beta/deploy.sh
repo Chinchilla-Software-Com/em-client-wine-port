@@ -891,7 +891,7 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[2] )); then
     STAGE2_DIR="$WORKDIR/output-stage2"
 elif (( INSTALLED_MASK & STAGE_BIT[2] )); then
     log "Stage 2 already applied -- using the installed files as-is."
-    STAGE2_DIR="$WORKDIR/original"
+    STAGE2_DIR="$STAGE1_DIR"
 else
     log "Stage 2 skipped -- not targeted this run."
     STAGE2_DIR="$STAGE1_DIR"
@@ -947,7 +947,7 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[3] )); then
     STAGE3_DIR="$WORKDIR/output-final"
 elif (( INSTALLED_MASK & STAGE_BIT[3] )); then
     log "Stage 3 already applied -- using the installed files as-is."
-    STAGE3_DIR="$WORKDIR/original"
+    STAGE3_DIR="$STAGE2_DIR"
 else
     log "Stage 3 skipped -- not targeted this run."
     STAGE3_DIR="$STAGE2_DIR"
@@ -991,7 +991,7 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[4] )); then
     STAGE4_DIR="$WORKDIR/output-stage4"
 elif (( INSTALLED_MASK & STAGE_BIT[4] )); then
     log "Stage 4 already applied -- using the installed files as-is."
-    STAGE4_DIR="$WORKDIR/original"
+    STAGE4_DIR="$STAGE3_DIR"
 else
     log "Stage 4 skipped -- not targeted this run."
     STAGE4_DIR="$STAGE3_DIR"
@@ -1027,7 +1027,7 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[6] )); then
     FINAL_DIR="$WORKDIR/output-final"
 elif (( INSTALLED_MASK & STAGE_BIT[6] )); then
     log "Stage 6 already applied -- using the installed files as-is."
-    FINAL_DIR="$WORKDIR/original"
+    FINAL_DIR="$STAGE4_DIR"
 else
     log "Stage 6 not included in this deploy."
     FINAL_DIR="$STAGE4_DIR"
