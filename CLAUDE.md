@@ -93,14 +93,22 @@
   version-mismatch confirmation prompt; `--install-fonts`/`--no-fonts` answer the fonts/ license
   consent prompt (see below) non-interactively, for scripted/repeated runs. Safe to re-run —
   reads a `MailClient.Wine.dll` version marker whose `FileVersion` trailing component is a
-  **bitmask**, one bit per stage number (`STAGE_BIT` in the script — stages 8-14, the notification
-  chain, share one bit since the tool enforces they only ever move together; every other stage is
-  independently trackable), and skips any stage whose bit is already set; `--force` skips that.
-  `--max-revision N` caps the mandatory chain (stages 1-8) at stage N; `--patches 1,3,15`
-  applies exactly those stage numbers (mandatory or optional), bypassing the "stages 1-8 are
-  mandatory together" rule entirely — the only non-interactive way to include the optional
-  Stage 15 (sync-freeze fix; same fix as v11's own optional stage, kept optional here too since it
-  was found to behave differently across machines). The two flags are mutually exclusive.
+  **bitmask**, one bit per internal stage number (`STAGE_BIT` in the script — stages 8-14, the
+  notification chain, share one bit since the tool enforces they only ever move together; every
+  other stage is independently trackable), and skips any stage whose bit is already set;
+  `--force` skips that.
+  `--patches`/`--max-revision` operate on a SEPARATE, externally-facing numbering — **patches**,
+  not stages (`PATCH_STAGES` in the script) — a curated, thematic grouping of one or more internal
+  stages chosen for what makes sense to a user picking which fixes to apply, deliberately NOT the
+  same numbering as `STAGE_BIT`'s own keys (e.g. patch 1 bundles stages 1, 6, and 7 together, all
+  "tofu box" icon/font glyph fixes — see the script's own `PATCH_STAGES` comment, or README.md's
+  patch table, for the full mapping). `--max-revision N` caps the mandatory patches (1-4) at
+  patch N; `--patches 1,3,5` applies exactly those PATCH numbers (mandatory or optional),
+  bypassing the "patches 1-4 are mandatory together" rule entirely — the only non-interactive way
+  to include the optional patch 5 (sync-freeze fix; same fix as v11's own optional patch, kept
+  optional here too since it was found to behave differently across machines). The two flags are
+  mutually exclusive. **Never assume a patch number equals a stage number** — the two are
+  independent numbering spaces by design, not required to stay in sync.
   **NOT backward compatible** with a bottle patched by an older, pre-bitmask version of this
   script (which stored a plain linear revision count in the same field) — deliberately no
   migration/bridging logic; reset such a bottle to pristine (fresh copy from
@@ -378,6 +386,11 @@ but don't rely on that alone).
   version touches it; the old value gets silently reinterpreted as a raw bitmask otherwise, which
   is normally wrong. (The v10.4.5674 pipeline now has this same bitmask/`--patches` treatment —
   see its own bullet earlier in this file, and the port note in its own Status section below.)
+  **Superseded by a later change**: `--patches` no longer takes raw stage numbers directly —
+  see this section's own "Patches are now a curated grouping, not raw stage numbers" note further
+  down (right after this script's own Status bullet list) for the current behavior and this
+  script's own `PATCH_STAGES` mapping (this paragraph's own `--patches 1,3,4` example is now
+  stale; the deploy script's own header comment and `PATCH_STAGES` map are the source of truth).
 
   **x64 support**: bottle discovery now checks both architectures' conventional install paths
   (`drive_c/Program Files (x86)/eM Client/` and plain `drive_c/Program Files/eM Client/`) rather
@@ -579,6 +592,32 @@ but don't rely on that alone).
     the tooling built/fixed along the way — an automatic freeze-context capture, two
     process-architecture discoveries, a `runner-panic` bug found), NOT merged into any tracked
     file: `reports/emclient11-msgraph-sync-freeze-findings.md`.
+
+**Patches are now a curated grouping, not raw stage numbers** (same correction as the 10.4.5674
+sibling script — see its own note under its `## Status` section for the full rationale):
+`--patches`/`--max-revision` now take a PATCH number, defined in this script's own `PATCH_STAGES`
+map, completely separate from `STAGE_BIT`:
+```
+1 = stage 2      (icon/font "tofu box" fix: splash tip)
+2 = stage 4      (message preview pane intermittently blank)
+3 = stage 1      (PBKDF2 startup crash, encryption)
+4 = stage 3      (notification toast)
+5 = stages 6, 7  (both sync-freeze fixes, grouped together, OPTIONAL)
+```
+Deliberately NOT the same numbering as the 10.4.5674 script's own patches, though the themes
+parallel where they can (both scripts' patch 1 is an icon/font fix; both have an
+encryption-related mandatory patch and a notification-toast patch, just at different numbers).
+Patch 5 is a real behavioral simplification, not just a renumbering: stage 6 and stage 7 used to
+be decided independently (two separate prompts, `--patches 6` vs `--patches 7`) — they're now
+always decided and applied together as one unit (one prompt, `--patches 5` includes both).
+`STAGE_BIT` itself is unchanged and still tracks stage 6/stage 7 as distinct bits, so a bottle
+that already has only one of the two (e.g. from before this change) is still handled correctly,
+just re-prompted rather than silently carried forward. `PIPELINE_LATEST_PATCH` (replacing
+`PIPELINE_LATEST_STAGE`) is `4`. See README.md's own patch table for the human-facing version of
+this mapping. Live-verified against `emClient_11_beta_win_11` reset to pristine: fresh deploy
+correctly reports "patches applied: 1,2,3,4", `--patches 5` correctly adds both sync-freeze fixes
+together (stage mask 111, confirmed real functional `MailClient.Wine.dll` + `deps.json` entry),
+an idempotent re-run correctly short-circuits, and every validation error path fires correctly.
 
 git is available in this environment (it wasn't in earlier sessions — if CLAUDE.md you're
 reading elsewhere says otherwise, this note supersedes it). Local commit identity for this repo
@@ -860,6 +899,33 @@ optional stage (mask 511), mutual-exclusivity/invalid-stage/out-of-range errors 
 correctly, an in-range `--max-revision 0` against an already-ahead bottle correctly detected
 nothing to do, and the resulting build launched cleanly (main window + CEF renderer up, zero new
 crash reports, graceful close).
+**Superseded by a later change**: `--patches`/`--max-revision` no longer take raw stage numbers
+directly — see "Patches are now a curated grouping, not raw stage numbers" below for the current
+behavior (this paragraph's own `--patches 15` example and its "mandatory 0-8 range" description
+are now stale).
+
+**Patches are now a curated grouping, not raw stage numbers** (a real correction, not an
+extension — the design above conflated "patch" with "stage" as if they were the same number,
+which they were never meant to be): `--patches`/`--max-revision` now take a PATCH number — a
+curated, thematic bundle of one or more internal stages, chosen for what makes sense to a user
+picking which fixes to apply, defined in a new `PATCH_STAGES` map that is completely separate
+from `STAGE_BIT` (which stays exactly as it was, still the only thing actually tracked in the
+on-bottle marker). This script's own `PATCH_STAGES`:
+```
+1 = stages 1, 6, 7   (icon/font "tofu box" fixes: splash banner blur, license icon, splash tip)
+2 = stages 2, 3, 4   (Settings dialog fixes: clip-region paint, Load event, category-click crash)
+3 = stage  5         (License Activation, encryption)
+4 = stages 8-14      (notification toast -- all one bit already)
+5 = stage  15        (Exchange sync-freeze fix -- OPTIONAL)
+```
+`PIPELINE_LATEST_PATCH` (replacing `PIPELINE_LATEST_STAGE`) is now `4`; `--max-revision N` caps
+the mandatory patches (1-4) at patch N; `--patches 1,3,5` applies exactly those PATCH numbers.
+The final deploy summary now reports "patches applied: 1,2,3,4" (computed by checking, for each
+patch, whether ALL of its underlying stage bits are set) rather than just a raw stage mask
+number. See README.md's own patch table for the human-facing version of this same mapping.
+Live-verified against `emClient_win_8_x64` reset to pristine: fresh deploy correctly reports
+"patches applied: 1,2,3,4", `--patches 5` correctly adds just the optional patch, and every
+validation error path fires correctly under the new numbering.
 
 ## Investigation method (what actually worked this round)
 
