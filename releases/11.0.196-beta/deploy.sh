@@ -30,28 +30,34 @@
 #                                   Bottles' own bottle name)
 #   ./deploy.sh --list              list found bottles and their installed versions, then exit
 #   ./deploy.sh -y|--yes            don't prompt on a version mismatch, continue automatically;
-#                                   also answers every optional-stage prompt (Stage 6, Stage 7)
-#                                   with its default of NOT included -- use --patches (below) to
-#                                   include one non-interactively instead.
+#                                   also answers the optional-patch prompt (patch 5) with its
+#                                   default of NOT included -- use --patches (below) to include it
+#                                   non-interactively instead.
 #   ./deploy.sh --force             skip the "already patched, nothing to do" short-circuit
-#   ./deploy.sh --max-revision N    cap the MANDATORY stage chain at stage N (0..4) instead of
-#                                   this script's own latest mandatory stage (PIPELINE_LATEST_STAGE).
-#                                   Purely about the mandatory 1-4 chain -- to include or exclude an
-#                                   optional stage (6, 7), use --patches instead; the two flags are
+#   ./deploy.sh --max-revision N    cap the MANDATORY patches at patch N (0..4) instead of this
+#                                   script's own latest mandatory patch (PIPELINE_LATEST_PATCH).
+#                                   Purely about the mandatory patches -- to include or exclude the
+#                                   optional patch 5, use --patches instead; the two flags are
 #                                   mutually exclusive. Useful for reverting a bottle to an earlier,
-#                                   known-good mandatory stage (restore the bottle's files from
+#                                   known-good mandatory patch (restore the bottle's files from
 #                                   original/em-<version>/ first, THEN run with --max-revision --
 #                                   this flag alone does not undo anything already installed) or
-#                                   for bisecting which stage introduced a regression.
-#   ./deploy.sh --patches 1,3,4     apply EXACTLY these stage numbers (mandatory or optional, any
-#                                   combination), bypassing the normal "stages 1-4 are mandatory"
-#                                   rule entirely -- for targeted patching. Only ever ADDS stages on
-#                                   top of whatever the bottle already has (never removes an
-#                                   already-applied one; that's what restoring from a backup or
+#                                   for bisecting which patch introduced a regression.
+#   ./deploy.sh --patches 1,3,4     apply EXACTLY these PATCH numbers (mandatory or optional, any
+#                                   combination), bypassing the normal "these patches are mandatory
+#                                   together" rule entirely -- for targeted patching. Only ever ADDS
+#                                   patches on top of whatever the bottle already has (never removes
+#                                   an already-applied one; that's what restoring from a backup or
 #                                   original/em-<version>/ is for). This is also the only
-#                                   non-interactive way to include an optional stage (6, 7) --
-#                                   e.g. --patches 6 includes the Exchange sync-freeze fix without
-#                                   answering its prompt. Mutually exclusive with --max-revision.
+#                                   non-interactive way to include the optional patch 5 (both
+#                                   sync-freeze fixes together) -- e.g. --patches 5 includes them
+#                                   without answering the prompt. A "patch" is a curated, thematic
+#                                   group of one or more internal stages (see PATCH_STAGES below) --
+#                                   NOT the same numbering as the internal stage numbers this
+#                                   script's own progress log lines use ("Stage N: ..."); see
+#                                   PATCH_STAGES' own comment, or README.md's patch table, for
+#                                   exactly which stages each patch number covers. Mutually
+#                                   exclusive with --max-revision.
 #   ./deploy.sh --install-fonts     install the vendored fonts/ without the license-consent prompt
 #   ./deploy.sh --no-fonts          skip font installation without the license-consent prompt
 #   ./deploy.sh --wine-manager crossover|bottles   which Wine-prefix manager the target bottle
@@ -91,10 +97,10 @@ set -euo pipefail
 # revision component) this script is confirmed to work against, each mapped to THIS deploy
 # line's own per-version release number (see il-patches/MailClient.Wine/VersionMarker.cs) --
 # used only for the release/<version>-<N> git tag and log/header messages. This is a SEPARATE
-# axis from PIPELINE_LATEST_STAGE below (which controls how many patch stages actually get
-# built and is shared across every version here, since the patch content itself doesn't vary by
-# version -- see the header comment's note on how 11.0.282 was verified): 11.0.282 starts its
-# own release-number count at 1 even though the underlying pipeline is already at stage 4,
+# axis from PIPELINE_LATEST_PATCH below (which controls how many patches actually get built and
+# is shared across every version here, since the patch content itself doesn't vary by version --
+# see the header comment's note on how 11.0.282 was verified): 11.0.282 starts its
+# own release-number count at 1 even though the underlying pipeline is already at patch 4,
 # because it's the first tagged release for that specific eM Client build, not because fewer
 # stages apply to it. Add a new entry the first time a new eM Client build is confirmed working
 # (after doing that same verification -- don't just add a version number here on faith); bump an
@@ -102,36 +108,52 @@ set -euo pipefail
 # supported.
 declare -A OUR_RELEASE_NUMBER_FOR_VERSION=( ["11.0.196"]=5 ["11.0.282"]=4 )
 
-# Highest MANDATORY pipeline stage number this script builds by default -- shared across every
-# supported eM Client version above. This (not OUR_RELEASE_NUMBER_FOR_VERSION) is what controls
-# how far a fresh deploy goes absent any opt-in, unrelated to which eM Client build it's on.
-#
-# Stage 4 is the preview-pane periodic-repaint fix (mandatory) -- see its own header comment
-# further down and reports/emclient11-preview-pane-blank-findings.md. It took the slot that used
-# to be deliberately vacant (reserved for exactly this: "whatever the next real mandatory patch
-# turns out to be"), leaving a fresh vacant Stage 5 behind for the next one. Optional stages (6,
-# 7) always sit at the highest number(s), past every mandatory one, so a future mandatory patch
-# takes the vacant slot and shifts every still-optional stage up by one again, same shuffle as
-# last time.
-PIPELINE_LATEST_STAGE=4
-
-# Each stage tracks as its OWN bit in a single mask, stored directly as the on-bottle
+# Each internal STAGE tracks as its OWN bit in a single mask, stored directly as the on-bottle
 # MailClient.Wine.dll marker's FileVersion trailing component -- e.g. a bottle with Stages
 # 1,2,3,4 applied reads back as mask 15 (0b1111); one with 1-4 plus Stage 7 (but not 6) reads
 # back as 79 (0b1001111). This is what lets Stage 6 and Stage 7 -- two independent optional
 # fixes a bottle can carry in ANY combination -- be represented natively, with no per-stage
-# special-casing needed (a plain linear "revision N means stages 1..N are done" count has no way
-# to express "has 7 but not 6"). No entry for Stage 5 -- it's a vacant slot, nothing to track.
+# special-casing needed. This is a purely INTERNAL/technical numbering -- see PATCH_STAGES below
+# for the externally-facing "patch" numbering --patches/--max-revision actually take.
 #
 # Deliberately no migration from the older, pre-bitmask linear-count scheme this same marker
 # field used to hold -- see the header comment's own note. A bottle patched by an older script
 # needs a pristine reset before this version touches it.
 declare -A STAGE_BIT=( [1]=1 [2]=2 [3]=4 [4]=8 [6]=32 [7]=64 )
+
+# PATCH is the externally-facing unit -- what --patches/--max-revision take, what README.md's
+# patch table documents, what a user thinks of as "patch N". It's a curated, THEMATIC grouping of
+# the internal stages above, chosen for what makes sense to a user picking which fixes to apply --
+# deliberately NOT the same numbering as STAGE_BIT's own keys, and not required to stay in sync
+# with it. Update this map (and README.md's patch table) if the grouping ever changes; never
+# assume a patch number equals a stage number anywhere in this script.
+#   1 = stage 2         (icon/font "tofu box" fix: splash tip -- same family as the 10.4.5674
+#                        sibling's own patch 1, just this build's one instance of it)
+#   2 = stage 4         (message preview pane intermittently blank)
+#   3 = stage 1         (PBKDF2 startup crash, encryption -- same family as the sibling's patch 3)
+#   4 = stage 3         (notification toast -- same family as the sibling's patch 4)
+#   5 = stages 6, 7     (both sync-freeze fixes, grouped together -- OPTIONAL, see their own
+#                        section further down)
+declare -A PATCH_STAGES=(
+    [1]="2"
+    [2]="4"
+    [3]="1"
+    [4]="3"
+    [5]="6 7"
+)
+# Highest MANDATORY patch number this script builds by default -- shared across every supported
+# eM Client version above. This (not OUR_RELEASE_NUMBER_FOR_VERSION) is what controls how far a
+# fresh deploy goes absent any opt-in, unrelated to which eM Client build it's on.
+PIPELINE_LATEST_PATCH=4
+MANDATORY_PATCHES=(1 2 3 4)
+
 MANDATORY_MASK=0
-for _n in 1 2 3 4; do MANDATORY_MASK=$(( MANDATORY_MASK | STAGE_BIT[$_n] )); done
+for _p in "${MANDATORY_PATCHES[@]}"; do
+    for _s in ${PATCH_STAGES[$_p]}; do MANDATORY_MASK=$(( MANDATORY_MASK | STAGE_BIT[$_s] )); done
+done
 ALL_KNOWN_MASK=0
 for _n in "${!STAGE_BIT[@]}"; do ALL_KNOWN_MASK=$(( ALL_KNOWN_MASK | STAGE_BIT[$_n] )); done
-unset _n
+unset _n _p _s
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -179,32 +201,36 @@ done
 
 [[ -n "$MAX_REVISION" && -n "$PATCHES_ARG" ]] && die "--max-revision and --patches are mutually exclusive"
 
-# MANDATORY_TARGET_MASK: how far up the mandatory 1-4 chain this run should reach -- either this
-# script's own latest (PIPELINE_LATEST_STAGE) or, if --max-revision was given, that lower cap.
+# MANDATORY_TARGET_MASK: how far up the mandatory patches (1 through 4) this run should reach --
+# either this script's own latest (PIPELINE_LATEST_PATCH) or, if --max-revision was given, that
+# lower cap. --max-revision takes a PATCH number (see PATCH_STAGES above), same unit as --patches.
 # Computed here (right after arg parsing, before the installed eM Client version is even known --
-# deliberately: this is about pipeline stages, not about which version's release-number is being
+# deliberately: this is about pipeline patches, not about which version's release-number is being
 # tagged) rather than inline at each use site, since it needs validating exactly once.
 if [[ -n "$MAX_REVISION" ]]; then
     [[ "$MAX_REVISION" =~ ^[0-9]+$ ]] || die "--max-revision must be a non-negative integer, got: $MAX_REVISION"
-    [[ "$MAX_REVISION" -ge 0 && "$MAX_REVISION" -le "$PIPELINE_LATEST_STAGE" ]] || die "--max-revision must be between 0 and $PIPELINE_LATEST_STAGE (the mandatory chain only -- use --patches to include an optional stage), got: $MAX_REVISION"
+    [[ "$MAX_REVISION" -ge 0 && "$MAX_REVISION" -le "$PIPELINE_LATEST_PATCH" ]] || die "--max-revision must be between 0 and $PIPELINE_LATEST_PATCH (the mandatory patches only -- use --patches to include the optional patch 5), got: $MAX_REVISION"
     MANDATORY_TARGET_MASK=0
-    for _n in $(seq 1 "$MAX_REVISION"); do MANDATORY_TARGET_MASK=$(( MANDATORY_TARGET_MASK | STAGE_BIT[$_n] )); done
-    unset _n
+    for _p in $(seq 1 "$MAX_REVISION"); do
+        for _s in ${PATCH_STAGES[$_p]}; do MANDATORY_TARGET_MASK=$(( MANDATORY_TARGET_MASK | STAGE_BIT[$_s] )); done
+    done
+    unset _p _s
 else
     MANDATORY_TARGET_MASK=$MANDATORY_MASK
 fi
 
-# PATCHES_MASK: the exact set of stages --patches named, validated against STAGE_BIT's known
-# domain. Empty (0) if --patches wasn't given.
+# PATCHES_MASK: the exact set of PATCHES --patches named, each expanded to its underlying
+# stage(s) via PATCH_STAGES and validated against that map's known domain. Empty (0) if
+# --patches wasn't given.
 PATCHES_MASK=0
 if [[ -n "$PATCHES_ARG" ]]; then
     IFS=',' read -ra _patch_list <<< "$PATCHES_ARG"
-    for _n in "${_patch_list[@]}"; do
-        [[ "$_n" =~ ^[0-9]+$ ]] || die "--patches: '$_n' is not a stage number"
-        [[ -n "${STAGE_BIT[$_n]+x}" ]] || die "--patches: stage $_n doesn't exist (known stages: ${!STAGE_BIT[*]})"
-        PATCHES_MASK=$(( PATCHES_MASK | STAGE_BIT[$_n] ))
+    for _p in "${_patch_list[@]}"; do
+        [[ "$_p" =~ ^[0-9]+$ ]] || die "--patches: '$_p' is not a patch number"
+        [[ -n "${PATCH_STAGES[$_p]+x}" ]] || die "--patches: patch $_p doesn't exist (known patches: ${!PATCH_STAGES[*]})"
+        for _s in ${PATCH_STAGES[$_p]}; do PATCHES_MASK=$(( PATCHES_MASK | STAGE_BIT[$_s] )); done
     done
-    unset _n _patch_list
+    unset _p _s _patch_list
 fi
 
 # ---------------------------------------------------------------------------
@@ -578,50 +604,35 @@ if [[ -f "$MARKER_DLL" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Optional stages: Stage 6 (Exchange sync-freeze fix) and Stage 7 (Microsoft 365 / Graph API
-# DNS+socket sync-freeze fix) -- see each one's own header comment further down for what they do
-# and why they're optional. Both decided here, identically: already applied -> carry forward with
-# no prompt; named explicitly via --patches -> included with no prompt; otherwise, with -y and no
-# --patches, default to NOT included; otherwise ask interactively.
+# Optional patch: patch 5 -- groups TWO related fixes together, stage 6 (Exchange sync-freeze
+# fix) and stage 7 (Microsoft 365 / Graph API DNS+socket sync-freeze fix) -- see each stage's own
+# header comment further down for what it individually does and why. Decided together, as one
+# unit: already fully applied -> carry forward with no prompt; named explicitly via --patches ->
+# included with no prompt; otherwise, with -y and no --patches, default to NOT included;
+# otherwise ask interactively (one combined prompt for both stages).
 # ---------------------------------------------------------------------------
 
 OPTIONAL_TARGET_MASK=0
+PATCH5_STAGE_MASK=$(( STAGE_BIT[6] | STAGE_BIT[7] ))
 
-if (( INSTALLED_MASK & STAGE_BIT[6] )); then
-    OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[6] ))
-elif (( PATCHES_MASK & STAGE_BIT[6] )); then
-    OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[6] ))
-    log "including the optional Exchange sync-freeze fix (Stage 6, named via --patches)."
+if (( (INSTALLED_MASK & PATCH5_STAGE_MASK) == PATCH5_STAGE_MASK )); then
+    OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | PATCH5_STAGE_MASK ))
+elif (( PATCHES_MASK & PATCH5_STAGE_MASK )); then
+    OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | PATCH5_STAGE_MASK ))
+    log "including the optional sync-freeze fixes (patch 5, named via --patches)."
 elif [[ $ASSUME_YES -eq 0 ]]; then
     echo ""
-    echo "Stage 6 (optional): a fix for severe, recurring multi-minute freezes during Exchange"
-    echo "sync. Confirmed working on some machines, but not yet confirmed to behave the same"
-    echo "way on every machine -- kept optional until that's better understood. Skipping this"
-    echo "keeps the bottle on the mandatory pipeline only; you can opt in later with a plain"
-    echo "re-run (or --patches 6) once you're ready to try it."
-    read -r -p "Include the Exchange sync-freeze fix in this deploy? [y/N] " sfreply
+    echo "Patch 5 (optional): two related sync-freeze fixes. One for severe, recurring"
+    echo "multi-minute freezes during classic IMAP/EWS Exchange sync. The other for Microsoft"
+    echo "365 / Graph API account sync freezes -- a DIFFERENT bug, hit through HttpClient's own"
+    echo "connection path plus a socket I/O hang, rather than Exchange's own sync entry points."
+    echo "Both confirmed working, but not yet confirmed to behave the same way on every machine"
+    echo "-- kept optional until that's better understood. Skipping this keeps the bottle on the"
+    echo "mandatory patches only; you can opt in later with a plain re-run (or --patches 5) once"
+    echo "you're ready to try them."
+    read -r -p "Include the sync-freeze fixes in this deploy? [y/N] " sfreply
     if [[ "$sfreply" =~ ^[Yy]$ ]]; then
-        OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[6] ))
-    fi
-fi
-
-if (( INSTALLED_MASK & STAGE_BIT[7] )); then
-    OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[7] ))
-elif (( PATCHES_MASK & STAGE_BIT[7] )); then
-    OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[7] ))
-    log "including the optional Microsoft 365 / Graph API sync-freeze fix (Stage 7, named via --patches)."
-elif [[ $ASSUME_YES -eq 0 ]]; then
-    echo ""
-    echo "Stage 7 (optional): a fix for Microsoft 365 / Graph API account sync freezes -- a"
-    echo "DIFFERENT bug from Stage 6's classic IMAP/EWS Exchange sync freeze. Root cause: the"
-    echo "same broken Wine async DNS resolution, this time hit through HttpClient's own"
-    echo "connection path, plus a second hang in socket I/O found after fixing the first."
-    echo "Confirmed fixing a real, reproduced freeze live; not yet soaked broadly, so kept"
-    echo "optional. Skipping this leaves Microsoft 365 / Graph accounts exposed to the Wine"
-    echo "defect Stage 6 doesn't touch; you can opt in later with a plain re-run (or --patches 7)."
-    read -r -p "Include the Microsoft 365 / Graph API sync-freeze fix in this deploy? [y/N] " gfreply
-    if [[ "$gfreply" =~ ^[Yy]$ ]]; then
-        OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | STAGE_BIT[7] ))
+        OPTIONAL_TARGET_MASK=$(( OPTIONAL_TARGET_MASK | PATCH5_STAGE_MASK ))
     fi
 fi
 
@@ -973,12 +984,10 @@ fi
 # between the two flags doesn't matter (different types, no shared state), same as the sibling
 # script's own Stage 15.
 #
-# Numbered 6 (not 5) and OPTIONAL, unlike every mandatory stage before it: this fix has been
-# observed to behave differently across machines, so it's no longer applied unconditionally --
-# see the prompt/flags right after the bottle list above, and PIPELINE_LATEST_STAGE's own comment
-# near the top of this script for the full renumbering rationale (Stage 5 is now the deliberately
-# vacant slot, reserved for the next patch that IS safe to apply unconditionally -- Stage 4 took
-# the previous vacant slot; see its own header comment above).
+# OPTIONAL, unlike every mandatory stage before it: this fix has been observed to behave
+# differently across machines, so it's no longer applied unconditionally -- see the prompt/flags
+# right after the bottle list above. Grouped with Stage 7 as one externally-facing patch (patch
+# 5, see PATCH_STAGES near the top of this script) -- the two are decided and applied together.
 # ---------------------------------------------------------------------------
 
 if (( NEEDS_WORK_MASK & STAGE_BIT[6] )); then
@@ -1283,12 +1292,21 @@ for f in "${DEPLOY_FILES[@]}"; do
     WRITTEN_FILES+=("$f")
 done
 
+PATCHES_APPLIED=""
+for _p in $(printf '%s\n' "${!PATCH_STAGES[@]}" | sort -n); do
+    _pm=0
+    for _s in ${PATCH_STAGES[$_p]}; do _pm=$(( _pm | STAGE_BIT[$_s] )); done
+    if [[ $(( NEW_MASK & _pm )) -eq $_pm ]]; then
+        PATCHES_APPLIED="${PATCHES_APPLIED:+$PATCHES_APPLIED,}$_p"
+    fi
+done
+unset _p _s _pm
+
 log "deploy complete."
 log "  bottle:      $BOTTLE_NAME"
 log "  version:     $FOUND_FILE_VERSION (release $RELEASE_VERSION-$OUR_RELEASE_NUMBER)"
-log "  stage mask:  $NEW_MASK"
-log "  Exchange sync-freeze fix (Stage 6):  $([[ $(( NEW_MASK & STAGE_BIT[6] )) -ne 0 ]] && echo included || echo not included)"
-log "  MS Graph DNS/socket fix (Stage 7):   $([[ $(( NEW_MASK & STAGE_BIT[7] )) -ne 0 ]] && echo included || echo not included)"
+log "  patches applied: ${PATCHES_APPLIED:-none} (stage mask $NEW_MASK -- see README.md's patch table for what each number covers)"
+log "  sync-freeze fixes (patch 5):  $([[ $(( NEW_MASK & PATCH5_STAGE_MASK )) -ne 0 ]] && echo included || echo not included)"
 log "  backup:      $BACKUP_DIR"
 
 fi  # DLL_ALREADY_PATCHED
