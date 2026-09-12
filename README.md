@@ -102,12 +102,13 @@ eM Client 11 ships as an MSIX package, which CrossOver/Wine can't install direct
 
 ### `releases/11.0.196-beta/deploy.sh` flags
 
-Same flag set as the 10.4.5674 script above, minus the three file-associations flags (not a
-feature of this release line) — `--bottle`, `--list`, `-y`/`--yes`, `--force`, `--max-revision N`,
-`--patches LIST`, `--install-fonts`, `--no-fonts`, `--wine-manager crossover|bottles`, `-h`/`--help`
-all work identically, same 5-patch shape as the 10.4.5674 script (patches 1–4 mandatory, patch 5
-optional) — though which bugs land in which patch number is its own, independently-curated
-grouping (see the table below), not the same numbering as the 10.4.5674 script's own patches.
+Identical flag set to the 10.4.5674 script above, file-associations flags included — `--bottle`,
+`--list`, `-y`/`--yes`, `--force`, `--max-revision N`, `--patches LIST`, `--install-fonts`,
+`--no-fonts`, `--install-associations`, `--no-associations`, `--force-associations`,
+`--wine-manager crossover|bottles`, `-h`/`--help` all work identically, same 5-patch shape as the
+10.4.5674 script (patches 1–4 mandatory, patch 5 optional) — though which bugs land in which
+patch number is its own, independently-curated grouping (see the table below), not the same
+numbering as the 10.4.5674 script's own patches.
 
 | Patch # | Bug | Root cause | Report |
 |---|---|---|---|

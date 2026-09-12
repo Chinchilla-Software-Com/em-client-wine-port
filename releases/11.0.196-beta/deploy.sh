@@ -62,6 +62,9 @@
 #                                   exclusive with --max-revision.
 #   ./deploy.sh --install-fonts     install the vendored fonts/ without the license-consent prompt
 #   ./deploy.sh --no-fonts          skip font installation without the license-consent prompt
+#   ./deploy.sh --install-associations   add file-type associations without the prompt
+#   ./deploy.sh --no-associations        skip file-type associations without the prompt
+#   ./deploy.sh --force-associations     also overwrite extensions that already have an association
 #   ./deploy.sh --wine-manager crossover|bottles   which Wine-prefix manager the target bottle
 #                                   lives under. Auto-detected when only one is installed;
 #                                   prompted for ("Are you using CrossOver or Bottles?") when both
@@ -86,11 +89,21 @@
 # before deploying. --install-fonts / --no-fonts answer that non-interactively -- for scripted or
 # repeated runs (e.g. a periodic check) where a prompt can't be answered by a human.
 #
-# Requires: dotnet SDK (checked below, prints install instructions if missing). python3 is only
-# needed if Stage 7 (the optional Microsoft 365 / Graph API fix) is included -- that's the first
-# stage in this release line to add a new sibling assembly MailClient.Wine.dll is genuinely
-# LOADED as (same MailClient.deps.json edit the 10.4.5674 pipeline's own Stage 5 needs); every
-# mandatory stage plus Stage 6 need neither. No network access needed beyond ilspycmd/NuGet
+# File-type associations: file-associations/*.reg fixes attachment types (office documents,
+# images, archives, audio/video) that a fresh CrossOver bottle has no working association for --
+# same feature, same files, same mechanism as the 10.4.5674 sibling script (confirmed applicable
+# here too: MailClient.UI.ShellInterop.OpenItem, the shared attachment-open entry point both
+# release lines rely on the bottle's own OS-level association for, exists identically in this
+# build) -- see reports/office-file-associations-findings.md. Only extensions with no existing
+# association are added by default (so a bottle with a real Office/LibreOffice install isn't
+# touched); --force-associations also overwrites extensions that already have something set.
+# --install-associations / --no-associations answer the prompt non-interactively.
+#
+# Requires: dotnet SDK (checked below, prints install instructions if missing). python3 (for
+# parse-reg-associations.py, and for the deps.json patch step if Stage 7, the optional
+# Microsoft 365 / Graph API fix, is included -- that's the first stage in this release line to
+# add a new sibling assembly MailClient.Wine.dll is genuinely LOADED as, same MailClient.deps.json
+# edit the 10.4.5674 pipeline's own Stage 5 needs). No network access needed beyond ilspycmd/NuGet
 # restore (same as the sibling script).
 
 set -euo pipefail
@@ -177,12 +190,15 @@ LIST_ONLY=0
 FORCE=0
 INSTALL_FONTS=0
 NO_FONTS=0
+INSTALL_ASSOCIATIONS=0
+NO_ASSOCIATIONS=0
+FORCE_ASSOCIATIONS=0
 MAX_REVISION=""
 PATCHES_ARG=""
 WINE_MANAGER_ARG=""
 
 print_help() {
-    sed -n '2,65p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,108p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -195,6 +211,9 @@ while [[ $# -gt 0 ]]; do
         --patches) PATCHES_ARG="${2:-}"; shift 2 ;;
         --install-fonts) INSTALL_FONTS=1; shift ;;
         --no-fonts) NO_FONTS=1; shift ;;
+        --install-associations) INSTALL_ASSOCIATIONS=1; shift ;;
+        --no-associations) NO_ASSOCIATIONS=1; shift ;;
+        --force-associations) FORCE_ASSOCIATIONS=1; shift ;;
         --wine-manager) WINE_MANAGER_ARG="${2:-}"; shift 2 ;;
         -h|--help) print_help; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
@@ -1423,6 +1442,167 @@ EOF
         fi
     else
         log "skipping font install (no license confirmation given). Use --install-fonts to skip this prompt."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Optional: file-type associations (file-associations/*.reg) for attachment
+# types eM Client can't launch an external viewer for because the bottle has
+# no working association for them -- same feature, same files, same
+# mechanism as the 10.4.5674 sibling script (see its own header comment
+# above this block for the full rationale) -- confirmed applicable to this
+# build too: MailClient.UI.ShellInterop.OpenItem, the shared attachment-open
+# entry point both release lines rely on the bottle's own OS-level
+# association for, exists identically here (verified via decompile before
+# porting this, not assumed).
+#
+# Deliberately NOT a blind `wine regedit /S` of the whole file: that would
+# unconditionally overwrite every extension's association, including one a
+# real Office/LibreOffice install already set up correctly in this bottle.
+# Instead: parse each .reg file into its individual per-extension blocks
+# (file-associations/parse-reg-associations.py), check each extension
+# against THIS bottle's live registry, and only import the blocks for
+# extensions with no existing association. --force-associations also
+# overwrites extensions that already have something set.
+# ---------------------------------------------------------------------------
+
+ASSOC_FILES=("$REPO_ROOT/file-associations/office-associations.reg" "$REPO_ROOT/file-associations/common-attachments.reg")
+ASSOC_FILES_PRESENT=()
+for f in "${ASSOC_FILES[@]}"; do [[ -f "$f" ]] && ASSOC_FILES_PRESENT+=("$f"); done
+
+# Bottle-prefix root (holds system.reg/user.reg, three levels above BOTTLE_APP_DIR -- .../eM
+# Client -> .../Program Files (x86) -> .../drive_c -> the bottle root itself) -- only actually
+# used by the Bottles existing-value check below, but resolved unconditionally since it's cheap.
+BOTTLE_PREFIX_ROOT="$(cd "$BOTTLE_APP_DIR/../../.." && pwd)"
+
+# Bottles-only: is there already an `@=` (default value) under [Software\Classes\.$ext] in either
+# user.reg (HKCU) or system.reg (HKLM) -- the two files a Bottles bottle's HKEY_CLASSES_ROOT merge
+# actually reads from. Reads the bottle's own .reg files directly rather than shelling to `wine
+# reg query` (confirmed hands-on: `bottles-cli run`'s own stdout isn't reliably forwarded back to
+# the caller, so a query's result can't be read that way under Bottles -- see the WINE_MANAGER
+# detection block's own note). python3 (already a hard dependency of this script for
+# parse-reg-associations.py) rather than a hand-rolled awk/grep state machine, for the same reason
+# parse-reg-associations.py itself is python: multi-line section parsing is fiddly in awk.
+bottles_hkcr_has_default() {
+    local ext="$1"
+    python3 -c "
+import re, sys
+ext_re = re.compile(r'^\[Software\\\\Classes\\\\\.' + re.escape(sys.argv[1]) + r'\]')
+for path in sys.argv[2:]:
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        continue
+    in_section = False
+    for line in lines:
+        if ext_re.match(line):
+            in_section = True
+            continue
+        if in_section:
+            if line.startswith('['):
+                in_section = False
+                continue
+            if line.startswith('@='):
+                sys.exit(0)
+sys.exit(1)
+" "$ext" "$BOTTLE_PREFIX_ROOT/user.reg" "$BOTTLE_PREFIX_ROOT/system.reg"
+}
+
+if [[ ${#ASSOC_FILES_PRESENT[@]} -gt 0 ]]; then
+    do_associations=0
+    if [[ $FORCE_ASSOCIATIONS -eq 1 || $INSTALL_ASSOCIATIONS -eq 1 ]]; then
+        do_associations=1
+    elif [[ $NO_ASSOCIATIONS -eq 1 ]]; then
+        do_associations=0
+    else
+        echo ""
+        echo "This repo has file-type association fixes under file-associations/ for"
+        echo "attachment types eM Client can't open otherwise (office documents, images,"
+        echo "archives, audio/video) -- see reports/office-file-associations-findings.md."
+        echo "Only extensions with no existing association in this bottle are touched."
+        read -r -p "Add missing file-type associations to this bottle? [Y/n] " areply
+        [[ -z "$areply" || "$areply" =~ ^[Yy]$ ]] && do_associations=1
+    fi
+
+    if [[ $do_associations -eq 1 ]]; then
+        log "checking file-type associations against $BOTTLE_NAME's registry..."
+        MERGED_REG="$WORKDIR/associations-merged.reg"
+        printf 'Windows Registry Editor Version 5.00\r\n\r\n' > "$MERGED_REG"
+        # Bottles path: instead of one merged .reg file (reg.exe import was confirmed NOT to
+        # reliably persist under Bottles -- see the WINE_MANAGER detection block's own note),
+        # accumulate the individual key/data pairs to apply via wine_reg_add, one call per pair.
+        BOTTLES_PAIRS_TO_APPLY=()
+
+        added=0
+        skipped=0
+        forced=0
+        while IFS=$'\t' read -r ext block_b64 pairs_json; do
+            if [[ "$WINE_MANAGER" == "crossover" ]]; then
+                # `wine reg query` exits non-zero for a genuinely-missing key -- expected, not an
+                # error, but pipefail (set above) would otherwise propagate that through this
+                # substitution and abort the whole script via set -e. || true absorbs it;
+                # $existing is correctly empty in that case either way.
+                existing=$( (CX_BOTTLE="$BOTTLE_NAME" /opt/cxoffice/bin/wine reg query "HKCR\\.$ext" /ve 2>/dev/null \
+                    | sed -n 's/.*REG_SZ *//p' | tr -d '\r') || true)
+                has_existing=0
+                [[ -n "$existing" && "$existing" != "(value not set)" ]] && has_existing=1
+            else
+                has_existing=0
+                bottles_hkcr_has_default "$ext" && has_existing=1
+            fi
+
+            if [[ $has_existing -eq 1 ]]; then
+                if [[ $FORCE_ASSOCIATIONS -eq 1 ]]; then
+                    echo "$block_b64" | base64 -d >> "$MERGED_REG"
+                    printf '\r\n' >> "$MERGED_REG"
+                    BOTTLES_PAIRS_TO_APPLY+=("$pairs_json")
+                    forced=$((forced + 1))
+                else
+                    skipped=$((skipped + 1))
+                fi
+            else
+                echo "$block_b64" | base64 -d >> "$MERGED_REG"
+                printf '\r\n' >> "$MERGED_REG"
+                BOTTLES_PAIRS_TO_APPLY+=("$pairs_json")
+                added=$((added + 1))
+            fi
+        done < <(for f in "${ASSOC_FILES_PRESENT[@]}"; do python3 "$REPO_ROOT/file-associations/parse-reg-associations.py" "$f"; done)
+
+        log "file associations: $added new, $forced forced-overwrite, $skipped already present (unchanged)."
+
+        if [[ $((added + forced)) -gt 0 ]]; then
+            if [[ "$WINE_MANAGER" == "crossover" ]]; then
+                WIN_MERGED_REG="Z:$(echo "$MERGED_REG" | sed 's/\//\\/g')"
+                if CX_BOTTLE="$BOTTLE_NAME" /opt/cxoffice/bin/wine regedit /S "$WIN_MERGED_REG"; then
+                    log "file-type associations imported."
+                else
+                    warn "wine regedit import of file-type associations failed -- bottle's associations may be partially updated."
+                fi
+            else
+                assoc_import_failed=0
+                for pairs_json in "${BOTTLES_PAIRS_TO_APPLY[@]}"; do
+                    while IFS=$'\t' read -r pair_key pair_data; do
+                        [[ -n "$pair_key" ]] || continue
+                        wine_reg_add "$BOTTLE_NAME" "HKEY_CLASSES_ROOT\\$pair_key" "" REG_SZ "$pair_data" \
+                            || assoc_import_failed=1
+                    done < <(python3 -c "
+import json, sys
+for key, data in json.loads(sys.argv[1]):
+    print(key + '\t' + data)
+" "$pairs_json")
+                done
+                if [[ $assoc_import_failed -eq 0 ]]; then
+                    log "file-type associations imported."
+                else
+                    warn "one or more file-type association registry writes failed -- bottle's associations may be partially updated."
+                fi
+            fi
+        else
+            log "no file-type association changes needed."
+        fi
+    else
+        log "skipping file-type associations. Use --install-associations to skip this prompt."
     fi
 fi
 

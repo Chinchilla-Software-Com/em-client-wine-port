@@ -321,9 +321,14 @@ but don't rely on that alone).
 - **`releases/11.0.196-beta/deploy.sh`** — this version's own deploy script, same overall shape
   (bottle discovery, running-instance check, version gate, backup, verify, deploy-with-rollback,
   a `MailClient.Wine.dll` revision marker) as `releases/10.4.5674/deploy.sh` but much smaller —
-  two DLL-patch stages so far. Deliberately does not share the file-associations step (unrelated
-  to anything fixed here yet) or the license-OAEP BouncyCastle helper (neither DLL fix so far
-  needs a new sibling assembly). The `MailClient.Wine.dll` marker is built from the exact same
+  two DLL-patch stages so far. Deliberately does not share the license-OAEP BouncyCastle helper
+  (neither DLL fix so far needs a new sibling assembly). **Now shares the file-associations
+  feature with the 10.4.5674 sibling script** (`--install-associations`/`--no-associations`/
+  `--force-associations`, same `file-associations/*.reg` files, same
+  `parse-reg-associations.py`/`bottles_hkcr_has_default()` mechanism) — confirmed applicable
+  before porting, not assumed: `MailClient.UI.ShellInterop.OpenItem`, the shared attachment-open
+  entry point both release lines rely on the bottle's own OS-level association for, exists
+  identically in this build (verified via decompile). The `MailClient.Wine.dll` marker is built from the exact same
   tracked source as v10's (`il-patches/MailClient.Wine/VersionMarker.cs`), just with this line's
   own version numbers passed at build time — `AssemblyVersion=11.0.196.0` (this eM Client build),
   `FileVersion=11.0.196.<our-release-number>` — so the same leading-three-components/trailing-
