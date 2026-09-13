@@ -27,8 +27,10 @@
 #                                   default to NOT included; use --patches (below) to include it
 #                                   non-interactively instead.
 #   ./deploy.sh --force             skip the "already patched, nothing to do" short-circuit
-#   ./deploy.sh --max-revision N    cap the MANDATORY patches at patch N (0..4) instead of this
-#                                   script's own latest mandatory patch (PIPELINE_LATEST_PATCH).
+#   ./deploy.sh --max-revision N    cap the MANDATORY patches at patch N (0..6) instead of this
+#                                   script's own latest mandatory patch (PIPELINE_LATEST_PATCH) --
+#                                   patch 5 is optional and sits below patch 6 in number, so
+#                                   --max-revision never implies it either way regardless of N.
 #                                   Purely about the mandatory patches -- to include or exclude the
 #                                   optional patch 5, use --patches instead; the two flags are
 #                                   mutually exclusive. Useful for reverting a bottle to an
@@ -125,7 +127,7 @@ OUR_RELEASE_NUMBER=4
 # patched by an older script needs a pristine reset before this version touches it.
 declare -A STAGE_BIT=( [1]=1 [2]=2 [3]=4 [4]=8 [5]=16 [6]=32 [7]=64 \
     [8]=128 [9]=128 [10]=128 [11]=128 [12]=128 [13]=128 [14]=128 \
-    [15]=256 )
+    [15]=256 [16]=512 )
 
 # PATCH is the externally-facing unit -- what --patches/--max-revision take, what README.md's
 # patch tables document, what a user thinks of as "patch N". It's a curated, THEMATIC grouping of
@@ -138,18 +140,23 @@ declare -A STAGE_BIT=( [1]=1 [2]=2 [3]=4 [4]=8 [5]=16 [6]=32 [7]=64 \
 #   3 = stage  5         (License Activation, encryption)
 #   4 = stages 8-14      (notification toast -- all one bit already, see STAGE_BIT above)
 #   5 = stage  15        (Exchange sync-freeze fix -- OPTIONAL, see its own section further down)
+#   6 = stage  16        (floating-popup Z-order fixes: nested combo dropdowns, spawned dialogs --
+#                         see reports/floating-popup-zorder-findings.md)
 declare -A PATCH_STAGES=(
     [1]="1 6 7"
     [2]="2 3 4"
     [3]="5"
     [4]="8"
     [5]="15"
+    [6]="16"
 )
-# Highest MANDATORY patch number this script builds by default. Patch 5 (sync-freeze fix) is
-# OPTIONAL, past this -- see its own header comment further down for why (the same underlying
-# fix in the 11.0.196-beta pipeline turned out to behave differently across machines).
-PIPELINE_LATEST_PATCH=4
-MANDATORY_PATCHES=(1 2 3 4)
+# Highest MANDATORY patch number this script builds by default. Patch 5 (sync-freeze fix) sits
+# BELOW this as a deliberate gap -- it's OPTIONAL (see its own header comment further down for
+# why), not part of the mandatory chain despite its number being lower than this constant. Always
+# consult MANDATORY_PATCHES (below), never assume "1..PIPELINE_LATEST_PATCH" is a contiguous
+# mandatory range -- it isn't, on purpose.
+PIPELINE_LATEST_PATCH=6
+MANDATORY_PATCHES=(1 2 3 4 6)
 
 MANDATORY_MASK=0
 for _p in "${MANDATORY_PATCHES[@]}"; do
@@ -211,17 +218,23 @@ done
 
 [[ -n "$MAX_REVISION" && -n "$PATCHES_ARG" ]] && die "--max-revision and --patches are mutually exclusive"
 
-# MANDATORY_TARGET_MASK: how far up the mandatory patches (1 through 4) this run should reach.
-# Three cases: --max-revision given -> that lower cap; --patches given (no --max-revision) ->
-# ZERO -- --patches means targeted patching, bypassing the "mandatory patches apply together"
-# default entirely, so nothing mandatory is implied just because it wasn't named (the only
-# patches this run targets are whatever's in PATCHES_MASK below); neither flag given -> this
-# script's own latest (PIPELINE_LATEST_PATCH), the plain "just run it" default.
+# MANDATORY_TARGET_MASK: how far up the mandatory patches this run should reach. Three cases:
+# --max-revision given -> that lower cap; --patches given (no --max-revision) -> ZERO --
+# --patches means targeted patching, bypassing the "mandatory patches apply together" default
+# entirely, so nothing mandatory is implied just because it wasn't named (the only patches this
+# run targets are whatever's in PATCHES_MASK below); neither flag given -> this script's own
+# latest (PIPELINE_LATEST_PATCH), the plain "just run it" default.
 if [[ -n "$MAX_REVISION" ]]; then
     [[ "$MAX_REVISION" =~ ^[0-9]+$ ]] || die "--max-revision must be a non-negative integer, got: $MAX_REVISION"
     [[ "$MAX_REVISION" -ge 0 && "$MAX_REVISION" -le "$PIPELINE_LATEST_PATCH" ]] || die "--max-revision must be between 0 and $PIPELINE_LATEST_PATCH (the mandatory patches only -- use --patches to include the optional patch 5), got: $MAX_REVISION"
     MANDATORY_TARGET_MASK=0
-    for _p in $(seq 1 "$MAX_REVISION"); do
+    # Filter MANDATORY_PATCHES itself, not a blind `seq 1 N` -- MANDATORY_PATCHES has a
+    # deliberate gap at 5 (the optional sync-freeze fix), so a contiguous seq would silently
+    # sweep patch 5 in the moment N reaches past it (hit for real while adding patch 6: an
+    # earlier version of this loop broke the very invariant --max-revision's own error message
+    # promises, "the mandatory patches only").
+    for _p in "${MANDATORY_PATCHES[@]}"; do
+        (( _p <= MAX_REVISION )) || continue
         for _s in ${PATCH_STAGES[$_p]}; do MANDATORY_TARGET_MASK=$(( MANDATORY_TARGET_MASK | STAGE_BIT[$_s] )); done
     done
     unset _p _s
@@ -1095,15 +1108,61 @@ fi
 if (( NEEDS_WORK_MASK & STAGE_BIT[15] )); then
     log "Stage 15: sync freeze fix (account-level sync + folder-tree sync both now run off the UI thread)..."
     $ILP --patch-account-manager-sync-async "$STAGE14_DIR" "$WORKDIR/output-stage15a"
-    $ILP --patch-folder-sync-async "$WORKDIR/output-stage15a" "$WORKDIR/output-final"
-    [[ -n "$BOUNCYCASTLEPATCH_DLL" ]] && cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-final/"
-    FINAL_DIR="$WORKDIR/output-final"
+    $ILP --patch-folder-sync-async "$WORKDIR/output-stage15a" "$WORKDIR/output-stage15"
+    [[ -n "$BOUNCYCASTLEPATCH_DLL" ]] && cp "$BOUNCYCASTLEPATCH_DLL" "$WORKDIR/output-stage15/"
+    STAGE15_DIR="$WORKDIR/output-stage15"
 elif (( INSTALLED_MASK & STAGE_BIT[15] )); then
     log "Stage 15 already applied -- using the installed files as-is."
-    FINAL_DIR="$STAGE14_DIR"
+    STAGE15_DIR="$STAGE14_DIR"
 else
     log "Stage 15 not included in this deploy."
-    FINAL_DIR="$STAGE14_DIR"
+    STAGE15_DIR="$STAGE14_DIR"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 16 (patch 6, MANDATORY): floating-popup Z-order fixes under Wine -- two related but
+# independent bugs found via live user reports, both root-caused to the same underlying class of
+# defect (Wine failing to recognise a real native window-owner relationship the app's own popup
+# code correctly asks for), fixed together since they're always deployed as one unit. Full
+# investigation, every wrong turn (five of them combined across both bugs, none of which worked
+# before landing on these): reports/floating-popup-zorder-findings.md.
+#   - A ComboBoxWithDataGrid dropdown nested inside an already-open ToolStripDropDown-based popup
+#     (e.g. the font-family list inside the "A" font/style toolbar popup) rendered UNDERNEATH the
+#     outer popup instead of on top of it. Neither a plain client-requested restack
+#     (SetWindowPos) nor the X11 override-redirect state (confirmed opaque and uncontrollable via
+#     any Win32-level CreateWindowEx parameter) could fix this. Fixed by
+#     --patch-nested-popup-owned-by-ancestor: PopupWindowHelper.SetVisibleCore now establishes a
+#     real native owner relationship (WinApi.Win32.SetWindowLong(GWL.HWNDPARENT)) with the
+#     ancestor popup, relying on Win32's own WM-independent "an owned window always draws above
+#     its owner" guarantee instead of trying to influence or race Wine's opaque stacking decision.
+#   - Opening the standard Windows ColorDialog from a "Custom colour..." link inside a floating
+#     popup closed the popup outright, instead of leaving it open in the background the way real
+#     Windows does (confirmed via a user-supplied reference screenshot from a real-Windows
+#     session). Root cause: a global, always-installed ToolStripManager.ModalMenuFilter message
+#     filter auto-closes any open ToolStripDropDown whenever the system's active window changes to
+#     something it doesn't recognise as belonging to that dropdown's own hierarchy -- exactly the
+#     same owner-chain recognition gap as the bug above, this time affecting a real dialog rather
+#     than a nested popup. Fixed by --patch-colordialog-suppress-autoclose: CommonUIUtils.
+#     ShowColorDialog now suppresses AutoClose on the caller's ancestor popup for the dialog's
+#     duration (WinForms' own sanctioned mechanism for exactly this scenario -- the filter itself
+#     explicitly skips closing any dropdown with AutoClose=false) and queues a forced repaint+
+#     restack via BeginInvoke (confirmed live: AutoClose suppression alone keeps the popup
+#     logically open but still renders blank -- a separate paint/stacking symptom needing its own
+#     fix, run via BeginInvoke so it executes inside the dialog's own nested modal message loop).
+# Touches MailClient.Common.UI.dll only, both patches chained through the same file.
+# ---------------------------------------------------------------------------
+
+if (( NEEDS_WORK_MASK & STAGE_BIT[16] )); then
+    log "Stage 16: floating-popup Z-order fixes (nested dropdowns, spawned dialogs)..."
+    $ILP --patch-nested-popup-owned-by-ancestor "$STAGE15_DIR" "$WORKDIR/output-stage16a"
+    $ILP --patch-colordialog-suppress-autoclose "$WORKDIR/output-stage16a" "$WORKDIR/output-final"
+    FINAL_DIR="$WORKDIR/output-final"
+elif (( INSTALLED_MASK & STAGE_BIT[16] )); then
+    log "Stage 16 already applied -- using the installed files as-is."
+    FINAL_DIR="$STAGE15_DIR"
+else
+    log "Stage 16 skipped -- not targeted this run."
+    FINAL_DIR="$STAGE15_DIR"
 fi
 
 # Every Cecil patch invocation above only ever copies *.dll files forward -- non-dll files (and,
@@ -1202,6 +1261,23 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[15] )); then
 
     $ILP --dump-handlers "$FINAL_DIR/MailClient.Accounts.dll" MailClient.Storage.Application.Folder __folderSyncTaskEntry 2>&1 | tail -1 | grep -q "^OK:" \
         || die "verification failed: --dump-handlers reported a handler-ordering violation in Folder.__folderSyncTaskEntry"
+fi
+
+if (( NEEDS_WORK_MASK & STAGE_BIT[16] )); then
+    $ILSPY -t "MailClient.Common.UI.PopupWindowHelper" "$FINAL_DIR/MailClient.Common.UI.dll" | grep -q "SetWindowLong(Handle, GWL.HWNDPARENT" \
+        || die "verification failed: PopupWindowHelper.SetVisibleCore doesn't set GWL.HWNDPARENT -- nested-popup-owned-by-ancestor fix missing"
+
+    $ILSPY -t "MailClient.Common.UI.PopupWindowHelper" "$FINAL_DIR/MailClient.Common.UI.dll" | grep -q "RepaintAndRestackForSpawnedDialog" \
+        || die "verification failed: PopupWindowHelper.RepaintAndRestackForSpawnedDialog not found -- colordialog-suppress-autoclose fix missing"
+
+    $ILSPY -t "MailClient.Common.UI.CommonUIUtils" "$FINAL_DIR/MailClient.Common.UI.dll" | grep -q "AutoClose = false" \
+        || die "verification failed: CommonUIUtils.ShowColorDialog doesn't suppress AutoClose -- colordialog-suppress-autoclose fix missing"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.Common.UI.dll" MailClient.Common.UI.PopupWindowHelper SetVisibleCore 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in PopupWindowHelper.SetVisibleCore"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.Common.UI.dll" MailClient.Common.UI.CommonUIUtils ShowColorDialog 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in CommonUIUtils.ShowColorDialog"
 fi
 
 log "all verification checks passed."

@@ -597,6 +597,26 @@ but don't rely on that alone).
     the tooling built/fixed along the way — an automatic freeze-context capture, two
     process-architecture discoveries, a `runner-panic` bug found), NOT merged into any tracked
     file: `reports/emclient11-msgraph-sync-freeze-findings.md`.
+  - `release/11.0.196-12` / `release/11.0.282-11` — Stage 8 (patch 6, MANDATORY): floating-popup
+    Z-order fixes under Wine, the exact same two bugs and same two `--patch-` flags
+    (`--patch-nested-popup-owned-by-ancestor`, `--patch-colordialog-suppress-autoclose`) as the
+    10.4.5674 sibling script's own Stage 16 — see that Status entry, or
+    `reports/floating-popup-zorder-findings.md`, for the full investigation and root cause.
+    Confirmed applicable to this build before porting, not assumed: `PopupWindowHelper.
+    SetVisibleCore`/`findParentPopupHelper` decompile identically to the 10.4.5674 copy (one
+    added `HideShadowWindow()` call on the `!visible` path and a renamed private field, neither
+    touched by the patch); `CommonUIUtils.ShowColorDialog` here has one extra early-return branch
+    (a `ColorPickerFactory` extensibility hook) the 10.4.5674 copy doesn't, handled generically by
+    the patch's own multi-return-safe retargeting logic rather than a version-specific carve-out.
+    Verified via decompile + `--dump-handlers` against both `original/em-11.0.196/` and
+    `original/em-11.0.282/`, applied identically to both (no version-specific adaptation needed,
+    hence bumping both versions' release numbers together, same as every other shared-content
+    patch in this pipeline). Deployed via a full, real `deploy.sh` run against
+    `emClient_11_beta_win_11` reset to pristine: reached mask 143 (patches 1,2,3,4,6), all
+    verification checks passed, and the resulting build launched cleanly with zero new crash
+    reports. This also surfaced and fixed a real, previously latent bug in `--max-revision`'s own
+    implementation (see the superseded note below) -- the same fix applied to the 10.4.5674
+    sibling script when it hit the identical issue.
 
 **Patches are now a curated grouping, not raw stage numbers** (same correction as the 10.4.5674
 sibling script — see its own note under its `## Status` section for the full rationale):
@@ -623,6 +643,12 @@ this mapping. Live-verified against `emClient_11_beta_win_11` reset to pristine:
 correctly reports "patches applied: 1,2,3,4", `--patches 5` correctly adds both sync-freeze fixes
 together (stage mask 111, confirmed real functional `MailClient.Wine.dll` + `deps.json` entry),
 an idempotent re-run correctly short-circuits, and every validation error path fires correctly.
+**Superseded by a later change**: `PIPELINE_LATEST_PATCH` is no longer `4` — see
+`release/11.0.196-12`/`release/11.0.282-11`'s own Status entry further down for patch 6, which sits
+past patch 5 in number despite patch 5 staying optional (a deliberate gap, not a mistake — see
+that entry and the 10.4.5674 sibling script's own equivalent note for why `--max-revision`'s own
+implementation has to filter `MANDATORY_PATCHES` explicitly rather than assume a contiguous
+`1..PIPELINE_LATEST_PATCH` range once a gap like this exists).
 
 git is available in this environment (it wasn't in earlier sessions — if CLAUDE.md you're
 reading elsewhere says otherwise, this note supersedes it). Local commit identity for this repo
@@ -931,6 +957,58 @@ number. See README.md's own patch table for the human-facing version of this sam
 Live-verified against `emClient_win_8_x64` reset to pristine: fresh deploy correctly reports
 "patches applied: 1,2,3,4", `--patches 5` correctly adds just the optional patch, and every
 validation error path fires correctly under the new numbering.
+**Superseded by a later change**: `PIPELINE_LATEST_PATCH` is no longer `4` — see
+`release/10.4.5674-8`'s own Status entry further down for patch 6 (Stage 16), which sits past
+patch 5 in number despite patch 5 staying optional (a deliberate gap, not a mistake). Adding it
+also surfaced a real bug in the `--max-revision` implementation shown above: iterating a plain
+`seq 1 N` instead of filtering `MANDATORY_PATCHES` would have silently swept the optional patch 5
+in once `N` reached past the gap — fixed as part of that same change; see that Status entry for
+the full account.
+
+`release/10.4.5674-8` — Stage 16 (patch 6, MANDATORY): floating-popup Z-order fixes under Wine,
+two related bugs found via live user reports, both root-caused to the same class of defect (Wine
+never establishing a real native window-owner relationship the app's own popup code correctly
+asks for) and fixed together since they always deploy as one unit. Full investigation, every
+wrong turn (five of them combined across both bugs before landing on the real fixes):
+`reports/floating-popup-zorder-findings.md`.
+  - A `ComboBoxWithDataGrid` dropdown nested inside an already-open `ToolStripDropDown`-based
+    popup (the font-family list inside the "A" font/style toolbar popup) rendered underneath the
+    outer popup instead of on top of it. Neither a plain client-requested restack
+    (`SetWindowPos`) nor the X11 override-redirect state (confirmed opaque and uncontrollable via
+    any Win32-level `CreateWindowEx` parameter — both popups create with byte-identical
+    parameters yet diverge) could fix this. `--patch-nested-popup-owned-by-ancestor` fixes it by
+    having `PopupWindowHelper.SetVisibleCore` establish a real native owner relationship
+    (`WinApi.Win32.SetWindowLong(GWL.HWNDPARENT)`) with the ancestor popup, then re-issuing
+    `SetWindowPos(HWND_TOP, ...)` so Wine's z-order enforcement reconciles against the new owner.
+  - Opening the standard Windows `ColorDialog` from a "Custom colour..." link inside a floating
+    popup closed the popup outright, instead of leaving it open in the background the way real
+    Windows does (confirmed via a user-supplied real-Windows reference screenshot). Root cause: a
+    global `ToolStripManager.ModalMenuFilter` message filter auto-closes any open
+    `ToolStripDropDown` whenever the active window changes to something it doesn't recognize as
+    belonging to that dropdown's own hierarchy — the same owner-chain recognition gap as the bug
+    above, this time affecting a real dialog. `--patch-colordialog-suppress-autoclose` fixes it by
+    having `CommonUIUtils.ShowColorDialog` suppress `AutoClose` on the caller's ancestor popup for
+    the dialog's duration (the filter itself explicitly skips closing any dropdown with
+    `AutoClose=false`) and queue a forced repaint+restack via `BeginInvoke` (confirmed live:
+    `AutoClose` suppression alone keeps the popup logically open but still renders blank — a
+    separate paint/stacking symptom needing its own fix, run via `BeginInvoke` so it executes
+    inside the dialog's own nested modal message loop, not only after it closes).
+  Both patches touch `MailClient.Common.UI.dll` only, chained through the same file. Verified via
+  decompile + `--dump-handlers` against all three supported eM Client builds (10.4.5674,
+  11.0.196-beta, 11.0.282) before porting — not assumed: `PopupWindowHelper.SetVisibleCore`/
+  `findParentPopupHelper` and `CommonUIUtils.ShowColorDialog` all exist with matching shapes
+  (11.0.196-beta's own `ShowColorDialog` has one extra early-return branch a `ColorPickerFactory`
+  extensibility hook adds, handled generically by making the "redirect other returns into the
+  restore block" logic apply to any `Ret` instruction in the method, not a version-specific
+  carve-out). A real bug was caught in the fix itself before it ever shipped: an early draft of
+  that same generalization accidentally swept the newly-inserted restore block's own instructions
+  into its own retargeting pass, corrupting an "ancestor == null" null-check into a
+  self-referencing infinite loop — caught by the mandatory re-decompile step, not by any static
+  check (see the findings report's own account). Deployed via a full, real `deploy.sh` run
+  (not just manual `il-patcher` invocations) against `emClient_win_7_x64_2` reset to pristine:
+  reached mask 767 (patches 1,2,3,4,6), all verification checks passed, and the resulting build
+  launched cleanly with zero new crash reports. This also surfaced and fixed a real, previously
+  latent bug in `--max-revision`'s own implementation (see the superseded note above).
 
 ## Investigation method (what actually worked this round)
 

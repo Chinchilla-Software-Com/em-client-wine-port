@@ -128,6 +128,16 @@ if (args.Length > 0 && args[0] == "--patch-http-dns-connect-callback")
     return RunPatchHttpDnsConnectCallback(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-nested-popup-owned-by-ancestor")
+{
+    return RunPatchNestedPopupOwnedByAncestor(args);
+}
+
+if (args.Length > 0 && args[0] == "--patch-colordialog-suppress-autoclose")
+{
+    return RunPatchColorDialogSuppressAutoClose(args);
+}
+
 if (args.Length > 0 && args[0] == "--patch-token-refresh-retry")
 {
     return RunPatchTokenRefreshRetry(args);
@@ -9828,6 +9838,644 @@ static int RunPatchPreviewPanePeriodicRepaint(string[] args)
 
     return 0;
 }
+
+// --patch-nested-popup-owned-by-ancestor <input-dir> <output-dir>
+//
+// Fix for a font-family dropdown list rendering UNDERNEATH an already-open sibling popup while
+// composing an email (reported via screenshot; reproduced live using a throwaway reflection-
+// based test-trigger tool, not tracked in this repo). Repro: open the "A" (font/style) toolbar
+// popup, then open its nested font-family combo dropdown -- the font-name list renders behind
+// the "A" popup's own Text Color/Background Color panel instead of on top of it.
+//
+// FOUR fixes were tried and rejected/disproven live before this one -- worth recording so none
+// gets re-tried:
+//   1. A CX_DEBUGMSG trace appeared to show Wine's own request-coalescing dropping a client
+//      raise-to-top request for the nested popup's window. Patched ComboBoxControl
+//      .ShowDropDownNormal() to re-issue SetWindowPos(popupHelper.Handle, HWND_TOP, ...)
+//      immediately after Show(): zero visible effect live.
+//   2. Assumed attempt 1's call landed inside the same coalescing window as Wine's own; deferred
+//      it onto a one-shot 100ms Timer instead. Still zero visible effect, and raw X11 sibling
+//      order (`xwininfo -root -tree`) was IDENTICAL before and after -- proving the call wasn't
+//      coalesced, it was ignored outright. Confirmed independently: even `wmctrl -i -r <id> -b
+//      add,above` (bypassing Wine/the app entirely) had no effect either, while the same tool
+//      correctly raised an unrelated ordinary window in a sanity check.
+//   3. `xwininfo -id <hwnd>` showed the real asymmetry: the outer "A" popup is
+//      `Override Redirect: yes`, the nested font-list popup is `Override Redirect: no` -- an
+//      override-redirect window bypasses the window manager entirely, which is why it always
+//      wins against a managed sibling. Hypothesized this was driven by WS_EX_TOPMOST and patched
+//      `PopupWindowHelper.CreateParams` to force it into ExStyle. Live re-test: still not
+//      override-redirect. A follow-up `CX_DEBUGMSG="+win,+x11drv"` trace proved why: both windows
+//      are created via byte-identical `NtUserCreateWindowEx` calls (same style, same ex_style
+//      0x10008 -- WS_EX_TOPMOST already included by default, same absent parent/owner) and reach
+//      byte-identical final styles once mapped -- whatever decides override-redirect for this
+//      Wine build is invisible to and unreachable from anything in the CreateWindowEx/SetWindowPos
+//      surface the app can influence.
+//   4. Given override-redirect couldn't be reached or controlled, sidestepped the stacking
+//      question by hiding the ANCESTOR popup's native window (WinApi.Win32.ShowWindow(SW_HIDE))
+//      while the nested popup was open, restoring it on close. Worked and was verified live
+//      (both the hide and the restore path), but REJECTED: the requirement is both popups
+//      genuinely on-screen together with correct stacking, not one hidden.
+//
+// REAL fix, found by looking past styling entirely at the OWNERSHIP relationship: the same
+// `CX_DEBUGMSG="+win"` trace from attempt 3 shows BOTH popups' `GWLP_HWNDPARENT` (index -8) being
+// set to a transient value (0x10254 -- some internal WinForms/ToolStripDropDown bookkeeping
+// window) and then immediately cleared back to 0 by WinForms' own code, for EITHER popup, before
+// either is ever shown. Win32 has a core, WM-independent guarantee that an OWNED window always
+// draws above its owner in the z-order -- and neither popup ends up with a real native owner at
+// all. `PopupWindowHelper.SetVisibleCore` already computes `findParentPopupHelper()` (an existing
+// private method, non-null exactly for this nested-popup case) for its own OwnerItem bookkeeping,
+// but that only affects WinForms' internal ToolStripDropDown cascade-closing logic, not the
+// native HWND owner chain -- it evidently never propagates into an actual
+// `SetWindowLongPtr(..., GWLP_HWNDPARENT, ...)` call for a nested popup owned by ANOTHER floating
+// ToolStripDropDown (as opposed to the common case of a real Form-hosted ToolStrip).
+//
+// Fix: when a popup opens and `findParentPopupHelper()` finds an ancestor, explicitly call
+// `WinApi.Win32.SetWindowLong(this.Handle, GWL.HWNDPARENT, ancestor.Handle)` (both methods
+// already exist as public wrappers in the app's own `WinApi.dll`) to establish that native owner
+// relationship ourselves. This relies on Win32's own owned-window z-order contract -- enforced by
+// Wine's window/z-order management uniformly for top-level windows, independent of whatever
+// separate, opaque mechanism decides X11 override-redirect status -- rather than trying to
+// influence or race that mechanism at all.
+//
+// `PopupWindowHelper` is the shared popup class behind every dropdown-style overlay in the app,
+// not just the font-family selector, so this fixes the same latent nested-popup stacking defect
+// for any of them -- `findParentPopupHelper()` returns null for the common, non-nested case, so
+// this is a no-op there.
+static int RunPatchNestedPopupOwnedByAncestor(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-nested-popup-owned-by-ancestor <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.Common.UI.dll";
+    const string targetType = "MailClient.Common.UI.PopupWindowHelper";
+    const int GWLP_HWNDPARENT = -8;
+    const int HWND_TOP = 0;
+    const uint SWP_NOSIZE = 0x0001;
+    const uint SWP_NOMOVE = 0x0002;
+    const uint SWP_NOACTIVATE = 0x0010;
+    const uint swpFlags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE;
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+
+        var method = type.Methods.FirstOrDefault(m => m.Name == "SetVisibleCore" && m.Parameters.Count == 1);
+        if (method is null) { Console.Error.WriteLine("FAIL: SetVisibleCore(bool) not found"); return 1; }
+
+        var findParentDef = type.Methods.FirstOrDefault(m => m.Name == "findParentPopupHelper" && m.Parameters.Count == 0);
+        if (findParentDef is null) { Console.Error.WriteLine("FAIL: findParentPopupHelper() not found"); return 1; }
+
+        MethodDefinition? FindInBaseChain(TypeDefinition start, string name, int paramCount)
+        {
+            for (var t = start; t is not null; t = t.BaseType?.Resolve())
+            {
+                var m = t.Methods.FirstOrDefault(m => m.Name == name && m.Parameters.Count == paramCount);
+                if (m is not null) return m;
+            }
+            return null;
+        }
+        var getHandleDef = FindInBaseChain(type, "get_Handle", 0);
+        if (getHandleDef is null) { Console.Error.WriteLine("FAIL: get_Handle not found in PopupWindowHelper's base chain"); return 1; }
+        var getHandleRef = module.ImportReference(getHandleDef);
+
+        var winApiAssemblyRef = module.AssemblyReferences.FirstOrDefault(a => a.Name == "WinApi");
+        if (winApiAssemblyRef is null) { Console.Error.WriteLine("FAIL: no AssemblyReference to WinApi found"); return 1; }
+        var winApiAssembly = module.AssemblyResolver.Resolve(winApiAssemblyRef);
+        var win32TypeDef = winApiAssembly.MainModule.GetType("WinApi.Win32");
+        if (win32TypeDef is null) { Console.Error.WriteLine("FAIL: WinApi.Win32 type not found"); return 1; }
+        var setWindowLongDef = win32TypeDef.Methods.FirstOrDefault(m => m.Name == "SetWindowLong" && m.Parameters.Count == 3);
+        if (setWindowLongDef is null) { Console.Error.WriteLine("FAIL: WinApi.Win32.SetWindowLong(3 args) not found"); return 1; }
+        var setWindowLongRef = module.ImportReference(setWindowLongDef);
+        // GWL is an enum (WinApi.dll) -- the SECOND parameter's type, used only to import the
+        // right overload; the actual value pushed at the call site is a plain ldc.i4 (enum
+        // parameters take their underlying integral type on the IL stack, no boxing needed for a
+        // non-boxed enum argument).
+        var setWindowPosDef = win32TypeDef.Methods.FirstOrDefault(m => m.Name == "SetWindowPos" && m.Parameters.Count == 7);
+        if (setWindowPosDef is null) { Console.Error.WriteLine("FAIL: WinApi.Win32.SetWindowPos(7 args) not found"); return 1; }
+        var setWindowPosRef = module.ImportReference(setWindowPosDef);
+
+        var body = method.Body;
+        body.SimplifyMacros();
+        var il = body.GetILProcessor();
+        var retInstruction = body.Instructions[body.Instructions.Count - 1];
+        if (retInstruction.OpCode != OpCodes.Ret)
+        {
+            Console.Error.WriteLine("FAIL: SetVisibleCore's last instruction isn't Ret -- insertion point assumption invalid, aborting");
+            return 1;
+        }
+
+        var ancestorLocal = new VariableDefinition(type);
+        method.Body.Variables.Add(ancestorLocal);
+
+        // var ancestor = findParentPopupHelper();
+        // if (ancestor != null && visible) {
+        //     WinApi.Win32.SetWindowLong(this.Handle, GWL.HWNDPARENT, ancestor.Handle);
+        //     WinApi.Win32.SetWindowPos(this.Handle, HWND_TOP, 0,0,0,0, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE);
+        // }
+        var block = new List<Instruction>
+        {
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Call, findParentDef),
+            Instruction.Create(OpCodes.Stloc, ancestorLocal),
+            Instruction.Create(OpCodes.Ldloc, ancestorLocal),
+            Instruction.Create(OpCodes.Brfalse, retInstruction),
+            Instruction.Create(OpCodes.Ldarg_1),
+            Instruction.Create(OpCodes.Brfalse, retInstruction),
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Callvirt, getHandleRef),
+            Instruction.Create(OpCodes.Ldc_I4, GWLP_HWNDPARENT),
+            Instruction.Create(OpCodes.Ldloc, ancestorLocal),
+            Instruction.Create(OpCodes.Callvirt, getHandleRef),
+            Instruction.Create(OpCodes.Call, setWindowLongRef),
+            Instruction.Create(OpCodes.Pop),
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Callvirt, getHandleRef),
+            Instruction.Create(OpCodes.Ldc_I4, HWND_TOP),
+            Instruction.Create(OpCodes.Conv_I),
+            Instruction.Create(OpCodes.Ldc_I4_0),
+            Instruction.Create(OpCodes.Ldc_I4_0),
+            Instruction.Create(OpCodes.Ldc_I4_0),
+            Instruction.Create(OpCodes.Ldc_I4_0),
+            Instruction.Create(OpCodes.Ldc_I4, unchecked((int)swpFlags)),
+            Instruction.Create(OpCodes.Call, setWindowPosRef),
+            Instruction.Create(OpCodes.Pop)
+        };
+        var firstNew = block[0];
+        var newInstructionSet = new HashSet<Instruction>(block);
+        foreach (var i in block) { il.InsertBefore(retInstruction, i); }
+
+        // Retarget any PRE-EXISTING branch/handler boundary pointing at the original `ret` to the
+        // new block's first instruction instead (lessons 2 and 18), excluding our own new
+        // instructions (two of which deliberately target retInstruction themselves, for the
+        // "ancestor == null" / "!visible" skip cases -- lesson learned the hard way on the
+        // previous hide-ancestor attempt: including the new block here corrupts those into a
+        // self-referencing loop instead of a skip).
+        foreach (var instr in body.Instructions)
+        {
+            if (newInstructionSet.Contains(instr)) continue;
+            if (instr.Operand is Instruction target && target == retInstruction)
+            {
+                instr.Operand = firstNew;
+            }
+        }
+        foreach (var handler in body.ExceptionHandlers)
+        {
+            if (handler.TryStart == retInstruction) handler.TryStart = firstNew;
+            if (handler.TryEnd == retInstruction) handler.TryEnd = firstNew;
+            if (handler.HandlerStart == retInstruction) handler.HandlerStart = firstNew;
+            if (handler.HandlerEnd == retInstruction) handler.HandlerEnd = firstNew;
+        }
+
+        // The method also has an EARLIER `ret` of its own (an early-return null-event-handler
+        // guard reached when visible==true) that returns directly rather than merely branching to
+        // the final `ret` -- redirect it into a `br firstNew` too, so that runtime path also
+        // establishes the owner relationship rather than skipping it (the DesignMode early return
+        // is included too: sourceControl is null at design time, so findParentPopupHelper()
+        // immediately returns null there and the new block's own null-check sends execution
+        // straight back out without ever reaching the SetWindowLong call -- both `ret` and `br`
+        // require/leave an empty evaluation stack, so the substitution is stack-neutral).
+        foreach (var instr in body.Instructions.ToList())
+        {
+            if (newInstructionSet.Contains(instr)) continue;
+            if (instr == retInstruction) continue;
+            if (instr.OpCode == OpCodes.Ret)
+            {
+                instr.OpCode = OpCodes.Br;
+                instr.Operand = firstNew;
+            }
+        }
+
+        Console.WriteLine($"OK   {fileName}: {targetType}.SetVisibleCore(bool) -- when a popup nested inside an ancestor PopupWindowHelper becomes visible, establishes a real native owner relationship (WinApi.Win32.SetWindowLong(GWL.HWNDPARENT)) with that ancestor, then re-issues SetWindowPos(HWND_TOP,...) so Wine's z-order enforcement reconciles against the now-current owner rather than leftover pre-ownership state");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
+// --patch-colordialog-suppress-autoclose <input-dir> <output-dir>
+//
+// Fix for a font/style toolbar popup (and any other ToolStripDropDown-hosted color picker in the
+// app) closing outright the instant its "Custom colour..." link opens the standard Windows
+// ColorDialog, instead of staying open in the background the way it does on real Windows
+// (confirmed via a user-supplied reference screenshot from a real-Windows session showing both
+// the popup and the ColorDialog visible together at once -- same app, different theme).
+//
+// Root cause, found by reading (not guessing at) System.Windows.Forms' own source via decompile:
+// EVERY open ToolStripDropDown is auto-closed by a single, global, always-installed
+// `ToolStripManager.ModalMenuFilter.PreFilterMessage` IMessageFilter, which calls
+// `PInvoke.GetActiveWindow()` on every pumped message and, whenever the active window changes,
+// closes the currently-open dropdown chain via `ProcessActivationChange()` UNLESS the newly
+// active window is recognised as belonging to that same dropdown's own window hierarchy
+// (`IsChildOrSameWindow` against the dropdown's own hwnd and Wine's `ActiveHwnd` tracking) --
+// this is a real, undocumented-outside-the-BCL-source mechanism, not something guessed at. A
+// `ColorDialog.ShowDialog(owner)` call passes a CHILD CONTROL of the popup as owner; on real
+// Windows the OS resolves that into a genuine native owner relationship with the popup's own
+// top-level window automatically, so `IsChildOrSameWindow` recognises it and
+// `ProcessActivationChange()` never even fires. Under Wine, the SAME class of owner-chain
+// recognition gap already found and fixed for nested-popup stacking earlier this session (see
+// --patch-nested-popup-owned-by-ancestor's own doc comment) means the dialog's window isn't
+// recognised as belonging to the popup's hierarchy, `ProcessActivationChange()` DOES fire, and --
+// crucially -- `ProcessActivationChange()`'s own source shows it explicitly SKIPS closing any
+// dropdown whose `AutoClose` property is `false`
+// (`if (GetActiveToolStripInternal() is ToolStripDropDown { AutoClose: not false } d) d.Visible
+// = false;`). Toggling `AutoClose` off for the duration of a self-spawned dialog and back on
+// afterward is WinForms' own sanctioned mechanism for exactly this scenario (documented in
+// Microsoft's own ToolStripDropDown samples) -- real Windows just doesn't need it here because
+// its owner-chain resolution already succeeds; this app's own code never needed to reach for it
+// before, since nothing else it does from inside a popup spawns a real modal dialog.
+//
+// Every "Custom colour..." click handler across the app (`ControlFontSelect.
+// controlColorSelect_CustomTextColor_Clicked`/`_CustomBackColor_Clicked`, `ControlFontColorSelect
+// .controlColorSelect_CustomBackColor_Clicked`, plus several MailClient.dll callers unrelated to
+// any popup -- Settings/Category/theme forms, which have no ToolStripDropDown ancestor to begin
+// with) funnels through one shared entry point, `CommonUIUtils.ShowColorDialog`, so the fix goes
+// there rather than at each individual call site: finds the caller's ancestor PopupWindowHelper
+// (if any -- null, a no-op, for every non-popup caller) via a new PUBLIC STATIC method added to
+// `PopupWindowHelper` (`FindAncestorPopupWindowHelper(Control)`), sets `AutoClose = false` on it
+// before showing the dialog, and restores `AutoClose = true` right before the method's own single
+// return (confirmed via decompile: this method has exactly one `ret`, no early-return branches,
+// so no lesson-2/18-style retargeting is needed for the restore call to be unconditionally
+// reached). The new `FindAncestorPopupWindowHelper` is a plain ADDITIVE public static method
+// (lesson 10's "add alongside, don't mutate an existing member" pattern) replicating the exact
+// same upward-parent-chain walk `PopupWindowHelper`'s own private, instance-scoped
+// `findParentPopupHelper()` already uses (kept untouched) -- just parameterised on an explicit
+// starting Control instead of the instance's own `sourceControl` field, so `CommonUIUtils` (a
+// different, unrelated static class in the same assembly) can call it for an arbitrary `owner`
+// control without needing reflection or widening any existing member's accessibility.
+//
+// AutoClose alone is NOT sufficient -- confirmed live via a throwaway reflection-based diagnostic
+// trigger (not tracked in this repo): with only the AutoClose suppression above, the ancestor
+// popup's `Visible` property correctly stayed `true` and its native window stayed mapped
+// (`xwininfo`'s Map State: IsViewable) for the whole time the dialog was open, yet it rendered
+// completely blank in a live screenshot -- a SEPARATE paint/stacking symptom, not the close bug.
+// Fixed by adding a second new method, `PopupWindowHelper.RepaintAndRestackForSpawnedDialog()`
+// (`Invalidate(true)`, `Update()`, then a plain `WinApi.Win32.SetWindowPos(Handle, HWND_TOP,
+// 0,0,0,0, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE)`), and having `ShowColorDialog` queue it via
+// `ancestor.BeginInvoke((Action)ancestor.RepaintAndRestackForSpawnedDialog)` immediately after
+// suppressing AutoClose, BEFORE calling `colorDialog.ShowDialog(owner)`. This relies on a
+// confirmed-live behavior: a `BeginInvoke` posted just before a blocking `ShowDialog()` call
+// still gets processed by that dialog's own nested modal message loop once it starts pumping,
+// not only after the dialog closes -- the same mechanism this session's own diagnostic tooling
+// used to interact with the app while a modal dialog it opened was still on screen. Verified live
+// end-to-end: both AutoClose suppression alone (dialog opens, ancestor logically stays open but
+// invisible) and the full fix together (ancestor visibly renders alongside the dialog, matching a
+// user-supplied real-Windows reference screenshot) were screenshotted and compared before this
+// was folded into one patch.
+static int RunPatchColorDialogSuppressAutoClose(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-colordialog-suppress-autoclose <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.Common.UI.dll";
+    const string popupHelperTypeName = "MailClient.Common.UI.PopupWindowHelper";
+    const string commonUIUtilsTypeName = "MailClient.Common.UI.CommonUIUtils";
+
+    var allDlls = Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly);
+    bool patched = false;
+
+    foreach (var dllPath in allDlls)
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters
+        {
+            AssemblyResolver = resolver,
+            ReadWrite = false
+        });
+
+        var popupHelperType = module.GetType(popupHelperTypeName);
+        if (popupHelperType is null) { Console.Error.WriteLine($"FAIL: type not found: {popupHelperTypeName}"); return 1; }
+        var commonUIUtilsType = module.GetType(commonUIUtilsTypeName);
+        if (commonUIUtilsType is null) { Console.Error.WriteLine($"FAIL: type not found: {commonUIUtilsTypeName}"); return 1; }
+
+        var showColorDialogMethod = commonUIUtilsType.Methods.FirstOrDefault(m => m.Name == "ShowColorDialog");
+        if (showColorDialogMethod is null) { Console.Error.WriteLine("FAIL: ShowColorDialog not found"); return 1; }
+
+        MethodDefinition? FindInBaseChain(TypeDefinition start, string name, int paramCount)
+        {
+            for (var t = start; t is not null; t = t.BaseType?.Resolve())
+            {
+                var m = t.Methods.FirstOrDefault(m => m.Name == name && m.Parameters.Count == paramCount);
+                if (m is not null) return m;
+            }
+            return null;
+        }
+        var controlTypeDef = FindInBaseChain(popupHelperType, "get_Parent", 0)?.DeclaringType;
+        if (controlTypeDef is null) { Console.Error.WriteLine("FAIL: couldn't resolve System.Windows.Forms.Control via get_Parent"); return 1; }
+        var getParentDef = controlTypeDef.Methods.First(m => m.Name == "get_Parent");
+        var getParentRef = module.ImportReference(getParentDef);
+        var controlTypeRef = module.ImportReference(controlTypeDef);
+
+        var setAutoCloseDef = FindInBaseChain(popupHelperType, "set_AutoClose", 1);
+        if (setAutoCloseDef is null) { Console.Error.WriteLine("FAIL: set_AutoClose not found in PopupWindowHelper's base chain"); return 1; }
+        var setAutoCloseRef = module.ImportReference(setAutoCloseDef);
+
+        // Additional members needed for the repaint+restack half of the fix (see doc comment):
+        // AutoClose=false alone keeps the ancestor popup logically Visible/open (confirmed live),
+        // but it still renders visually blank once Wine hands "active window" status to the
+        // spawned dialog -- confirmed live via a throwaway reflection-based diagnostic trigger
+        // (not tracked in this repo) that this is a SEPARATE paint/stacking symptom, fixed by
+        // forcing a real repaint (Invalidate(true)+Update()) plus a plain SetWindowPos(HWND_TOP)
+        // restack, run via BeginInvoke so it executes once the dialog's own nested modal message
+        // loop starts pumping (confirmed live: a BeginInvoke posted just before ShowDialog() is
+        // reliably processed WHILE the modal dialog is still showing, not only after it closes).
+        var getHandleDef = FindInBaseChain(popupHelperType, "get_Handle", 0);
+        if (getHandleDef is null) { Console.Error.WriteLine("FAIL: get_Handle not found in PopupWindowHelper's base chain"); return 1; }
+        var getHandleRef = module.ImportReference(getHandleDef);
+        // Control declares TWO 1-parameter Invalidate overloads (bool, and Region) -- match on
+        // the parameter's type name too, not just the count, or this silently binds to the wrong
+        // one (hit for real: FindInBaseChain(_, "Invalidate", 1) picked Invalidate(Region) here
+        // first, producing a Ldc_I4_1/Region type mismatch the decompiler flagged as "IL_0007:
+        // Expected O, but got I4" -- an invalid-IL bug caught only by re-decompiling, never by
+        // scan mode or a clean build).
+        MethodDefinition? invalidateDef = null;
+        for (var t = popupHelperType; t is not null && invalidateDef is null; t = t.BaseType?.Resolve())
+        {
+            invalidateDef = t.Methods.FirstOrDefault(m => m.Name == "Invalidate" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.Boolean");
+        }
+        if (invalidateDef is null) { Console.Error.WriteLine("FAIL: Invalidate(bool) not found in PopupWindowHelper's base chain"); return 1; }
+        var invalidateRef = module.ImportReference(invalidateDef);
+        var updateDef = FindInBaseChain(popupHelperType, "Update", 0);
+        if (updateDef is null) { Console.Error.WriteLine("FAIL: Update() not found in PopupWindowHelper's base chain"); return 1; }
+        var updateRef = module.ImportReference(updateDef);
+        var beginInvokeDef = FindInBaseChain(popupHelperType, "BeginInvoke", 1);
+        // Control declares three BeginInvoke overloads with 1 parameter (Delegate, Action, and
+        // the 2-param Delegate+args form doesn't match here) -- pick the one whose parameter type
+        // is exactly "Action" to avoid binding to the plain Delegate overload instead.
+        if (beginInvokeDef is null || beginInvokeDef.Parameters[0].ParameterType.Name != "Action")
+        {
+            beginInvokeDef = null;
+            for (var t = popupHelperType; t is not null && beginInvokeDef is null; t = t.BaseType?.Resolve())
+            {
+                beginInvokeDef = t.Methods.FirstOrDefault(m => m.Name == "BeginInvoke" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "Action");
+            }
+        }
+        if (beginInvokeDef is null) { Console.Error.WriteLine("FAIL: BeginInvoke(Action) overload not found in PopupWindowHelper's base chain"); return 1; }
+        var beginInvokeRef = module.ImportReference(beginInvokeDef);
+
+        var winApiAssemblyRef = module.AssemblyReferences.FirstOrDefault(a => a.Name == "WinApi");
+        if (winApiAssemblyRef is null) { Console.Error.WriteLine("FAIL: no AssemblyReference to WinApi found"); return 1; }
+        var winApiAssembly = module.AssemblyResolver.Resolve(winApiAssemblyRef);
+        var win32TypeDef = winApiAssembly.MainModule.GetType("WinApi.Win32");
+        if (win32TypeDef is null) { Console.Error.WriteLine("FAIL: WinApi.Win32 type not found"); return 1; }
+        var setWindowPosDef = win32TypeDef.Methods.FirstOrDefault(m => m.Name == "SetWindowPos" && m.Parameters.Count == 7);
+        if (setWindowPosDef is null) { Console.Error.WriteLine("FAIL: WinApi.Win32.SetWindowPos(7 args) not found"); return 1; }
+        var setWindowPosRef = module.ImportReference(setWindowPosDef);
+
+        var actionCtorRef = module.ImportReference(typeof(Action).GetConstructor(new[] { typeof(object), typeof(IntPtr) })!);
+
+        // --- New method: public void RepaintAndRestackForSpawnedDialog()
+        //     Invalidate(true); Update();
+        //     WinApi.Win32.SetWindowPos(Handle, HWND_TOP, 0,0,0,0, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE);
+        const int HWND_TOP = 0;
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOMOVE = 0x0002;
+        const uint SWP_NOACTIVATE = 0x0010;
+        const uint swpFlags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE;
+
+        var repaintMethod = new MethodDefinition(
+            "RepaintAndRestackForSpawnedDialog",
+            MethodAttributes.Public | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        popupHelperType.Methods.Add(repaintMethod);
+        var rmIl = repaintMethod.Body.GetILProcessor();
+        rmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        rmIl.Append(Instruction.Create(OpCodes.Ldc_I4_1));
+        rmIl.Append(Instruction.Create(OpCodes.Callvirt, invalidateRef));
+        rmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        rmIl.Append(Instruction.Create(OpCodes.Callvirt, updateRef));
+        rmIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        rmIl.Append(Instruction.Create(OpCodes.Callvirt, getHandleRef));
+        rmIl.Append(Instruction.Create(OpCodes.Ldc_I4, HWND_TOP));
+        rmIl.Append(Instruction.Create(OpCodes.Conv_I));
+        rmIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+        rmIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+        rmIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+        rmIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+        rmIl.Append(Instruction.Create(OpCodes.Ldc_I4, unchecked((int)swpFlags)));
+        rmIl.Append(Instruction.Create(OpCodes.Call, setWindowPosRef));
+        rmIl.Append(Instruction.Create(OpCodes.Pop));
+        rmIl.Append(Instruction.Create(OpCodes.Ret));
+
+        // --- New method: public static PopupWindowHelper? FindAncestorPopupWindowHelper(Control? start)
+        //     PopupWindowHelper? result = null;
+        //     Control? parent = start;
+        //     while (parent != null && parent.Parent != null)
+        //     {
+        //         parent = parent.Parent;
+        //         if (parent is PopupWindowHelper p) result = p;
+        //     }
+        //     return result;
+        var findMethod = new MethodDefinition(
+            "FindAncestorPopupWindowHelper",
+            MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
+            popupHelperType);
+        findMethod.Parameters.Add(new ParameterDefinition("start", ParameterAttributes.None, controlTypeRef));
+        var resultLocal = new VariableDefinition(popupHelperType);
+        var parentLocal = new VariableDefinition(controlTypeRef);
+        findMethod.Body.Variables.Add(resultLocal);
+        findMethod.Body.Variables.Add(parentLocal);
+        popupHelperType.Methods.Add(findMethod);
+
+        // Every branch target below is a bare Nop with zero stack effect (IL-patching lesson 8:
+        // never reuse a real load/side-effecting instruction as a join point multiple paths
+        // converge on) -- caught and fixed in this exact method during authoring, before ever
+        // building it: an earlier draft reused `Ldloc parentLocal` itself as two of these labels,
+        // which would have left a stray leftover value on the stack every time the null-cast
+        // branch was taken.
+        var fIl = findMethod.Body.GetILProcessor();
+        var loopBody = Instruction.Create(OpCodes.Nop);
+        var skipAssign = Instruction.Create(OpCodes.Nop);
+        var afterAssign = Instruction.Create(OpCodes.Nop);
+        var loopCheck = Instruction.Create(OpCodes.Nop);
+        var loopEnd = Instruction.Create(OpCodes.Nop);
+
+        // result = null; parent = start;
+        fIl.Append(Instruction.Create(OpCodes.Ldnull));
+        fIl.Append(Instruction.Create(OpCodes.Stloc, resultLocal));
+        fIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        fIl.Append(Instruction.Create(OpCodes.Stloc, parentLocal));
+        fIl.Append(Instruction.Create(OpCodes.Br, loopCheck));
+
+        // loopBody: parent = parent.Parent;
+        fIl.Append(loopBody);
+        fIl.Append(Instruction.Create(OpCodes.Ldloc, parentLocal));
+        fIl.Append(Instruction.Create(OpCodes.Callvirt, getParentRef));
+        fIl.Append(Instruction.Create(OpCodes.Stloc, parentLocal));
+
+        // if (parent is PopupWindowHelper) result = (PopupWindowHelper)parent;
+        // Isinst leaves exactly one value (the cast result, or null) on the stack; Dup+Brfalse
+        // consumes one copy to test, always leaving exactly one more to either Stloc (non-null
+        // path) or Pop (null path) -- both paths consume precisely the one leftover value.
+        fIl.Append(Instruction.Create(OpCodes.Ldloc, parentLocal));
+        fIl.Append(Instruction.Create(OpCodes.Isinst, popupHelperType));
+        fIl.Append(Instruction.Create(OpCodes.Dup));
+        fIl.Append(Instruction.Create(OpCodes.Brfalse, skipAssign));
+        fIl.Append(Instruction.Create(OpCodes.Stloc, resultLocal));
+        fIl.Append(Instruction.Create(OpCodes.Br, afterAssign));
+        fIl.Append(skipAssign);
+        fIl.Append(Instruction.Create(OpCodes.Pop));
+        fIl.Append(afterAssign);
+
+        // loopCheck: while (parent != null && parent.Parent != null) goto loopBody;
+        fIl.Append(loopCheck);
+        fIl.Append(Instruction.Create(OpCodes.Ldloc, parentLocal));
+        fIl.Append(Instruction.Create(OpCodes.Brfalse, loopEnd));
+        fIl.Append(Instruction.Create(OpCodes.Ldloc, parentLocal));
+        fIl.Append(Instruction.Create(OpCodes.Callvirt, getParentRef));
+        fIl.Append(Instruction.Create(OpCodes.Brtrue, loopBody));
+
+        fIl.Append(loopEnd);
+        fIl.Append(Instruction.Create(OpCodes.Ldloc, resultLocal));
+        fIl.Append(Instruction.Create(OpCodes.Ret));
+
+        var findMethodRef = findMethod; // same module, no import needed
+
+        // --- Patch ShowColorDialog: suppress/restore AutoClose around the existing body.
+        var body = showColorDialogMethod.Body;
+        body.SimplifyMacros();
+        var il = body.GetILProcessor();
+        var firstInstruction = body.Instructions[0];
+        var retInstruction = body.Instructions[body.Instructions.Count - 1];
+        if (retInstruction.OpCode != OpCodes.Ret)
+        {
+            Console.Error.WriteLine("FAIL: ShowColorDialog's last instruction isn't Ret -- insertion point assumption invalid, aborting");
+            return 1;
+        }
+
+        var ancestorLocal = new VariableDefinition(popupHelperType);
+        body.Variables.Add(ancestorLocal);
+
+        // ancestor = PopupWindowHelper.FindAncestorPopupWindowHelper(owner as Control);
+        // if (ancestor != null) {
+        //     ancestor.AutoClose = false;
+        //     ancestor.BeginInvoke((Action)ancestor.RepaintAndRestackForSpawnedDialog);
+        // }
+        var startBlock = new List<Instruction>
+        {
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Isinst, controlTypeRef),
+            Instruction.Create(OpCodes.Call, findMethodRef),
+            Instruction.Create(OpCodes.Stloc, ancestorLocal),
+            Instruction.Create(OpCodes.Ldloc, ancestorLocal)
+        };
+        var afterSuppress = Instruction.Create(OpCodes.Nop);
+        startBlock.Add(Instruction.Create(OpCodes.Brfalse, afterSuppress));
+        startBlock.Add(Instruction.Create(OpCodes.Ldloc, ancestorLocal));
+        startBlock.Add(Instruction.Create(OpCodes.Ldc_I4_0));
+        startBlock.Add(Instruction.Create(OpCodes.Callvirt, setAutoCloseRef));
+        startBlock.Add(Instruction.Create(OpCodes.Ldloc, ancestorLocal));
+        startBlock.Add(Instruction.Create(OpCodes.Ldloc, ancestorLocal));
+        startBlock.Add(Instruction.Create(OpCodes.Ldftn, repaintMethod));
+        startBlock.Add(Instruction.Create(OpCodes.Newobj, actionCtorRef));
+        startBlock.Add(Instruction.Create(OpCodes.Callvirt, beginInvokeRef));
+        startBlock.Add(Instruction.Create(OpCodes.Pop));
+        startBlock.Add(afterSuppress);
+        foreach (var i in startBlock) { il.InsertBefore(firstInstruction, i); }
+
+        // if (ancestor != null) ancestor.AutoClose = true;   (right before the existing final ret)
+        var afterRestore = Instruction.Create(OpCodes.Nop);
+        var endBlock = new List<Instruction>
+        {
+            Instruction.Create(OpCodes.Ldloc, ancestorLocal),
+            Instruction.Create(OpCodes.Brfalse, afterRestore),
+            Instruction.Create(OpCodes.Ldloc, ancestorLocal),
+            Instruction.Create(OpCodes.Ldc_I4_1),
+            Instruction.Create(OpCodes.Callvirt, setAutoCloseRef),
+            afterRestore
+        };
+        var firstRestore = endBlock[0];
+        var restoreInstructionSet = new HashSet<Instruction>(endBlock);
+        foreach (var i in endBlock) { il.InsertBefore(retInstruction, i); }
+
+        // v11.0.196-beta's own ShowColorDialog gained a SECOND, EARLIER `ret` not present in
+        // 10.4.5674's copy (a new `if (ColorPickerFactory != null) { ...; return dialogResult; }`
+        // extensibility hook checked before the classic ColorDialog path -- confirmed via
+        // --dump-il, not assumed from the decompile alone) -- redirect any such early `ret` (any
+        // Ret other than the final one, and other than our own newly-inserted instructions) into
+        // a `Br` to the restore block, exactly the same "every real exit path must still run the
+        // restore" treatment already proven for PopupWindowHelper.SetVisibleCore's own multiple
+        // early returns. Confirmed via --dump-il that this early ret sits before the `using
+        // ColorDialog` block even begins, so it's outside any exception-handler region -- safe to
+        // retarget without touching handler boundaries (lessons 3/18 don't apply here).
+        foreach (var instr in body.Instructions.ToList())
+        {
+            if (restoreInstructionSet.Contains(instr)) continue;
+            if (instr == retInstruction) continue;
+            if (instr.OpCode == OpCodes.Ret)
+            {
+                instr.OpCode = OpCodes.Br;
+                instr.Operand = firstRestore;
+            }
+        }
+
+        Console.WriteLine($"OK   {fileName}: added {popupHelperTypeName}.FindAncestorPopupWindowHelper(Control) and .RepaintAndRestackForSpawnedDialog(), and patched {commonUIUtilsTypeName}.ShowColorDialog to suppress AutoClose on the caller's ancestor PopupWindowHelper (if any) for the duration of the dialog (works around ModalMenuFilter.ProcessActivationChange() closing the popup) and to queue a repaint+restack via BeginInvoke so the popup actually renders while the dialog is up, not just stays logically Visible");
+        patched = true;
+
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
+
+    return 0;
+}
+
 
 // --patch-http-dns-connect-callback <input-dir> <mailclient-wine-dll-path> <output-dir>
 //

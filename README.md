@@ -49,11 +49,11 @@ for both and tells you how to install whichever is missing.
 
 ## eM Client 10
 
-`releases/10.4.5674/deploy.sh` groups its fixes into 5 numbered **patches** — patch 5 is
-optional, patches 1–4 are applied by default. A patch is a curated bundle of one or more related
-fixes (e.g. patch 1 bundles every "tofu box" icon/font glyph fix together); the table below shows
-which bugs each patch covers. Use `--patches N` to apply one targeted patch on its own (e.g.
-`--patches 5` to add just the Exchange sync-freeze fix to an already-patched bottle), or
+`releases/10.4.5674/deploy.sh` groups its fixes into 6 numbered **patches** — patch 5 is
+optional, patches 1–4 and 6 are applied by default. A patch is a curated bundle of one or more
+related fixes (e.g. patch 1 bundles every "tofu box" icon/font glyph fix together); the table
+below shows which bugs each patch covers. Use `--patches N` to apply one targeted patch on its own
+(e.g. `--patches 5` to add just the Exchange sync-freeze fix to an already-patched bottle), or
 `--patches 1,3` for several at once — see `./deploy.sh --help`.
 
 | Patch # | Bug | Root cause | Report |
@@ -67,6 +67,8 @@ which bugs each patch covers. Use `--patches N` to apply one targeted patch on i
 | 3 | License Activation silently failed (spinner, then nothing) | RSA-OAEP decrypt fails inside Wine's `bcrypt.dll`/GnuTLS backend | [license-activation-oaep-findings.md](reports/license-activation-oaep-findings.md) |
 | 4 | New-mail notification toast didn't display correctly until it faded out — invisible text/icons, no hover-pause, unclickable icons | `this` form's own window doesn't reliably paint or receive input under Wine; content only ever appeared during the fade animation ticks | [notification-empty-until-fade-findings.md](reports/notification-empty-until-fade-findings.md) |
 | **5 (optional)** | Severe, recurring multi-minute freezes during Exchange sync, especially while composing/replying | Wine can't honor async DNS lookup cancellation, so two fully-synchronous, UI-thread-reachable sync entry points could each block for a 20s completion-port fallback | [exchange-sync-freeze-findings.md](reports/exchange-sync-freeze-findings.md) |
+| 6 | Font-family dropdown (and other nested combo dropdowns) rendered underneath its own parent popup | Wine never establishes a real native window-owner relationship the app's popup code asks for; fixed by asserting it explicitly instead | [floating-popup-zorder-findings.md](reports/floating-popup-zorder-findings.md) |
+| 6 | Opening the standard color picker from inside a floating popup closed the popup instead of leaving it open behind the dialog | A global WinForms filter auto-closes any popup it doesn't recognize as owning the newly-active window — same root cause as the dropdown bug above | [floating-popup-zorder-findings.md](reports/floating-popup-zorder-findings.md) |
 | — (`--install-associations`) | Docx attachments (and other extensions) wouldn't open — "no Windows program configured" | Fresh CrossOver bottles ship no file-type association for most attachment extensions (not an eM Client bug) | [office-file-associations-findings.md](reports/office-file-associations-findings.md) |
 
 All confirmed fixed and working, tested across Windows 7/8/10/11 CrossOver bottles. Patch 5 is
@@ -105,10 +107,10 @@ eM Client 11 ships as an MSIX package, which CrossOver/Wine can't install direct
 Identical flag set to the 10.4.5674 script above, file-associations flags included — `--bottle`,
 `--list`, `-y`/`--yes`, `--force`, `--max-revision N`, `--patches LIST`, `--install-fonts`,
 `--no-fonts`, `--install-associations`, `--no-associations`, `--force-associations`,
-`--wine-manager crossover|bottles`, `-h`/`--help` all work identically, same 5-patch shape as the
-10.4.5674 script (patches 1–4 mandatory, patch 5 optional) — though which bugs land in which
-patch number is its own, independently-curated grouping (see the table below), not the same
-numbering as the 10.4.5674 script's own patches.
+`--wine-manager crossover|bottles`, `-h`/`--help` all work identically, same 6-patch shape as the
+10.4.5674 script (patches 1–4 and 6 mandatory, patch 5 optional) — though which bugs land in
+which patch number is its own, independently-curated grouping (see the table below), not the
+same numbering as the 10.4.5674 script's own patches.
 
 | Patch # | Bug | Root cause | Report |
 |---|---|---|---|
@@ -118,6 +120,8 @@ numbering as the 10.4.5674 script's own patches.
 | 4 | New-mail notification toast empty until fade | Same bug and same fix as the 10.4.5674 fix above; two of the seven sub-fixes needed real adaptation for structural changes in this build | [emclient11-notification-empty-until-fade-findings.md](reports/emclient11-notification-empty-until-fade-findings.md) |
 | **5 (optional)** | Severe, recurring multi-minute freezes during Exchange sync | Same bug and same fix as the 10.4.5674 fix above — confirmed identical, applied completely unmodified, no adaptation needed | [exchange-sync-freeze-findings.md](reports/exchange-sync-freeze-findings.md) |
 | **5 (optional)** | Freezes syncing Microsoft 365 / Graph API accounts specifically (a different bug from the classic IMAP/EWS freeze above) | Same underlying Wine DNS defect, hit through `HttpClient`'s own connection path instead, plus a second hang in socket send/receive | [emclient11-msgraph-sync-freeze-findings.md](reports/emclient11-msgraph-sync-freeze-findings.md) |
+| 6 | Font-family dropdown (and other nested combo dropdowns) rendered underneath its own parent popup | Wine never establishes a real native window-owner relationship the app's popup code asks for; fixed by asserting it explicitly instead | [floating-popup-zorder-findings.md](reports/floating-popup-zorder-findings.md) |
+| 6 | Opening the standard color picker from inside a floating popup closed the popup instead of leaving it open behind the dialog | A global WinForms filter auto-closes any popup it doesn't recognize as owning the newly-active window — same root cause as the dropdown bug above | [floating-popup-zorder-findings.md](reports/floating-popup-zorder-findings.md) |
 
 Patch 5 bundles both sync-freeze fixes together — they're decided and applied as one unit
 (`--patches 5` includes both; there's no way to request just one).

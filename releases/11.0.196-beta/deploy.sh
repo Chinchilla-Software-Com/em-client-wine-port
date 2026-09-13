@@ -36,8 +36,10 @@
 #                                   default to NOT included; use --patches (below) to include it
 #                                   non-interactively instead.
 #   ./deploy.sh --force             skip the "already patched, nothing to do" short-circuit
-#   ./deploy.sh --max-revision N    cap the MANDATORY patches at patch N (0..4) instead of this
-#                                   script's own latest mandatory patch (PIPELINE_LATEST_PATCH).
+#   ./deploy.sh --max-revision N    cap the MANDATORY patches at patch N (0..6) instead of this
+#                                   script's own latest mandatory patch (PIPELINE_LATEST_PATCH) --
+#                                   patch 5 is optional and sits below patch 6 in number, so
+#                                   --max-revision never implies it either way regardless of N.
 #                                   Purely about the mandatory patches -- to include or exclude the
 #                                   optional patch 5, use --patches instead; the two flags are
 #                                   mutually exclusive. Useful for reverting a bottle to an earlier,
@@ -134,7 +136,7 @@ declare -A OUR_RELEASE_NUMBER_FOR_VERSION=( ["11.0.196"]=5 ["11.0.282"]=4 )
 # Deliberately no migration from the older, pre-bitmask linear-count scheme this same marker
 # field used to hold -- see the header comment's own note. A bottle patched by an older script
 # needs a pristine reset before this version touches it.
-declare -A STAGE_BIT=( [1]=1 [2]=2 [3]=4 [4]=8 [6]=32 [7]=64 )
+declare -A STAGE_BIT=( [1]=1 [2]=2 [3]=4 [4]=8 [6]=32 [7]=64 [8]=128 )
 
 # PATCH is the externally-facing unit -- what --patches/--max-revision take, what README.md's
 # patch table documents, what a user thinks of as "patch N". It's a curated, THEMATIC grouping of
@@ -149,18 +151,26 @@ declare -A STAGE_BIT=( [1]=1 [2]=2 [3]=4 [4]=8 [6]=32 [7]=64 )
 #   4 = stage 3         (notification toast -- same family as the sibling's patch 4)
 #   5 = stages 6, 7     (both sync-freeze fixes, grouped together -- OPTIONAL, see their own
 #                        section further down)
+#   6 = stage  8        (floating-popup Z-order fixes: nested combo dropdowns, spawned dialogs --
+#                        same family as the 10.4.5674 sibling's own patch 6; see
+#                        reports/floating-popup-zorder-findings.md)
 declare -A PATCH_STAGES=(
     [1]="2"
     [2]="4"
     [3]="1"
     [4]="3"
     [5]="6 7"
+    [6]="8"
 )
 # Highest MANDATORY patch number this script builds by default -- shared across every supported
 # eM Client version above. This (not OUR_RELEASE_NUMBER_FOR_VERSION) is what controls how far a
-# fresh deploy goes absent any opt-in, unrelated to which eM Client build it's on.
-PIPELINE_LATEST_PATCH=4
-MANDATORY_PATCHES=(1 2 3 4)
+# fresh deploy goes absent any opt-in, unrelated to which eM Client build it's on. Patch 5 (sync-
+# freeze fixes) sits BELOW this as a deliberate gap -- it's OPTIONAL, not part of the mandatory
+# chain despite its number being lower than this constant. Always consult MANDATORY_PATCHES
+# (below), never assume "1..PIPELINE_LATEST_PATCH" is a contiguous mandatory range -- it isn't,
+# on purpose.
+PIPELINE_LATEST_PATCH=6
+MANDATORY_PATCHES=(1 2 3 4 6)
 
 MANDATORY_MASK=0
 for _p in "${MANDATORY_PATCHES[@]}"; do
@@ -235,7 +245,12 @@ if [[ -n "$MAX_REVISION" ]]; then
     [[ "$MAX_REVISION" =~ ^[0-9]+$ ]] || die "--max-revision must be a non-negative integer, got: $MAX_REVISION"
     [[ "$MAX_REVISION" -ge 0 && "$MAX_REVISION" -le "$PIPELINE_LATEST_PATCH" ]] || die "--max-revision must be between 0 and $PIPELINE_LATEST_PATCH (the mandatory patches only -- use --patches to include the optional patch 5), got: $MAX_REVISION"
     MANDATORY_TARGET_MASK=0
-    for _p in $(seq 1 "$MAX_REVISION"); do
+    # Filter MANDATORY_PATCHES itself, not a blind `seq 1 N` -- MANDATORY_PATCHES has a
+    # deliberate gap at 5 (the optional sync-freeze fixes), so a contiguous seq would silently
+    # sweep patch 5 in the moment N reaches past it (same fix applied to the 10.4.5674 sibling
+    # script when it hit this exact issue adding its own patch 6).
+    for _p in "${MANDATORY_PATCHES[@]}"; do
+        (( _p <= MAX_REVISION )) || continue
         for _s in ${PATCH_STAGES[$_p]}; do MANDATORY_TARGET_MASK=$(( MANDATORY_TARGET_MASK | STAGE_BIT[$_s] )); done
     done
     unset _p _s
@@ -1115,6 +1130,51 @@ else
     MAILCLIENT_WINE_DLL_OVERRIDE=""
 fi
 
+# ---------------------------------------------------------------------------
+# Stage 8 (patch 6, MANDATORY): floating-popup Z-order fixes under Wine -- two related but
+# independent bugs found via live user reports, both root-caused to the same underlying class of
+# defect (Wine failing to recognise a real native window-owner relationship the app's own popup
+# code correctly asks for), fixed together since they're always deployed as one unit. Same fix,
+# same two --patch- flags, as the 10.4.5674 sibling script's own Stage 16 -- confirmed via
+# decompile-diff against this build before porting, not assumed: PopupWindowHelper.
+# SetVisibleCore/findParentPopupHelper and CommonUIUtils.ShowColorDialog all exist here with the
+# same shapes (this build's ShowColorDialog has one extra early-return branch the 10.4.5674 copy
+# doesn't -- a `ColorPickerFactory` extensibility hook -- handled generically by the same
+# multi-ret-safe patch logic, not a version-specific carve-out). Full investigation, every wrong
+# turn (five of them combined across both bugs): reports/floating-popup-zorder-findings.md.
+#   - A ComboBoxWithDataGrid dropdown nested inside an already-open ToolStripDropDown-based popup
+#     (e.g. the font-family list inside the "A" font/style toolbar popup) rendered UNDERNEATH the
+#     outer popup instead of on top of it. Fixed by --patch-nested-popup-owned-by-ancestor:
+#     PopupWindowHelper.SetVisibleCore now establishes a real native owner relationship
+#     (WinApi.Win32.SetWindowLong(GWL.HWNDPARENT)) with the ancestor popup, relying on Win32's own
+#     WM-independent "an owned window always draws above its owner" guarantee instead of trying
+#     to influence or race Wine's opaque X11 override-redirect stacking decision.
+#   - Opening the standard Windows ColorDialog from a "Custom colour..." link inside a floating
+#     popup closed the popup outright, instead of leaving it open in the background the way real
+#     Windows does. Root cause: a global ToolStripManager.ModalMenuFilter message filter
+#     auto-closes any open ToolStripDropDown whenever the system's active window changes to
+#     something it doesn't recognise as belonging to that dropdown's own hierarchy -- the same
+#     owner-chain recognition gap as the bug above, this time affecting a real dialog. Fixed by
+#     --patch-colordialog-suppress-autoclose: CommonUIUtils.ShowColorDialog now suppresses
+#     AutoClose on the caller's ancestor popup for the dialog's duration (the filter itself
+#     explicitly skips closing any dropdown with AutoClose=false) and queues a forced repaint+
+#     restack via BeginInvoke (AutoClose suppression alone keeps the popup logically open but
+#     still renders blank -- a separate paint/stacking symptom needing its own fix, run via
+#     BeginInvoke so it executes inside the dialog's own nested modal message loop).
+# Touches MailClient.Common.UI.dll only, both patches chained through the same file.
+# ---------------------------------------------------------------------------
+
+if (( NEEDS_WORK_MASK & STAGE_BIT[8] )); then
+    log "Stage 8: floating-popup Z-order fixes (nested dropdowns, spawned dialogs)..."
+    $ILP --patch-nested-popup-owned-by-ancestor "$FINAL_DIR" "$WORKDIR/output-stage8a"
+    $ILP --patch-colordialog-suppress-autoclose "$WORKDIR/output-stage8a" "$WORKDIR/output-stage8-final"
+    FINAL_DIR="$WORKDIR/output-stage8-final"
+elif (( INSTALLED_MASK & STAGE_BIT[8] )); then
+    log "Stage 8 already applied -- using the installed files as-is."
+else
+    log "Stage 8 skipped -- not targeted this run."
+fi
+
 # Both Cecil patch invocations (any stage, not just Stage 7) only ever copy *.dll files forward --
 # non-dll files like MailClient.deps.json never make it into a stage's own output directory.
 # Backfill everything ELSE from $WORKDIR/original (the one directory guaranteed to hold a
@@ -1286,6 +1346,23 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[7] )); then
 
     grep -q "\"MailClient.Wine/$RELEASE_VERSION.0\"" "$FINAL_DIR/MailClient.deps.json" \
         || die "verification failed: MailClient.deps.json has no MailClient.Wine/$RELEASE_VERSION.0 entry -- Stage 7's helper assembly won't load at runtime"
+fi
+
+if (( NEEDS_WORK_MASK & STAGE_BIT[8] )); then
+    $ILSPY -t "MailClient.Common.UI.PopupWindowHelper" "$FINAL_DIR/MailClient.Common.UI.dll" | grep -q "SetWindowLong(Handle, GWL.HWNDPARENT" \
+        || die "verification failed: PopupWindowHelper.SetVisibleCore doesn't set GWL.HWNDPARENT -- nested-popup-owned-by-ancestor fix missing"
+
+    $ILSPY -t "MailClient.Common.UI.PopupWindowHelper" "$FINAL_DIR/MailClient.Common.UI.dll" | grep -q "RepaintAndRestackForSpawnedDialog" \
+        || die "verification failed: PopupWindowHelper.RepaintAndRestackForSpawnedDialog not found -- colordialog-suppress-autoclose fix missing"
+
+    $ILSPY -t "MailClient.Common.UI.CommonUIUtils" "$FINAL_DIR/MailClient.Common.UI.dll" | grep -q "AutoClose = false" \
+        || die "verification failed: CommonUIUtils.ShowColorDialog doesn't suppress AutoClose -- colordialog-suppress-autoclose fix missing"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.Common.UI.dll" MailClient.Common.UI.PopupWindowHelper SetVisibleCore 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in PopupWindowHelper.SetVisibleCore"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.Common.UI.dll" MailClient.Common.UI.CommonUIUtils ShowColorDialog 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in CommonUIUtils.ShowColorDialog"
 fi
 
 log "all verification checks passed."
