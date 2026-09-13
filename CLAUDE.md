@@ -617,6 +617,21 @@ but don't rely on that alone).
     reports. This also surfaced and fixed a real, previously latent bug in `--max-revision`'s own
     implementation (see the superseded note below) -- the same fix applied to the 10.4.5674
     sibling script when it hit the identical issue.
+  - `release/11.0.196-13` / `release/11.0.282-12` — a follow-up fix to the SAME patch 6 (Stage 8,
+    `--patch-colordialog-suppress-autoclose` extended further, not a new stage/patch number): the
+    exact same third bug and same fix as the 10.4.5674 sibling script's own `release/10.4.5674-9`
+    (picking a color in the custom `ColorDialog` and clicking OK still closed the ancestor popup
+    via a separate, pre-existing `base.popupHelper.Close()` mechanism unrelated to `AutoClose`) --
+    see that Status entry, or `reports/floating-popup-zorder-findings.md`'s "Bug 3" section, for
+    the full root cause and the two new IL-patching/methodology lessons it surfaced. Confirmed
+    applicable to this build before porting: `ControlToolStripButtonFontSelector`/
+    `ControlToolStripButtonFontColorSelector` and their three targeted methods decompile
+    identically to the 10.4.5674 copies, including the same null-conditional branch in
+    `ControlFontColorSelect_SelectedColorChanged` that needed the new generic retargeting fix.
+    Verified via decompile + `--dump-handlers` against both `original/em-11.0.196/` and
+    `original/em-11.0.282/`, applied identically to both. Verified live via real synthesized
+    clicks (`python3-xlib`'s `Xlib.ext.xtest`, the same newly-discovered technique used for the
+    10.4.5674 sibling's own verification) against `emClient_11_beta_win_11`.
 
 **Patches are now a curated grouping, not raw stage numbers** (same correction as the 10.4.5674
 sibling script — see its own note under its `## Status` section for the full rationale):
@@ -661,6 +676,21 @@ target bug's steps, check the target fixme/err/symptom is gone with no new freez
 UI automation tooling exists in this environment (no xdotool/ydotool/xte) — a human has to
 actually click through the app. `xwininfo`, `wmctrl`, `xprop` (read-only X11 inspection) ARE
 available and useful for checking live window geometry without needing automation.
+**Correction**: `python3-xlib` (a plain Python package, confirmed present) exposes real
+synthesized-input automation via its `Xlib.ext.xtest` module (`XTestFakeInput` under the hood) --
+`xtest.fake_input(display, X.MotionNotify, x=..., y=...)` followed by `ButtonPress`/
+`ButtonRelease` reliably clicks a real screen coordinate, tested and confirmed working against a
+live native Win32 dialog (a `ColorDialog`'s own OK/Cancel buttons) that a reflection-based
+diagnostic trigger and `wmctrl -c` both could not exercise the same way (see
+`reports/floating-popup-zorder-findings.md`'s "Bug 3" section for why the difference mattered --
+`wmctrl -c`'s asynchronous X11-level close request has different, looser timing than a real
+same-thread button click, and at least one real bug only reproduced under the latter). Prefer
+this over a reflection-based trigger specifically when the thing under test is a genuine native
+Win32 control (a common dialog's own buttons, a menu, anything not part of MailClient's own
+managed object graph) that reflection can't reach at all; the existing reflection-trigger
+technique (a background thread polling marker files, described throughout this file's own patch
+history) remains the right tool for driving the app's OWN managed UI/object graph directly,
+where XTest would need real, fiddly screen-coordinate targeting instead.
 
 **Dev-only tools removed from `il-patcher` for the release patch** (never in `deploy.sh`, no
 loss to recreate if needed again — each is a small, self-contained `RunPatchX` function):
@@ -1009,6 +1039,38 @@ wrong turn (five of them combined across both bugs before landing on the real fi
   reached mask 767 (patches 1,2,3,4,6), all verification checks passed, and the resulting build
   launched cleanly with zero new crash reports. This also surfaced and fixed a real, previously
   latent bug in `--max-revision`'s own implementation (see the superseded note above).
+
+`release/10.4.5674-9` — a follow-up fix to the SAME patch 6 (Stage 16, `--patch-colordialog-
+suppress-autoclose` extended further, not a new stage/patch number): a third bug, reported after
+`release/10.4.5674-8` above had already shipped, where picking a color in the custom `ColorDialog`
+and clicking OK still closed the entire ancestor popup — separate from, and unrelated to, the
+`AutoClose`/`ModalMenuFilter` mechanism the previous release fixed. Root cause: a genuinely
+pre-existing app mechanism — `ControlToolStripButtonFontSelector`'s own
+`controlFontSelect_SelectedTextColorChanged`/`_SelectedTextBackColorChanged`, and
+`ControlToolStripButtonFontColorSelector`'s own `ControlFontColorSelect_SelectedColorChanged`,
+each end with an explicit `base.popupHelper.Close();` whenever a color actually gets set — by
+design, for the ordinary case of picking a color from the quick swatch grid directly (confirmed
+still correct and unchanged by this fix). The dialog's own OK path raises the identical event a
+quick swatch click does, so it inherited the same `Close()` call. Fixed by a new public field,
+`PopupWindowHelper.SuppressCloseOnColorPicked`, set alongside the existing `AutoClose = false`
+and checked by all three `Close()`-calling handlers instead of touching `Close()` itself. Caught
+and fixed a genuinely new IL-patching bug while building this (lesson 2, in a new shape — see
+`reports/floating-popup-zorder-findings.md`'s own account: a null-conditional event-invoke
+pattern's own "no subscribers" branch landed on the exact instruction the new guard was inserted
+before, silently defeating the guard for that one method until the branch was retargeted too).
+Also discovered and used, for the first time in this project, a REAL UI-automation capability
+this file previously (incorrectly) documented as absent — `python3-xlib`'s `Xlib.ext.xtest`
+module, which synthesizes genuine mouse clicks at real screen coordinates; a `wmctrl -c`-based
+test of the same scenario had missed this specific bug entirely due to timing differences between
+an asynchronous X11-level close request and a real, same-thread button click — see the "Test
+loop" section's own correction note above, and the findings report's "Bug 3" section for the full
+account. Verified live via real synthesized clicks on the dialog's actual OK/Cancel buttons (not
+just the reflection-based diagnostic trigger used for the earlier two bugs in this same patch):
+ancestor stays open through Cancel, through OK, and through OK-with-a-newly-picked-color, in all
+cases with the picked color correctly applied; a quick swatch click still closes the panel
+immediately, unchanged. Deployed via a full, real `deploy.sh` run against `emClient_win_7_x64_2`
+reset to pristine a second time: reached the same mask 767, all verification checks passed, clean
+launch, zero new crash reports.
 
 ## Investigation method (what actually worked this round)
 

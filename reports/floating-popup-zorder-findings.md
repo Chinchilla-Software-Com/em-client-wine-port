@@ -1,11 +1,13 @@
-# Floating-popup Z-order under Wine: two related bugs, one root cause class
+# Floating-popup Z-order under Wine: three related bugs, one patch stage
 
-Two separate, user-reported bugs, both root-caused to the same underlying class of defect (Wine
-failing to recognize a real native window-owner relationship the app's own WinForms popup code
-correctly asks for), fixed together as one patch stage since they always deploy as a unit.
+Three separate, user-reported bugs. The first two share the same underlying root-cause class
+(Wine failing to recognize a real native window-owner relationship the app's own WinForms popup
+code correctly asks for); the third is a completely separate, pre-existing app-level mechanism
+that only became visible once the first two were fixed enough to test properly. All three are
+fixed together as one patch stage since they always deploy as a unit.
 
 - `--patch-nested-popup-owned-by-ancestor` (bug 1)
-- `--patch-colordialog-suppress-autoclose` (bug 2)
+- `--patch-colordialog-suppress-autoclose` (bugs 2 and 3)
 
 Both touch `MailClient.Common.UI.dll` only. Confirmed applicable to all three supported
 eM Client builds (10.4.5674, 11.0.196-beta, 11.0.282) via decompile-diff before porting, not
@@ -166,7 +168,68 @@ dialog, matching the user-supplied real-Windows reference screenshot) were scree
 compared before folding both into one patch. Closing the dialog afterward correctly leaves the
 ancestor open and fully visible, exactly matching real-Windows behavior end-to-end.
 
-## A real bug caught in the fix itself, before it ever shipped
+## Bug 3: picking a color and clicking OK closes the ancestor popup anyway
+
+**Report**: "When a custom colour is picked from the colour picker (or the cancel/ok button
+pressed in it)… the font/style dialog closes… which it shouldn't because we're still setting
+styles." Reported as a follow-up after bug 2's fix above had already shipped.
+
+**Investigation, and a real methodology gap found along the way**: the FIRST reproduction attempt
+used `wmctrl -c "Colour"` (the same tool used to dismiss the dialog throughout bug 2's own
+investigation) to simulate Cancel — this did NOT reproduce any closing of the ancestor, with
+either the old or the (then-current) new code. This was a genuine test-methodology blind spot:
+`wmctrl -c` sends an asynchronous X11-level `WM_DELETE_WINDOW` request, incurring enough of a
+round-trip delay before Wine's message loop ever sees it that any timing-sensitive behavior a
+REAL, instantaneous button click would trigger (same-thread, no scheduling gap between
+`ShowDialog()` returning and whatever runs next) never actually gets exercised. Discovering this
+led to finding that **`python3-xlib`'s `Xlib.ext.xtest` module is available in this environment**
+and can synthesize genuine mouse clicks (`XTestFakeInput` under the hood) at real screen
+coordinates — a real UI-automation capability this project's own `CLAUDE.md` documented as
+*absent* ("no xdotool/ydotool/xte"). See this file's own note in `CLAUDE.md` for the correction;
+this changes what's possible for future investigation in this project, not just this one bug.
+
+Reproducing with a real synthesized click on the dialog's own OK button (after also clicking a
+basic color swatch) confirmed the bug: the entire ancestor "A" popup closed. Reproducing with a
+real click on Cancel specifically did NOT close it, with either the old or new
+`ShowColorDialog` code — ruling out the `AutoClose`/`ModalMenuFilter` mechanism (bugs 1/2's own
+root cause) entirely for this symptom; it also retroactively means the earlier "reproduced on
+Cancel" reasoning that motivated deferring the `AutoClose` restore via `BeginInvoke` (see bug 2's
+own section) was never actually confirmed live with a real click — that deferral is kept anyway
+as a low-cost defensive measure, but the doc comments were corrected to stop overclaiming it as a
+confirmed fix for a confirmed bug.
+
+**Real root cause**: entirely separate from bugs 1 and 2, and pre-existing (not something the
+earlier patches introduced). `ControlToolStripButtonFontSelector`'s own
+`controlFontSelect_SelectedTextColorChanged`/`_SelectedTextBackColorChanged`, and
+`ControlToolStripButtonFontColorSelector`'s own `ControlFontColorSelect_SelectedColorChanged`,
+each end with an explicit `base.popupHelper.Close();` whenever `TextColor`/`BackgroundColor`/
+`Color` actually gets set — genuine, original app design, for the ordinary case of picking a
+color from the quick swatch grid directly inside the popup (pick it, you're done, the whole
+panel closes — confirmed still correct and unchanged, see the regression check below). The
+custom `ColorDialog`'s own OK path raises the exact same `SelectedTextColorChanged`/
+`SelectedColorChanged` event used by a quick swatch click, so it inherits the identical `Close()`
+call — but the user is still mid-dialog-interaction at that point, not finished with the popup
+the way a quick swatch click implies.
+
+**Fix**: a new public field, `PopupWindowHelper.SuppressCloseOnColorPicked`, set `true` by
+`ShowColorDialog` alongside the existing `AutoClose = false` (and reset via the same deferred
+`BeginInvoke` restore bug 2 already added), checked by all three `Close()`-calling handlers above
+— `if (!popupHelper.SuppressCloseOnColorPicked) { popupHelper.Close(); }` — rather than touching
+`Close()` itself (a shared, heavily-called method; adding a guard at each of the three specific
+CALLERS keeps the blast radius to exactly those three call sites, matching this project's own
+"add alongside, don't mutate a shared member" convention, lesson 10, applied here to a caller
+rather than a callee).
+
+A second real IL-patching bug was caught and fixed while building this specific guard (see the
+next section) before it ever reached a live test.
+
+Verified live end-to-end via real synthesized clicks: picking a color and clicking OK now leaves
+the ancestor popup open, with the picked color visibly applied (the "Custom colour…" swatch
+itself updates to reflect it); Cancel already left it open with either code and still does;
+clicking a quick swatch directly (bypassing the dialog entirely) still closes the panel
+immediately, confirming the original, unrelated UX is unchanged.
+
+## Two real bugs caught in the fix itself, before either ever shipped
 
 While generalizing `--patch-colordialog-suppress-autoclose` to also handle 11.0.196-beta's
 `ShowColorDialog` (which has an extra early-return branch 10.4.5674 doesn't — a
@@ -183,6 +246,27 @@ branch-target label without checking what else might target the same original an
 recorded here since it recurred in a new shape (a *generated* label corrupted by a *later*,
 unrelated pass over the same instruction list, not a hand-picked label reused across two paths).
 
+While building bug 3's fix, a second, unrelated instance of IL-patching **lesson 2** ("inserting
+before a branch target without retargeting skips the new code") turned up in a NEW shape.
+`ControlToolStripButtonFontColorSelector.ControlFontColorSelect_SelectedColorChanged`'s own
+`ColorChanged?.Invoke(this, EventArgs.Empty);` compiles to a null-conditional check whose "no
+subscribers" path (`br.s`) branches PAST the invoke straight to the `ldarg.0` that begins the
+`base.popupHelper.Close();` sequence — exactly the instruction the new guard was inserted before.
+The first version of `GuardPopupCloseTail` inserted the guard without checking for this, so
+whenever `ColorChanged` had no subscribers the branch would skip the guard entirely and call
+`Close()` unconditionally, silently defeating the fix for that one specific method (confirmed by
+decompiling the result: `goto IL_0043;` appearing INSIDE the `if (eventHandler != null)` block
+rather than governing the `Close()` call, meaning the guard only applied on the "has subscribers"
+path). Caught before ever deploying by re-decompiling and noticing the unexpected `goto` — not by
+any static check, matching this project's own long-standing "decompiling clean is not sufficient
+proof, but decompiling *unclean* is real signal" pattern. Fixed by making `GuardPopupCloseTail`
+retarget any pre-existing branch or exception-handler boundary pointing at its own insertion point
+to the new guard's first instruction instead, the same sweep already used for
+`SetVisibleCore`/`ShowColorDialog` elsewhere in this same patch. The other two guarded methods
+have no such null-conditional branch and were unaffected either way, but the retargeting logic
+now applies uniformly regardless, rather than relying on which specific methods happen to need it
+today.
+
 ## Cross-version verification
 
 Confirmed via decompile-diff against all three supported builds before porting, not assumed:
@@ -198,10 +282,20 @@ Confirmed via decompile-diff against all three supported builds before porting, 
 - **11.0.282**: both patches applied and decompiled cleanly against this build's own pristine
   snapshot with no further adaptation, matching this pipeline's established pattern of sharing
   patch content across 11.0.196/11.0.282 whenever nothing needs to differ.
+- `ControlToolStripButtonFontSelector`/`ControlToolStripButtonFontColorSelector` (bug 3's own
+  guarded types) and their three targeted methods exist with the identical tail shape in all
+  three builds; the null-conditional branch found in `ControlFontColorSelect_SelectedColorChanged`
+  (see the lesson-2 account above) is present in all three too, and the fix's generic branch/
+  handler retargeting sweep handles it uniformly without needing to special-case any one build.
 
 Both patches, applied to all three builds, verified via decompile (clean, matching intended C#
 shape) and `--dump-handlers` (no handler-ordering violations) before any live deployment. Full
 end-to-end `deploy.sh` runs (not just manual `il-patcher` invocations) confirmed reaching the
-expected stage mask and launching cleanly with zero new crash reports for 10.4.5674 and
-11.0.196-beta; 11.0.282 confirmed via the same decompile+handler verification (no separate bottle
-was available for a live end-to-end deploy.sh run against that exact build this session).
+expected stage mask and launching cleanly with zero new crash reports for 10.4.5674 (twice — once
+before bug 3's fix, once after, both via a full fresh `deploy.sh` run against a bottle reset to
+pristine) and 11.0.196-beta; 11.0.282 confirmed via the same decompile+handler verification (no
+separate bottle was available for a live end-to-end `deploy.sh` run against that exact build this
+session). Bug 3's own fix was additionally verified live via real synthesized mouse clicks
+(`python3-xlib`'s `Xlib.ext.xtest`, not just the reflection-based diagnostic trigger used for bugs
+1 and 2) on the actual dialog buttons at their real screen coordinates — see bug 3's own section
+above for why this mattered and what it found that a `wmctrl -c`-based test had missed entirely.

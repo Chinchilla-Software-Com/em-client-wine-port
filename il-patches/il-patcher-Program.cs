@@ -10157,6 +10157,27 @@ static int RunPatchNestedPopupOwnedByAncestor(string[] args)
 // invisible) and the full fix together (ancestor visibly renders alongside the dialog, matching a
 // user-supplied real-Windows reference screenshot) were screenshotted and compared before this
 // was folded into one patch.
+//
+// A THIRD symptom, found only after live testing beyond just "does the popup render correctly
+// while the dialog is open": closing the ColorDialog -- via Cancel, via OK with no color change,
+// or via OK with a color actually picked, all three -- closed the ancestor popup outright.
+// Reproducing it on Cancel specifically rules out the app's own pre-existing, deliberate "close
+// the whole popup once a color is actually chosen" handler
+// (`ControlToolStripButtonFontSelector.controlFontSelect_SelectedTextColorChanged`'s own
+// `base.popupHelper.Close()` call, gated on `DialogResult.OK` and therefore inert on Cancel) --
+// this had to be a symptom of the fix's OWN restore step instead. Root cause: restoring
+// `AutoClose = true` SYNCHRONOUSLY the instant `ShowDialog()` returns races the dialog's own
+// teardown -- the WM_ACTIVATE-style messages that reassign "active window" back to the ancestor
+// popup as the dialog's window is destroyed haven't necessarily been pumped yet, so
+// `ModalMenuFilter.PreFilterMessage` can still see a stale/unresolved active window at the exact
+// moment `AutoClose` flips back to `true`, triggering `ProcessActivationChange()` for real. Fixed
+// by adding a third new method, `PopupWindowHelper.RestoreAutoCloseAfterSpawnedDialog()`
+// (`AutoClose = true;`), and queuing it via the SAME `BeginInvoke` pattern -- but posted AFTER
+// `ShowDialog()` returns instead of before, so the restore only runs once the message queue has
+// drained whatever activation messages the dialog's own close already generated. Verified live:
+// reproduced the close-on-Cancel symptom with the synchronous restore, then confirmed it gone
+// (ancestor stays open through Cancel, through a plain OK, and through OK-with-a-newly-picked
+// color, in all three cases) with the deferred one.
 static int RunPatchColorDialogSuppressAutoClose(string[] args)
 {
     if (args.Length < 3)
@@ -10309,6 +10330,55 @@ static int RunPatchColorDialogSuppressAutoClose(string[] args)
         rmIl.Append(Instruction.Create(OpCodes.Pop));
         rmIl.Append(Instruction.Create(OpCodes.Ret));
 
+        // --- New method: public void RestoreAutoCloseAfterSpawnedDialog() { AutoClose = true; SuppressCloseOnColorPicked = false; }
+        // Deliberately NOT called directly from ShowColorDialog right after ShowDialog() returns
+        // -- a synchronous restore right at that point is a plausible race against whatever
+        // WM_ACTIVATE-style messages the dialog's own teardown generates (the ancestor popup's own
+        // "active window" recognition may not have settled yet), so it's queued via BeginInvoke
+        // instead (same mechanism as RepaintAndRestackForSpawnedDialog above, but posted AFTER
+        // ShowDialog() returns rather than before) purely as a defensive precaution -- live
+        // testing via real synthesized clicks (not just a WM_CLOSE-level `wmctrl -c`, which turned
+        // out to behave differently and not exercise the same timing at all) did NOT actually
+        // reproduce a close on Cancel with either the synchronous or the deferred version, so this
+        // specific race was never confirmed as a REAL trigger for the ancestor closing -- kept
+        // deferred anyway since it costs nothing and closes off a plausible failure mode. The
+        // actual, confirmed-live "why does the ancestor popup close" bug turned out to be a
+        // completely separate, pre-existing mechanism -- see SuppressCloseOnColorPicked below.
+        //
+        // --- New field: public bool SuppressCloseOnColorPicked
+        // Confirmed live (via real synthesized mouse clicks on the actual dialog buttons, not
+        // just a WM_CLOSE-level `wmctrl -c` -- that route never exercised this at all): picking a
+        // color in the custom ColorDialog and clicking OK closes the ENTIRE ancestor popup, even
+        // though Cancel does not. Root cause is NOT AutoClose or ModalMenuFilter at all -- it's a
+        // separate, pre-existing, deliberate mechanism: ControlToolStripButtonFontSelector's own
+        // controlFontSelect_SelectedTextColorChanged/_SelectedTextBackColorChanged, and
+        // ControlToolStripButtonFontColorSelector's own ControlFontColorSelect_SelectedColorChanged,
+        // each end with an explicit `base.popupHelper.Close();` whenever TextColor/BackgroundColor
+        // actually gets set -- by original app design, for the ordinary case of picking a color
+        // from the quick swatch grid directly (a deliberate "pick it, you're done, close" UX this
+        // patch does NOT change). The custom ColorDialog's own OK path raises the exact same
+        // SelectedTextColorChanged/SelectedColorChanged event, so it inherits the same Close()
+        // call -- but the user is still mid-dialog-interaction at that point, not finished with
+        // the popup the way a quick swatch click implies. This field lets ShowColorDialog tell
+        // those three handlers "the color that's about to be set came from the dialog you're
+        // ancestor of, not a quick swatch -- skip your own Close() this one time."
+        var suppressCloseField = new FieldDefinition("SuppressCloseOnColorPicked", FieldAttributes.Public, module.TypeSystem.Boolean);
+        popupHelperType.Fields.Add(suppressCloseField);
+
+        var restoreMethod = new MethodDefinition(
+            "RestoreAutoCloseAfterSpawnedDialog",
+            MethodAttributes.Public | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        popupHelperType.Methods.Add(restoreMethod);
+        var rsIl = restoreMethod.Body.GetILProcessor();
+        rsIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        rsIl.Append(Instruction.Create(OpCodes.Ldc_I4_1));
+        rsIl.Append(Instruction.Create(OpCodes.Callvirt, setAutoCloseRef));
+        rsIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+        rsIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+        rsIl.Append(Instruction.Create(OpCodes.Stfld, suppressCloseField));
+        rsIl.Append(Instruction.Create(OpCodes.Ret));
+
         // --- New method: public static PopupWindowHelper? FindAncestorPopupWindowHelper(Control? start)
         //     PopupWindowHelper? result = null;
         //     Control? parent = start;
@@ -10401,6 +10471,7 @@ static int RunPatchColorDialogSuppressAutoClose(string[] args)
         // ancestor = PopupWindowHelper.FindAncestorPopupWindowHelper(owner as Control);
         // if (ancestor != null) {
         //     ancestor.AutoClose = false;
+        //     ancestor.SuppressCloseOnColorPicked = true;
         //     ancestor.BeginInvoke((Action)ancestor.RepaintAndRestackForSpawnedDialog);
         // }
         var startBlock = new List<Instruction>
@@ -10417,6 +10488,9 @@ static int RunPatchColorDialogSuppressAutoClose(string[] args)
         startBlock.Add(Instruction.Create(OpCodes.Ldc_I4_0));
         startBlock.Add(Instruction.Create(OpCodes.Callvirt, setAutoCloseRef));
         startBlock.Add(Instruction.Create(OpCodes.Ldloc, ancestorLocal));
+        startBlock.Add(Instruction.Create(OpCodes.Ldc_I4_1));
+        startBlock.Add(Instruction.Create(OpCodes.Stfld, suppressCloseField));
+        startBlock.Add(Instruction.Create(OpCodes.Ldloc, ancestorLocal));
         startBlock.Add(Instruction.Create(OpCodes.Ldloc, ancestorLocal));
         startBlock.Add(Instruction.Create(OpCodes.Ldftn, repaintMethod));
         startBlock.Add(Instruction.Create(OpCodes.Newobj, actionCtorRef));
@@ -10425,15 +10499,20 @@ static int RunPatchColorDialogSuppressAutoClose(string[] args)
         startBlock.Add(afterSuppress);
         foreach (var i in startBlock) { il.InsertBefore(firstInstruction, i); }
 
-        // if (ancestor != null) ancestor.AutoClose = true;   (right before the existing final ret)
+        // if (ancestor != null) ancestor.BeginInvoke((Action)ancestor.RestoreAutoCloseAfterSpawnedDialog);
+        // (right before the existing final ret -- queued, not called directly: see
+        // RestoreAutoCloseAfterSpawnedDialog's own doc comment above.)
         var afterRestore = Instruction.Create(OpCodes.Nop);
         var endBlock = new List<Instruction>
         {
             Instruction.Create(OpCodes.Ldloc, ancestorLocal),
             Instruction.Create(OpCodes.Brfalse, afterRestore),
             Instruction.Create(OpCodes.Ldloc, ancestorLocal),
-            Instruction.Create(OpCodes.Ldc_I4_1),
-            Instruction.Create(OpCodes.Callvirt, setAutoCloseRef),
+            Instruction.Create(OpCodes.Ldloc, ancestorLocal),
+            Instruction.Create(OpCodes.Ldftn, restoreMethod),
+            Instruction.Create(OpCodes.Newobj, actionCtorRef),
+            Instruction.Create(OpCodes.Callvirt, beginInvokeRef),
+            Instruction.Create(OpCodes.Pop),
             afterRestore
         };
         var firstRestore = endBlock[0];
@@ -10461,7 +10540,96 @@ static int RunPatchColorDialogSuppressAutoClose(string[] args)
             }
         }
 
-        Console.WriteLine($"OK   {fileName}: added {popupHelperTypeName}.FindAncestorPopupWindowHelper(Control) and .RepaintAndRestackForSpawnedDialog(), and patched {commonUIUtilsTypeName}.ShowColorDialog to suppress AutoClose on the caller's ancestor PopupWindowHelper (if any) for the duration of the dialog (works around ModalMenuFilter.ProcessActivationChange() closing the popup) and to queue a repaint+restack via BeginInvoke so the popup actually renders while the dialog is up, not just stays logically Visible");
+        // --- Guard the three pre-existing "close the whole popup once a color is set" call sites
+        // that fire on the ColorDialog's OK path too (see SuppressCloseOnColorPicked's own doc
+        // comment above for the full root-cause account). Each target method has the identical,
+        // confirmed-via---dump-il tail shape `ldarg.0; call get_popupHelper(); callvirt Close();
+        // ret` as its very last statement -- wrap that tail in
+        // `if (!popupHelper.SuppressCloseOnColorPicked) { ... }` rather than touching Close()
+        // itself (a shared, heavily-called method -- lesson 10's "add alongside, don't mutate an
+        // existing member" applies just as much to guarding a CALLER as it does to widening a
+        // callee's own visibility).
+        void GuardPopupCloseTail(TypeDefinition type, string methodName)
+        {
+            var method = type.Methods.FirstOrDefault(m => m.Name == methodName);
+            if (method is null) { throw new InvalidOperationException($"{type.FullName}.{methodName} not found"); }
+            var mBody = method.Body;
+            var instrs = mBody.Instructions;
+            Instruction? closeCall = null;
+            for (int i = 0; i < instrs.Count; i++)
+            {
+                if (instrs[i].OpCode == OpCodes.Callvirt && instrs[i].Operand is MethodReference mr && mr.Name == "Close" && mr.Parameters.Count == 0)
+                {
+                    closeCall = instrs[i];
+                    break;
+                }
+            }
+            if (closeCall is null) { throw new InvalidOperationException($"{type.FullName}.{methodName}: no Close() call found"); }
+            int closeIdx = instrs.IndexOf(closeCall);
+            var getPopupHelperCall = instrs[closeIdx - 1];
+            var loadThis = instrs[closeIdx - 2];
+            if (!(getPopupHelperCall.OpCode == OpCodes.Call && getPopupHelperCall.Operand is MethodReference pr && pr.Name == "get_popupHelper"))
+            {
+                throw new InvalidOperationException($"{type.FullName}.{methodName}: expected get_popupHelper() call immediately before Close(), tail shape assumption invalid");
+            }
+            if (loadThis.OpCode != OpCodes.Ldarg_0)
+            {
+                throw new InvalidOperationException($"{type.FullName}.{methodName}: expected ldarg.0 immediately before get_popupHelper(), tail shape assumption invalid");
+            }
+
+            var mIl = mBody.GetILProcessor();
+            var afterClose = Instruction.Create(OpCodes.Nop);
+            var guardFirst = Instruction.Create(OpCodes.Ldarg_0);
+            var newInstrs = new[]
+            {
+                guardFirst,
+                Instruction.Create(OpCodes.Call, (MethodReference)getPopupHelperCall.Operand),
+                Instruction.Create(OpCodes.Ldfld, suppressCloseField),
+                Instruction.Create(OpCodes.Brtrue, afterClose)
+            };
+            foreach (var ni in newInstrs) { mIl.InsertBefore(loadThis, ni); }
+            mIl.InsertAfter(closeCall, afterClose);
+
+            // loadThis (the original ldarg.0 immediately before get_popupHelper()) can itself be
+            // an existing branch target -- confirmed for real in
+            // ControlFontColorSelect_SelectedColorChanged, whose own `ColorChanged?.Invoke(...)`
+            // null-conditional compiles to a `br.s` landing exactly on this instruction for the
+            // "no subscribers" path. Inserting new code before a branch target does not make the
+            // branch fall through it (lesson 2) -- without retargeting, that path would call
+            // Close() completely unconditionally, bypassing the new guard entirely whenever
+            // ColorChanged has no subscribers. Retarget any such branch (and, defensively, any
+            // exception-handler boundary -- lesson 18) to the new guard's first instruction
+            // instead, mirroring the same sweep already used for SetVisibleCore/ShowColorDialog
+            // above -- excluding the newly-inserted instructions themselves from the sweep (the
+            // guard's own `Brtrue afterClose` legitimately targets `afterClose`, not `loadThis`,
+            // so this exclusion is defensive/consistent rather than strictly required here).
+            var newInstrSet = new HashSet<Instruction>(newInstrs) { afterClose };
+            foreach (var instr in instrs)
+            {
+                if (newInstrSet.Contains(instr)) continue;
+                if (instr.Operand is Instruction target && target == loadThis)
+                {
+                    instr.Operand = guardFirst;
+                }
+            }
+            foreach (var handler in mBody.ExceptionHandlers)
+            {
+                if (handler.TryStart == loadThis) handler.TryStart = guardFirst;
+                if (handler.TryEnd == loadThis) handler.TryEnd = guardFirst;
+                if (handler.HandlerStart == loadThis) handler.HandlerStart = guardFirst;
+                if (handler.HandlerEnd == loadThis) handler.HandlerEnd = guardFirst;
+            }
+        }
+
+        var fontSelectorType = module.GetType("MailClient.Common.UI.Controls.ToolStripButtons.ControlToolStripButtonFontSelector");
+        if (fontSelectorType is null) { Console.Error.WriteLine("FAIL: ControlToolStripButtonFontSelector not found"); return 1; }
+        var fontColorSelectorType = module.GetType("MailClient.Common.UI.Controls.ToolStripButtons.ControlToolStripButtonFontColorSelector");
+        if (fontColorSelectorType is null) { Console.Error.WriteLine("FAIL: ControlToolStripButtonFontColorSelector not found"); return 1; }
+        GuardPopupCloseTail(fontSelectorType, "controlFontSelect_SelectedTextColorChanged");
+        GuardPopupCloseTail(fontSelectorType, "controlFontSelect_SelectedTextBackColorChanged");
+        GuardPopupCloseTail(fontColorSelectorType, "ControlFontColorSelect_SelectedColorChanged");
+
+        Console.WriteLine($"OK   {fileName}: added {popupHelperTypeName}.FindAncestorPopupWindowHelper(Control), .RepaintAndRestackForSpawnedDialog(), .RestoreAutoCloseAfterSpawnedDialog(), and the .SuppressCloseOnColorPicked field; patched {commonUIUtilsTypeName}.ShowColorDialog to suppress AutoClose and queue a repaint+restack while the dialog is up, restore both afterward via BeginInvoke, and guarded the 3 pre-existing \"close the whole popup\" call sites (ControlToolStripButtonFontSelector x2, ControlToolStripButtonFontColorSelector x1) so picking a color via the dialog no longer closes the ancestor popup the way a quick swatch click still deliberately does");
         patched = true;
 
         module.Write(destPath);
