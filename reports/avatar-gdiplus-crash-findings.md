@@ -31,6 +31,3 @@ OK, second run refuses (shape no longer present).
 ## eM Client 11
 `AvatarHelper.FromData` is byte-for-byte the same shape in the 11.0.196 build (checked via `--dump-il`); wired into
 `releases/11.0.196-beta/deploy.sh` as Stage 9 / patch 7. Not yet run against a live eM Client 11 bottle.
-
-## Not yet done
-- Not tested: a full `deploy.sh` run with Stage 17 (only `bash -n`).
