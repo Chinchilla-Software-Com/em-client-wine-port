@@ -33,6 +33,4 @@ OK, second run refuses (shape no longer present).
 `releases/11.0.196-beta/deploy.sh` as Stage 9 / patch 7. Not yet run against a live eM Client 11 bottle.
 
 ## Not yet done
-- Visual confirmation with the Trash mail (10.4.5674 deployed to the Lutris prefix `em-client-10`, backup in
-  `~/Lutris/em-client-10-backup-avatar/`).
 - Not tested: a full `deploy.sh` run with Stage 17 (only `bash -n`).
