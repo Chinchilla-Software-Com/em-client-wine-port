@@ -136,7 +136,7 @@ declare -A OUR_RELEASE_NUMBER_FOR_VERSION=( ["11.0.196"]=5 ["11.0.282"]=4 )
 # Deliberately no migration from the older, pre-bitmask linear-count scheme this same marker
 # field used to hold -- see the header comment's own note. A bottle patched by an older script
 # needs a pristine reset before this version touches it.
-declare -A STAGE_BIT=( [1]=1 [2]=2 [3]=4 [4]=8 [6]=32 [7]=64 [8]=128 )
+declare -A STAGE_BIT=( [1]=1 [2]=2 [3]=4 [4]=8 [6]=32 [7]=64 [8]=128 [9]=256 )
 
 # PATCH is the externally-facing unit -- what --patches/--max-revision take, what README.md's
 # patch table documents, what a user thinks of as "patch N". It's a curated, THEMATIC grouping of
@@ -154,6 +154,9 @@ declare -A STAGE_BIT=( [1]=1 [2]=2 [3]=4 [4]=8 [6]=32 [7]=64 [8]=128 )
 #   6 = stage  8        (floating-popup Z-order fixes: nested combo dropdowns, spawned dialogs --
 #                        same family as the 10.4.5674 sibling's own patch 6; see
 #                        reports/floating-popup-zorder-findings.md)
+#   7 = stage  9        (crash showing a message whose sender's contact photo GDI+ can't decode --
+#                        same fix as the 10.4.5674 sibling's patch 7; see
+#                        reports/avatar-gdiplus-crash-findings.md)
 declare -A PATCH_STAGES=(
     [1]="2"
     [2]="4"
@@ -161,6 +164,7 @@ declare -A PATCH_STAGES=(
     [4]="3"
     [5]="6 7"
     [6]="8"
+    [7]="9"
 )
 # Highest MANDATORY patch number this script builds by default -- shared across every supported
 # eM Client version above. This (not OUR_RELEASE_NUMBER_FOR_VERSION) is what controls how far a
@@ -169,8 +173,8 @@ declare -A PATCH_STAGES=(
 # chain despite its number being lower than this constant. Always consult MANDATORY_PATCHES
 # (below), never assume "1..PIPELINE_LATEST_PATCH" is a contiguous mandatory range -- it isn't,
 # on purpose.
-PIPELINE_LATEST_PATCH=6
-MANDATORY_PATCHES=(1 2 3 4 6)
+PIPELINE_LATEST_PATCH=7
+MANDATORY_PATCHES=(1 2 3 4 6 7)
 
 MANDATORY_MASK=0
 for _p in "${MANDATORY_PATCHES[@]}"; do
@@ -1175,6 +1179,24 @@ else
     log "Stage 8 skipped -- not targeted this run."
 fi
 
+# ---------------------------------------------------------------------------
+# Stage 9 (patch 7, MANDATORY): AvatarHelper.FromData rethrew a GDI+ ExternalException instead of
+# returning null (its own handler checks `ex.Source == "System.Drawing"`, never true on current
+# .NET), crashing the preview pane for senders whose contact photo GDI+ can't decode. Identical
+# method shape to the 10.4.5674 build (verified via --dump-il). Touches MailClient.dll only.
+# See reports/avatar-gdiplus-crash-findings.md.
+# ---------------------------------------------------------------------------
+
+if (( NEEDS_WORK_MASK & STAGE_BIT[9] )); then
+    log "Stage 9: avatar GDI+ decode failure no longer crashes the preview pane..."
+    $ILP --patch-avatar-gdiplus-source-check "$FINAL_DIR" "$WORKDIR/output-stage9"
+    FINAL_DIR="$WORKDIR/output-stage9"
+elif (( INSTALLED_MASK & STAGE_BIT[9] )); then
+    log "Stage 9 already applied -- using the installed files as-is."
+else
+    log "Stage 9 skipped -- not targeted this run."
+fi
+
 # Both Cecil patch invocations (any stage, not just Stage 7) only ever copy *.dll files forward --
 # non-dll files like MailClient.deps.json never make it into a stage's own output directory.
 # Backfill everything ELSE from $WORKDIR/original (the one directory guaranteed to hold a
@@ -1363,6 +1385,14 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[8] )); then
 
     $ILP --dump-handlers "$FINAL_DIR/MailClient.Common.UI.dll" MailClient.Common.UI.CommonUIUtils ShowColorDialog 2>&1 | tail -1 | grep -q "^OK:" \
         || die "verification failed: --dump-handlers reported a handler-ordering violation in CommonUIUtils.ShowColorDialog"
+fi
+
+if (( NEEDS_WORK_MASK & STAGE_BIT[9] )); then
+    $ILSPY -m "M:MailClient.UI.AvatarHelper.FromData(System.Byte[])" "$FINAL_DIR/MailClient.dll" | grep -q "_ = ex.Source" \
+        || die "verification failed: AvatarHelper.FromData still branches on ex.Source -- avatar-gdiplus-source-check fix missing"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.dll" MailClient.UI.AvatarHelper FromData 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in AvatarHelper.FromData"
 fi
 
 log "all verification checks passed."

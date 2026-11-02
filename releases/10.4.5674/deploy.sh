@@ -127,7 +127,7 @@ OUR_RELEASE_NUMBER=4
 # patched by an older script needs a pristine reset before this version touches it.
 declare -A STAGE_BIT=( [1]=1 [2]=2 [3]=4 [4]=8 [5]=16 [6]=32 [7]=64 \
     [8]=128 [9]=128 [10]=128 [11]=128 [12]=128 [13]=128 [14]=128 \
-    [15]=256 [16]=512 )
+    [15]=256 [16]=512 [17]=1024 )
 
 # PATCH is the externally-facing unit -- what --patches/--max-revision take, what README.md's
 # patch tables document, what a user thinks of as "patch N". It's a curated, THEMATIC grouping of
@@ -142,6 +142,8 @@ declare -A STAGE_BIT=( [1]=1 [2]=2 [3]=4 [4]=8 [5]=16 [6]=32 [7]=64 \
 #   5 = stage  15        (Exchange sync-freeze fix -- OPTIONAL, see its own section further down)
 #   6 = stage  16        (floating-popup Z-order fixes: nested combo dropdowns, spawned dialogs --
 #                         see reports/floating-popup-zorder-findings.md)
+#   7 = stage  17        (crash showing a message whose sender's contact photo GDI+ can't decode --
+#                         see reports/avatar-gdiplus-crash-findings.md)
 declare -A PATCH_STAGES=(
     [1]="1 6 7"
     [2]="2 3 4"
@@ -149,14 +151,15 @@ declare -A PATCH_STAGES=(
     [4]="8"
     [5]="15"
     [6]="16"
+    [7]="17"
 )
 # Highest MANDATORY patch number this script builds by default. Patch 5 (sync-freeze fix) sits
 # BELOW this as a deliberate gap -- it's OPTIONAL (see its own header comment further down for
 # why), not part of the mandatory chain despite its number being lower than this constant. Always
 # consult MANDATORY_PATCHES (below), never assume "1..PIPELINE_LATEST_PATCH" is a contiguous
 # mandatory range -- it isn't, on purpose.
-PIPELINE_LATEST_PATCH=6
-MANDATORY_PATCHES=(1 2 3 4 6)
+PIPELINE_LATEST_PATCH=7
+MANDATORY_PATCHES=(1 2 3 4 6 7)
 
 MANDATORY_MASK=0
 for _p in "${MANDATORY_PATCHES[@]}"; do
@@ -1165,6 +1168,24 @@ else
     FINAL_DIR="$STAGE15_DIR"
 fi
 
+# ---------------------------------------------------------------------------
+# Stage 17 (patch 7, MANDATORY): AvatarHelper.FromData rethrew a GDI+ ExternalException instead of
+# returning null, crashing the preview pane for any sender whose contact photo GDI+ can't decode
+# (GitHub issue #4). The app's own handler checks `ex.Source == "System.Drawing"`, which no longer
+# matches on current .NET. --patch-avatar-gdiplus-source-check makes the handler unconditional.
+# Touches MailClient.dll only. See reports/avatar-gdiplus-crash-findings.md.
+# ---------------------------------------------------------------------------
+
+if (( NEEDS_WORK_MASK & STAGE_BIT[17] )); then
+    log "Stage 17: avatar GDI+ decode failure no longer crashes the preview pane..."
+    $ILP --patch-avatar-gdiplus-source-check "$FINAL_DIR" "$WORKDIR/output-stage17"
+    FINAL_DIR="$WORKDIR/output-stage17"
+elif (( INSTALLED_MASK & STAGE_BIT[17] )); then
+    log "Stage 17 already applied -- using the installed files as-is."
+else
+    log "Stage 17 skipped -- not targeted this run."
+fi
+
 # Every Cecil patch invocation above only ever copies *.dll files forward -- non-dll files (and,
 # in one specific edge case, MailClient.Licensing.BouncyCastlePatch.dll if a stage's own input
 # directory didn't already have it staged in) never make it into a stage's own output directory
@@ -1278,6 +1299,14 @@ if (( NEEDS_WORK_MASK & STAGE_BIT[16] )); then
 
     $ILP --dump-handlers "$FINAL_DIR/MailClient.Common.UI.dll" MailClient.Common.UI.CommonUIUtils ShowColorDialog 2>&1 | tail -1 | grep -q "^OK:" \
         || die "verification failed: --dump-handlers reported a handler-ordering violation in CommonUIUtils.ShowColorDialog"
+fi
+
+if (( NEEDS_WORK_MASK & STAGE_BIT[17] )); then
+    $ILSPY -m "M:MailClient.UI.AvatarHelper.FromData(System.Byte[])" "$FINAL_DIR/MailClient.dll" | grep -q "_ = ex.Source" \
+        || die "verification failed: AvatarHelper.FromData still branches on ex.Source -- avatar-gdiplus-source-check fix missing"
+
+    $ILP --dump-handlers "$FINAL_DIR/MailClient.dll" MailClient.UI.AvatarHelper FromData 2>&1 | tail -1 | grep -q "^OK:" \
+        || die "verification failed: --dump-handlers reported a handler-ordering violation in AvatarHelper.FromData"
 fi
 
 log "all verification checks passed."

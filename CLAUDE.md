@@ -1072,6 +1072,14 @@ immediately, unchanged. Deployed via a full, real `deploy.sh` run against `emCli
 reset to pristine a second time: reached the same mask 767, all verification checks passed, clean
 launch, zero new crash reports.
 
+`release/10.4.5674-10` — Stage 17 (patch 7, MANDATORY): crash when displaying a message whose
+sender's contact photo Wine's GDI+ can't decode (GitHub issue #4) — `AvatarHelper.FromData`'s own
+handler checks `ex.Source == "System.Drawing"`, never true on current .NET, so it rethrows.
+`--patch-avatar-gdiplus-source-check` makes it always return null. Full account:
+`reports/avatar-gdiplus-crash-findings.md`. Found via the user's Lutris prefix
+(`~/Lutris/em-client-10/`, plain Wine prefix, user dir `steamuser`; deploy.sh doesn't support Lutris,
+patch by hand). Not yet visually confirmed; eM Client 11 not yet checked.
+
 ## Investigation method (what actually worked this round)
 
 Roughly in order of how cheap/reliable each was, cheapest first:

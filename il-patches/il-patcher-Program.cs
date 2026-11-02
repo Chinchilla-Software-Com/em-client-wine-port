@@ -38,6 +38,11 @@ if (args.Length > 0 && args[0] == "--patch-default-client-notimpl")
     return RunPatchDefaultClientNotImpl(args);
 }
 
+if (args.Length > 0 && args[0] == "--patch-avatar-gdiplus-source-check")
+{
+    return RunPatchAvatarGdiplusSourceCheck(args);
+}
+
 if (args.Length > 0 && args[0] == "--dump-handlers")
 {
     return RunDumpHandlers(args);
@@ -8355,6 +8360,94 @@ static int RunPatchDefaultClientNotImpl(string[] args)
         return 1;
     }
 
+    return 0;
+}
+
+// --patch-avatar-gdiplus-source-check <input-dir> <output-dir>
+//
+// Crash when a message from a sender whose contact photo GDI+ (under Wine) can't decode is shown in
+// the preview pane (GitHub issue #4). Stack from the app's own bug report:
+//   ExternalException "A generic error occurred in GDI+."
+//     at Image.FromStream  <- AvatarHelper.FromData <- UIAvatar.get_Image/GetImage
+//     <- MessageBehaviorHandlerBase.StoreToCache/GetContactUrl/GetHtmlForMessageHeader
+//     <- ControlMessageDetail.InsertMessagesInternal <- webBrowser_LoadEnd (unhandled)
+//
+// AvatarHelper.FromData ALREADY handles this: `catch (ExternalException ex) { if (ex.Source ==
+// "System.Drawing") return null; throw; }`. The authors' check was written for the old
+// System.Drawing assembly; on current .NET the exception is thrown from
+// System.Private.Windows.Core (Source != "System.Drawing"), so the app rethrows. Fix: make the
+// handler's `brfalse` (-> rethrow) unconditional fall-through to `return null`, by swapping it for
+// `pop` (identical stack effect). The caller then falls back to its no-photo avatar.
+static int RunPatchAvatarGdiplusSourceCheck(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: il-patcher --patch-avatar-gdiplus-source-check <input-dir> <output-dir>");
+        return 2;
+    }
+
+    string inDir = args[1];
+    string outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    const string targetAssembly = "MailClient.dll";
+    const string targetType = "MailClient.UI.AvatarHelper";
+    const string targetMethod = "FromData";
+
+    bool patched = false;
+    foreach (var dllPath in Directory.GetFiles(inDir, "*.dll", SearchOption.TopDirectoryOnly))
+    {
+        string fileName = Path.GetFileName(dllPath);
+        string destPath = Path.Combine(outDir, fileName);
+        if (fileName != targetAssembly)
+        {
+            File.Copy(dllPath, destPath, overwrite: true);
+            continue;
+        }
+
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(inDir);
+        using var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters { AssemblyResolver = resolver, ReadWrite = false });
+
+        var type = module.GetType(targetType);
+        if (type is null) { Console.Error.WriteLine($"FAIL: type not found: {targetType}"); return 1; }
+        var method = type.Methods.FirstOrDefault(m => m.Name == targetMethod && m.HasBody);
+        if (method is null) { Console.Error.WriteLine($"FAIL: method not found: {targetType}::{targetMethod}"); return 1; }
+
+        var il = method.Body.Instructions;
+        // Shape: callvirt get_Source; ldstr "System.Drawing"; call op_Equality; brfalse(.s) -> rethrow
+        Instruction? target = null;
+        for (int i = 0; i + 3 < il.Count; i++)
+        {
+            if (il[i].OpCode == OpCodes.Callvirt && il[i].Operand is MethodReference m0 && m0.Name == "get_Source" &&
+                il[i + 1].OpCode == OpCodes.Ldstr && (string?)il[i + 1].Operand == "System.Drawing" &&
+                il[i + 2].OpCode == OpCodes.Call && il[i + 2].Operand is MethodReference m2 && m2.Name == "op_Equality" &&
+                (il[i + 3].OpCode == OpCodes.Brfalse || il[i + 3].OpCode == OpCodes.Brfalse_S) &&
+                ((Instruction)il[i + 3].Operand!).OpCode == OpCodes.Rethrow)
+            {
+                target = il[i + 3];
+                break;
+            }
+        }
+        if (target is null)
+        {
+            Console.Error.WriteLine($"FAIL: {targetType}::{targetMethod}: expected `Source == \"System.Drawing\"` -> rethrow shape not found (already patched?) -- refusing to patch");
+            return 1;
+        }
+
+        target.OpCode = OpCodes.Pop;
+        target.Operand = null;
+
+        Console.WriteLine($"OK   {fileName}: {targetType}::{targetMethod} -- GDI+ ExternalException now always returns null instead of rethrowing when Source != \"System.Drawing\"");
+        patched = true;
+        module.Write(destPath);
+    }
+
+    if (!patched)
+    {
+        Console.Error.WriteLine($"FAIL: {targetAssembly} not found in {inDir}");
+        return 1;
+    }
     return 0;
 }
 
